@@ -1,0 +1,68 @@
+import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { ALLOWED_EXTENSIONS as CHAT_ATTACHMENT_EXTENSIONS } from '../../src/main/features/chat_attachments';
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const policy = require('../../src/renderer/modules/file-operation-policy.js') as {
+  canAddToChat: (name: string) => boolean;
+  canAddToLibrary: (name: string, options?: { projectScoped?: boolean }) => boolean;
+};
+
+describe('file operation policy', () => {
+  it('loads before every renderer consumer', () => {
+    const index = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
+    const policyTag = index.indexOf('<script src="./modules/file-operation-policy.js"></script>');
+    expect(policyTag).toBeGreaterThan(-1);
+    expect(policyTag).toBeLessThan(index.indexOf('<script src="./modules/chat-file-viewer.js"></script>'));
+    expect(policyTag).toBeLessThan(index.indexOf('<script src="./modules/conversation-info.js"></script>'));
+  });
+
+  it.each([
+    'note.md', 'data.json', 'report.pdf', 'document.docx', 'sheet.xlsx', 'legacy.xls', 'slides.pptx',
+    'photo.png', 'clip.mp4', 'voice.mp3', 'skills.zip',
+    'page.html', 'style.css', 'script.js', 'source.py', 'data.jsonl', 'events.ndjson',
+    'config.toml', 'report.tex', 'notes.rst', 'captions.srt', 'captions.vtt',
+  ])('allows supported chat attachment %s', (name) => {
+    expect(policy.canAddToChat(name)).toBe(true);
+  });
+
+  it('matches the main-process chat attachment allow-list', () => {
+    for (const ext of CHAT_ATTACHMENT_EXTENSIONS) {
+      expect(policy.canAddToChat(`attachment${ext}`), ext).toBe(true);
+    }
+  });
+
+  it.each([
+    'legacy.doc',
+    'vector.svg', 'font.woff2', 'module.wasm',
+  ])('does not advertise Add to chat for unsupported %s', (name) => {
+    expect(policy.canAddToChat(name)).toBe(false);
+  });
+
+  it.each([
+    'note.md', 'page.html', 'style.css', 'script.js', 'source.py', 'report.pdf',
+    'document.docx', 'sheet.xlsx', 'legacy.xls', 'slides.pptx', 'photo.png',
+  ])('allows common Library file %s', (name) => {
+    expect(policy.canAddToLibrary(name)).toBe(true);
+  });
+
+  it('allows video only for a project-scoped Library', () => {
+    expect(policy.canAddToLibrary('clip.mp4')).toBe(false);
+    expect(policy.canAddToLibrary('clip.mp4', { projectScoped: true })).toBe(true);
+    expect(policy.canAddToLibrary('voice.mp3', { projectScoped: true })).toBe(false);
+  });
+
+  it.each(['archive.zip', 'legacy.doc', 'vector.svg', 'font.woff2', 'module.wasm'])(
+    'rejects unsupported Library file %s',
+    (name) => {
+      expect(policy.canAddToLibrary(name, { projectScoped: true })).toBe(false);
+    },
+  );
+
+  it('is case-insensitive', () => {
+    expect(policy.canAddToChat('REPORT.PDF')).toBe(true);
+    expect(policy.canAddToLibrary('PHOTO.PNG')).toBe(true);
+    expect(policy.canAddToChat('README')).toBe(false);
+  });
+});

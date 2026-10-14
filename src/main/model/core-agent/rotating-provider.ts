@@ -1,0 +1,1100 @@
+/**
+ * Rotating provider wrapper — transparently tries multiple credential
+ * candidates for the same `(provider, model)` before yielding any content
+ * to the caller.
+ *
+ * ## Why a wrapper (not retry in AgentRunner)
+ *
+ * AgentRunner appends the user message to `PersistentSession` before the
+ * first provider call. Retrying at AgentRunner level would either double-
+ * commit the user message or need session rollback logic. Here we sit
+ * **below** AgentRunner, so the user message is added exactly once and
+ * our rotation is invisible to session state.
+ *
+ * ## Rotation rule
+ *
+ * `stream()` is the streaming entry point. We try each candidate provider
+ * in order. The tricky bit is "when is it still safe to rotate?":
+ *
+ *   - Before any `text_delta` / `tool_use_start` / similar content event
+ *     has been yielded → OAuth authentication failure ⇒ refresh and rebuild
+ *     once; rate limit ⇒ try next configured model without cross-request cooldown;
+ *     remaining credential/account failure ⇒ mark cooldown, try next
+ *     candidate; retryable provider/runtime failure ⇒ retry this
+ *     candidate first, then rotate without cooldown. If AgentRunner is
+ *     already retrying the model round, try each candidate once so the
+ *     nested retry budget is not multiplied.
+ *   - After first content event has been yielded → failure propagates
+ *     unchanged to AgentRunner. AgentRunner owns model-call retry after
+ *     visible output exists; rotating here would change credentials mid-stream.
+ *
+ * A "content event" is anything the caller could have rendered to the
+ * user. `message_end` without prior text is also accepted as "produced
+ * output" — we err on the side of NOT rotating if we've started producing
+ * anything, since the model may have run a full turn before erroring.
+ *
+ * ## Non-key failures
+ *
+ * Failures that `auth-error.ts::classifyKeyFailure` returns null for
+ * are handled by a blacklist-style retry classifier: request/config/safety
+ * failures propagate, while unknown provider/runtime failures default to
+ * retryable and may fall through to the next candidate without cooldown.
+ *
+ * ## Cooldown & onSuccess
+ *
+ * On a credential/account rotatable failure: `markCooldown(profileId, kind, reason)`.
+ * Network failures are never cooled down; each new user request starts from
+ * the configured entries list again. Within one run, though, a candidate whose
+ * network failure exhausted its retry budget while a LATER candidate committed
+ * is latched out of the remaining model rounds (run-local only) — otherwise
+ * every tool-loop round re-pays the dead candidate's full timeout/retry
+ * ladder. A sweep where every candidate fails network-class latches nothing,
+ * so a transient machine-local outage keeps full retry on the next call.
+ * On a successful first-event-yield: `onSuccess(profileId)` fires so
+ * callers can clear any prior cooldown + bump lastUsed.
+ */
+
+import type { CustomModelImageSupport } from './custom-model-image-support';
+import type { LLMProvider, CompletionParams, CompletionResult, Message } from '#core-agent';
+import type { ProviderEmptyKind, ProviderTerminationCategory, StreamEvent, Usage } from '#core-agent';
+import { classifyKeyFailure, formatKeyFailure, type KeyFailureKind } from './auth-error';
+import { markCooldown } from './profile-cooldown';
+import { createLogger } from '../../logger';
+import { getRetryErrorPolicyConfig } from '../../features/client_config';
+import { isProviderRateLimitError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
+import { maskId } from '../../util/log-redact';
+
+const log = createLogger('rotating-provider');
+
+const NETWORK_RETRY_ATTEMPTS = 3;
+const NETWORK_RETRY_BASE_DELAY_MS = 500;
+const NETWORK_RETRY_MAX_DELAY_MS = 2_000;
+const PROVIDER_FIRST_EVENT_TIMEOUT_MS = 180_000;
+const NORMAL_EMPTY_RETRY_ATTEMPTS = 1;
+export const PROVIDER_NO_FIRST_EVENT_TIMEOUT_CODE = 'PROVIDER_NO_FIRST_EVENT_TIMEOUT';
+/** Legacy code retained for older persisted errors and compatibility tests. */
+export const PROVIDER_EMPTY_RESPONSE_CODE = 'PROVIDER_EMPTY_RESPONSE';
+export const PROVIDER_EMPTY_TRANSPORT_CODE = 'PROVIDER_EMPTY_TRANSPORT';
+export const PROVIDER_EMPTY_NORMAL_CODE = 'PROVIDER_EMPTY_NORMAL';
+export const PROVIDER_EMPTY_SAFETY_CODE = 'PROVIDER_EMPTY_SAFETY';
+export const PROVIDER_EMPTY_UNKNOWN_CODE = 'PROVIDER_EMPTY_UNKNOWN';
+export const PROVIDER_CANDIDATES_UNAVAILABLE_CODE = 'PROVIDER_CANDIDATES_UNAVAILABLE';
+
+class ProviderCandidatesUnavailableError extends Error {
+  readonly code = PROVIDER_CANDIDATES_UNAVAILABLE_CODE;
+
+  constructor() {
+    super('No configured model candidate is currently available');
+    this.name = 'ProviderCandidatesUnavailableError';
+  }
+}
+
+class ProviderNoFirstEventTimeoutError extends Error {
+  readonly code = PROVIDER_NO_FIRST_EVENT_TIMEOUT_CODE;
+
+  constructor(providerId: string, timeoutMs: number) {
+    super(`Provider ${providerId} produced no usable stream event within ${Math.max(1, Math.round(timeoutMs))}ms`);
+    this.name = 'ProviderNoFirstEventTimeoutError';
+  }
+}
+
+class ProviderEmptyResponseError extends Error {
+  readonly code: string;
+  readonly kind: ProviderEmptyKind;
+
+  constructor(providerId: string, kind: ProviderEmptyKind) {
+    super('empty response');
+    this.name = 'ProviderEmptyResponseError';
+    this.kind = kind;
+    this.code = {
+      transport_empty: PROVIDER_EMPTY_TRANSPORT_CODE,
+      normal_end_empty: PROVIDER_EMPTY_NORMAL_CODE,
+      safety_filtered_empty: PROVIDER_EMPTY_SAFETY_CODE,
+      unknown_empty: PROVIDER_EMPTY_UNKNOWN_CODE,
+    }[kind];
+    Object.defineProperty(this, 'providerId', {
+      value: providerId,
+      enumerable: false,
+    });
+  }
+}
+
+function isProviderNoFirstEventTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object'
+    && (err as { code?: unknown }).code === PROVIDER_NO_FIRST_EVENT_TIMEOUT_CODE;
+}
+
+function classifyRetryableErrorLocal(err: unknown): RetryableErrorKind | null {
+  return classifyRetryableErrorWithPolicy(err, getRetryErrorPolicyConfig());
+}
+
+export interface RotatingCandidate {
+  profileId: string;
+  /** Cooldown/unavailability identity. Defaults to profileId. Official
+   * managed models set this per model because one profile fronts multiple
+   * independent upstreams. */
+  cooldownId?: string;
+  /** The (provider, model) this candidate binds to. Required because
+   *  rotation may cross provider boundaries (e.g. primary openai/gpt-5.4
+   *  → fallback anthropic/claude-opus-4.7). We override `params.model`
+   *  with `modelId` before calling the built provider, so the caller
+   *  (AgentRunner) doesn't need to know which candidate is active. */
+  providerId: string;
+  modelId: string;
+  /** Model-default output cap for this exact candidate. AgentRunner enters
+   *  the wrapper with the primary model's generated default in params; when
+   *  rotation crosses models/providers, replace that generated value with
+   *  the candidate's own cap. Explicit caller caps are preserved. */
+  maxTokens?: number;
+  /** Maximum image blocks accepted in one request by this exact model.
+   * Zero means text-only. Undefined preserves caller input for backwards
+   * compatibility with non-chat/internal test candidates. */
+  maxInputImages?: number;
+  /** Only custom models carry an explicit API capability observation. */
+  imageSupport?: CustomModelImageSupport;
+  /** Factory is deferred-async because external providers need core-agent
+   *  loaded lazily. It may be rebuilt for a bounded retry or after an OAuth
+   *  credential refresh; if rotation happens, we build the next candidate. */
+  build(): Promise<LLMProvider>;
+  /** OAuth-only recovery hook. On an authentication failure before any
+   * visible content, refresh the credential and make the next build use it.
+   * Returns false when refresh is unavailable or failed. */
+  refreshCredential?: () => Promise<boolean>;
+}
+
+/**
+ * Project provider-facing history to a candidate's image limit without
+ * mutating the durable session messages.
+ *
+ * Later messages get priority so an image produced by a recent `read_file`
+ * tool call remains visible in the next model round. Within one message we
+ * retain source order, which keeps the first N composer attachments aligned
+ * with their manifest `image_order` values.
+ */
+export function boundMessagesForImageLimit(
+  messages: Message[],
+  rawLimit: number,
+): Message[] {
+  const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.trunc(rawLimit)) : 0;
+  const totalImages = messages.reduce(
+    (sum, message) => sum + messageImageCount(message),
+    0,
+  );
+  if (totalImages <= limit) return messages;
+
+  let remaining = limit;
+  const projected: Message[] = [];
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex];
+    const content: Message['content'] = [];
+    for (const item of message.content) {
+      if (item.type === 'image') {
+        if (remaining > 0) { content.push(item); remaining--; }
+      } else if (item.type === 'tool_result' && item.images?.length) {
+        const images = item.images.slice(0, remaining);
+        remaining -= images.length;
+        content.push({ ...item, images });
+      } else content.push(item);
+    }
+    if (content.length === 0) continue;
+    projected.push({ ...message, content });
+  }
+  projected.reverse();
+  const omittedImages = totalImages - limit;
+  const notice = limit > 0
+    ? `<model-image-limit max_images="${limit}" omitted_images="${omittedImages}">Only the retained image blocks in this request are visually available. Use attachment manifest paths with read_files one image at a time for omitted images; do not claim visual processing from a listed path alone.</model-image-limit>`
+    : `<model-image-limit max_images="0" omitted_images="${omittedImages}" vision_supported="false">This model cannot receive image blocks, including read_files image previews. Do not claim visual analysis. Ask for readable text or a vision-capable model when the task depends on image content.</model-image-limit>`;
+  projected.push({
+    role: 'developer',
+    content: [{ type: 'text', text: notice }],
+  });
+  return projected;
+}
+
+function messageImageCount(message: Message): number {
+  return message.content.reduce((sum, item) => sum
+    + (item.type === 'image' ? 1 : item.type === 'tool_result' ? item.images?.length ?? 0 : 0), 0);
+}
+
+export interface CreateRotatingProviderConfig {
+  /** Request diagnostics bypass pre-commit buffering and do not commit a stream. */
+  onRequestFailure?: CompletionParams['onRequestFailure'];
+  /** Ordered list of candidates. First entry is the primary (matches
+   *  `pickChatEntryGroup()[0]`). Further entries are fallbacks. */
+  candidates: RotatingCandidate[];
+  /** Called after the wrapper commits to a candidate (first content event
+   *  yielded successfully). Used by callers to clear cooldown on the
+   *  winning profile and bump `lastUsed`. */
+  onSuccess?: (profileId: string, candidate: RotatingCandidate) => void;
+  /** Called when a candidate "owns" the call's outcome — either committed
+   *  (success) or surfaced the user-visible error after rotation exhausted
+   *  / a non-rotatable failure. The dev archive recorder uses this to
+   *  rewrite its model/provider/profile labels so the stored row reflects
+   *  the candidate that actually produced the visible result, not the
+   *  rotating-provider's primary label. Fires at most once per `complete`
+   *  / `stream` invocation. */
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
+  /** Reports configured and currently usable candidates even when no fallback
+   * occurs. This keeps `candidate_count=0` from ambiguously meaning either
+   * "one candidate" or "not observed" in sampled diagnostics. */
+  onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
+  /** Provider id surfaced as `LLMProvider.id` — should match the group's
+   *  shared provider id, e.g. "anthropic" / "moonshot". */
+  providerId: string;
+  /** How many times to retry a network-class failure on the same candidate
+   *  before cooling it down and rotating to the next configured candidate. */
+  networkRetryAttempts?: number;
+  /** Test hook / tuning knob for network retry backoff. */
+  networkRetryDelayMs?: (attempt: number) => number;
+  /** Same-model retries after an explicitly normal terminal event with no
+   * usable content. Kept independent from transport retries. */
+  normalEmptyRetryAttempts?: number;
+  /** Maximum time from opening a provider stream until its first meaningful
+   * text/tool event. Applies only before the stream is committed, so a timed
+   * out candidate can be replaced without duplicating visible output/tools. */
+  firstEventTimeoutMs?: number;
+}
+
+export function createRotatingProvider(config: CreateRotatingProviderConfig): LLMProvider {
+  const candidates = config.candidates;
+  if (candidates.length === 0) {
+    throw new Error('rotating-provider: candidates list is empty');
+  }
+
+  const providerId = config.providerId;
+  const networkRetryAttempts = Math.max(0, config.networkRetryAttempts ?? NETWORK_RETRY_ATTEMPTS);
+  const networkRetryDelayMs = config.networkRetryDelayMs ?? ((attempt: number) => {
+    return Math.min(NETWORK_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1), NETWORK_RETRY_MAX_DELAY_MS);
+  });
+  const firstEventTimeoutMs = Math.max(1, config.firstEventTimeoutMs ?? PROVIDER_FIRST_EVENT_TIMEOUT_MS);
+  const normalEmptyRetryAttempts = Math.max(
+    0,
+    Math.trunc(config.normalEmptyRetryAttempts ?? NORMAL_EMPTY_RETRY_ATTEMPTS),
+  );
+  // A credential/account failure, a provider that never produced its first
+  // usable event, or a network-exhausted candidate that a later candidate
+  // outlived (see the per-call networkFailedThisCall sets) is kept out of
+  // later model rounds in this agent run. This is run-local only; only
+  // credential failures enter the persisted cooldown.
+  const unavailableProfiles = new Set<string>();
+  // Throttling can be model-specific even when models share one credential.
+  // Skip only that candidate for this task; a new user request starts fresh.
+  const rateLimitedCandidates = new Set<string>();
+  let exhaustedRateLimitError: Error | undefined;
+  // W4-2: stream() runs once per tool-loop round with the full history, so
+  // without this run-local latch the same "images omitted" notice repeats on
+  // every remaining round of the turn.
+  let imagesOmittedAnnounced = false;
+
+  const cooldownIdFor = (candidate: RotatingCandidate): string => (
+    candidate.cooldownId || candidate.profileId
+  );
+
+  const rateLimitIdFor = (candidate: RotatingCandidate): string => (
+    JSON.stringify([candidate.profileId, candidate.providerId, candidate.modelId])
+  );
+  const isUnavailable = (candidate: RotatingCandidate): boolean => (
+    unavailableProfiles.has(cooldownIdFor(candidate))
+    || rateLimitedCandidates.has(rateLimitIdFor(candidate))
+  );
+  const markUnavailable = (candidate: RotatingCandidate, kind: KeyFailureKind, reason: string): void => {
+    if (kind === 'rate_limit') {
+      rateLimitedCandidates.add(rateLimitIdFor(candidate));
+    } else {
+      markCooldown(cooldownIdFor(candidate), kind, reason);
+      unavailableProfiles.add(cooldownIdFor(candidate));
+    }
+  };
+
+  const reportCandidates = (): void => {
+    config.onCandidatesObserved?.({
+      candidateCount: candidates.length,
+      availableCandidateCount: candidates.filter(
+        (candidate) => !isUnavailable(candidate),
+      ).length,
+    });
+  };
+
+  /**
+   * Events that are pure preamble — getting one doesn't commit us to this
+   * candidate because the user hasn't seen anything yet. We keep draining
+   * past them until we see either:
+   *   - a content-ish event (text_*, thinking_*, tool_use_*, message_end)
+   *     → commit (return iterator + buffered preamble + first content event)
+   *   - an `error` event / thrown exception → classify and rotate/propagate
+   *
+   * pi-ai's stream starts with `{type: 'start'}`; core-agent maps that to
+   * `{type: 'message_start'}` before this wrapper sees it. Some transports
+   * also yield an internal `{type: 'content_block_start'}` before the real
+   * text_delta. If we commit on those preamble events and the actual
+   * provider call then throws on the NEXT iterator.next(), we'd be past the
+   * point of rotation and the user would just see the first candidate's
+   * error instead of falling back.
+   */
+  const PREAMBLE_TYPES = new Set<string>(['start', 'message_start', 'content_block_start']);
+
+  let terminalRateLimit: Error | undefined;
+
+  function observeFailure(cand: RotatingCandidate, params: CompletionParams, error: unknown, committed = false): void {
+    if (terminalRateLimit) throw terminalRateLimit;
+    if (cand.providerId === 'custom' && params.messages.some(message => messageImageCount(message) > 0)) {
+      cand.imageSupport?.observeRejection(error);
+    }
+    if (committed && (classifyKeyFailure(error) === 'rate_limit' || isProviderRateLimitError(error))) {
+      terminalRateLimit = exhaustedCredentialError(error, { kind: 'rate_limit', cooldownKind: null });
+      config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+      throw terminalRateLimit;
+    }
+  }
+
+  /** Substitute in the candidate's own model metadata so a cross-provider
+   *  fallback hits its own endpoint and request limits even though
+   *  AgentRunner only knows about the primary model.
+   *
+   *  Main turns mark their catalog-derived cap as `model_default`; only that
+   *  generated default follows the candidate. Auxiliary semantic calls mark
+   *  `provider_default`, omit a call-specific cap, and keep that omission
+   *  across fallback. */
+  function paramsFor(cand: RotatingCandidate, params: CompletionParams): CompletionParams {
+    const next = { ...params, model: cand.modelId,
+      ...(config.onRequestFailure ? { onRequestFailure: config.onRequestFailure } : {}),
+    };
+    const imageLimit = cand.imageSupport?.unsupported ? 0 : cand.maxInputImages;
+    if (typeof imageLimit === 'number' && Number.isFinite(imageLimit)) {
+      next.messages = boundMessagesForImageLimit(params.messages, imageLimit);
+      // W4-2 evidence: a text-only model silently loses every attached image
+      // here, and the visible symptom is the model "admitting" it cannot see
+      // — sampled users debugged that as their own mistake. Log the drop so
+      // diagnosis has a recorded fact; the user-facing notice needs the
+      // provider_fallback-style event plumbing (recorded in the plan doc).
+      if (imageLimit === 0) {
+        const dropped = params.messages.reduce(
+          (sum, message) => sum + messageImageCount(message),
+          0,
+        );
+        if (dropped > 0) {
+          log.warn('image attachments dropped for text-only model', {
+            provider_id: cand.providerId,
+            dropped_images: dropped,
+          });
+        }
+      }
+    }
+    const metadata = params.requestMetadata;
+    const usesModelDefault = !!metadata
+      && typeof metadata === 'object'
+      && !Array.isArray(metadata)
+      && metadata.outputLimitSource === 'model_default';
+    if (usesModelDefault) {
+      next.maxTokens = typeof cand.maxTokens === 'number'
+        && Number.isFinite(cand.maxTokens)
+        && cand.maxTokens > 0
+        ? Math.trunc(cand.maxTokens)
+        : undefined;
+    }
+    return next;
+  }
+
+  function abortError(signal: AbortSignal): Error {
+    return signal.reason instanceof Error
+      ? signal.reason
+      : Object.assign(new Error('Request aborted'), { code: 'ABORT_ERR' });
+  }
+
+  function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw abortError(signal);
+  }
+
+  function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(abortError(signal));
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener?.('abort', onAbort);
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        cleanup();
+        reject(abortError(signal!));
+      };
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+    });
+  }
+
+  function exhaustedNetworkError(lastErr: unknown): Error {
+    // An unknown error may use the bounded retry policy without proving a
+    // network fault. Preserve its original diagnostic instead of inventing one.
+    const transientKind = classifyTransientNetworkError(lastErr);
+    if (classifyKeyFailure(lastErr) === null
+      && (transientKind === null || transientKind === 'rate_limit')) {
+      return Object.assign(new Error(lastErr instanceof Error ? lastErr.message : String(lastErr)), {
+        code: 'PROVIDER_RETRIES_EXHAUSTED', cause: lastErr,
+      });
+    }
+    const msg = formatKeyFailure(lastErr) || 'network error';
+    return Object.assign(
+      new Error(`All configured model candidates failed after network retries: ${msg.replace(/fetch[_\s-]?failed/ig, 'connection failed')}`),
+      // The text above is diagnostic. Keeping the original error as `cause` is
+      // what lets `classifyTransientNetworkError` walk to it and the user see
+      // "the model connection is unstable, try again" instead of
+      // "[network] connection failed" — 2026-08-08, a transient blip mid-run
+      // showed the raw sentence, which names a transport the user cannot act on
+      // and omits the one thing they can do.
+      { code: 'PROVIDER_NETWORK_EXHAUSTED', cause: lastErr },
+    );
+  }
+
+  function exhaustedCredentialError(lastErr: unknown, failure: PreCommitFailure): Error {
+    const codeByKind: Partial<Record<KeyFailureKind | RetryableErrorKind, string>> = {
+      auth: 'PROVIDER_AUTH_EXHAUSTED',
+      permission: 'PROVIDER_PERMISSION_EXHAUSTED',
+      rate_limit: 'PROVIDER_RATE_LIMIT_EXHAUSTED',
+      balance: 'PROVIDER_BALANCE_EXHAUSTED',
+    };
+    const code = codeByKind[failure.kind];
+    if (!code) return lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    const message = lastErr instanceof Error ? lastErr.message : (formatKeyFailure(lastErr) || String(lastErr));
+    return Object.assign(new Error(message), { code, cause: lastErr });
+  }
+
+  type PreCommitFailure = {
+    kind: KeyFailureKind | RetryableErrorKind;
+    cooldownKind: KeyFailureKind | null;
+    retryCurrent?: boolean;
+  };
+
+  function classifyPreCommitFailure(err: unknown): PreCommitFailure | null {
+    if (isProviderNoFirstEventTimeout(err)) {
+      return { kind: 'timeout', cooldownKind: null, retryCurrent: false };
+    }
+    const keyKind = classifyKeyFailure(err);
+    if (keyKind) return { kind: keyKind, cooldownKind: keyKind };
+    if (isProviderRateLimitError(err)) return { kind: 'rate_limit', cooldownKind: 'rate_limit' };
+
+    const retryableKind = classifyRetryableErrorLocal(err);
+    if (retryableKind) return { kind: retryableKind, cooldownKind: null };
+
+    return null;
+  }
+
+  function shouldRetryCurrentCandidate(failure: PreCommitFailure): boolean {
+    if (failure.retryCurrent === false) return false;
+    return failure.cooldownKind === null || failure.kind === 'network';
+  }
+
+  async function tryRefreshAuthentication(
+    cand: RotatingCandidate,
+    failure: PreCommitFailure,
+    attemptedProfiles: Set<string>,
+  ): Promise<boolean> {
+    const candidateId = cooldownIdFor(cand);
+    if (
+      failure.kind !== 'auth'
+      || !cand.refreshCredential
+      || attemptedProfiles.has(candidateId)
+    ) return false;
+
+    attemptedProfiles.add(candidateId);
+    log.info('refreshing OAuth credential after pre-content auth failure', {
+      profile_id: maskId(cand.profileId),
+      provider_id: cand.providerId,
+    });
+    try {
+      const refreshed = await cand.refreshCredential();
+      log.info('OAuth credential refresh completed', {
+        profile_id: maskId(cand.profileId),
+        provider_id: cand.providerId,
+        result: refreshed ? 'success' : 'unavailable',
+      });
+      return refreshed;
+    } catch (err) {
+      log.warn('OAuth credential refresh failed', {
+        profile_id: maskId(cand.profileId),
+        provider_id: cand.providerId,
+        error_chars: err instanceof Error ? err.message.length : String(err).length,
+      });
+      return false;
+    }
+  }
+
+  function retryAttemptsFor(params: CompletionParams): number {
+    const agentAttempt = params.retryContext?.agentAttempt;
+    return typeof agentAttempt === 'number' && Number.isFinite(agentAttempt) && agentAttempt > 0
+      ? 0
+      : networkRetryAttempts;
+  }
+
+  function normalEmptyRetriesFor(params: CompletionParams): number {
+    const agentAttempt = params.retryContext?.agentAttempt;
+    return typeof agentAttempt === 'number' && Number.isFinite(agentAttempt) && agentAttempt > 0
+      ? 0
+      : normalEmptyRetryAttempts;
+  }
+
+  function emptyKindForTermination(category: ProviderTerminationCategory | undefined): ProviderEmptyKind {
+    if (category === 'normal') return 'normal_end_empty';
+    if (category === 'safety') return 'safety_filtered_empty';
+    return 'unknown_empty';
+  }
+
+  /** complete()'s counterpart of `normal_end_empty`: the provider ended the
+   *  turn normally with neither visible text nor a tool call. Thinking-only
+   *  content counts as empty — the reflection loop, the main complete()
+   *  caller, reads text blocks only. A truncated reply is not "empty". */
+  function isNormalEmptyCompletion(result: CompletionResult): boolean {
+    if (result.stopReason === 'max_tokens') return false;
+    return !result.content.some((block) => (
+      block.type === 'tool_use'
+      || (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0)
+    ));
+  }
+
+  type EmptyObservation = {
+    kind: ProviderEmptyKind;
+    terminalEventSeen: boolean;
+    terminationCategory?: ProviderTerminationCategory;
+    usage?: Partial<Usage>;
+  };
+
+  async function streamOne(cand: RotatingCandidate, params: CompletionParams): Promise<{
+    iterator: AsyncIterator<StreamEvent>;
+    buffered: StreamEvent[];
+    cleanup: () => void;
+  } | { rotatable: true; err: unknown; failure: PreCommitFailure; empty?: EmptyObservation }
+    | { rotatable: false; err: unknown; empty?: EmptyObservation }> {
+    const parentSignal = (params as { signal?: AbortSignal }).signal;
+    if (parentSignal?.aborted) {
+      return { rotatable: false, err: abortError(parentSignal) };
+    }
+
+    let provider: LLMProvider;
+    try {
+      provider = await cand.build();
+    } catch (err) {
+      if (parentSignal?.aborted) {
+        return { rotatable: false, err: abortError(parentSignal) };
+      }
+      // Build-time failure can be a bad credential or a transient provider
+      // client init/network failure; rotate only for classified cases.
+      const failure = classifyPreCommitFailure(err);
+      if (failure) return { rotatable: true, err, failure };
+      return { rotatable: false, err };
+    }
+
+    if (parentSignal?.aborted) {
+      return { rotatable: false, err: abortError(parentSignal) };
+    }
+
+    const providerController = new AbortController();
+    let timedOutError: ProviderNoFirstEventTimeoutError | null = null;
+    let parentAbortError: Error | null = null;
+    let rejectGate: (err: Error) => void = () => {};
+    const preCommitGate = new Promise<never>((_resolve, reject) => { rejectGate = reject; });
+    const onParentAbort = () => {
+      parentAbortError = parentSignal?.reason instanceof Error
+        ? parentSignal.reason
+        : Object.assign(new Error('Request aborted'), { code: 'ABORT_ERR' });
+      rejectGate(parentAbortError);
+      providerController.abort(parentAbortError);
+    };
+    parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+    const rawRequestFirstEventTimeoutMs = params.firstEventTimeoutMs;
+    const requestFirstEventTimeoutMs = Number.isFinite(rawRequestFirstEventTimeoutMs)
+      && Number(rawRequestFirstEventTimeoutMs) > 0
+      ? Math.max(1, Math.trunc(Number(rawRequestFirstEventTimeoutMs)))
+      : firstEventTimeoutMs;
+    let firstEventTimer: NodeJS.Timeout | null = setTimeout(() => {
+      timedOutError = new ProviderNoFirstEventTimeoutError(cand.providerId, requestFirstEventTimeoutMs);
+      rejectGate(timedOutError);
+      providerController.abort(timedOutError);
+    }, requestFirstEventTimeoutMs);
+
+    const clearFirstEventTimer = () => {
+      if (!firstEventTimer) return;
+      clearTimeout(firstEventTimer);
+      firstEventTimer = null;
+    };
+
+    let iterator: AsyncIterator<StreamEvent> | null = null;
+    const cleanup = () => {
+      clearFirstEventTimer();
+      parentSignal?.removeEventListener('abort', onParentAbort);
+    };
+    const stopUncommittedStream = () => {
+      cleanup();
+      if (!providerController.signal.aborted) providerController.abort();
+      try {
+        const returned = iterator?.return?.();
+        if (returned && typeof (returned as Promise<unknown>).catch === 'function') {
+          void (returned as Promise<unknown>).catch(() => {});
+        }
+      } catch { /* best-effort disposal */ }
+    };
+
+    try {
+      const iter = provider.stream(paramsFor(cand, { ...params, signal: providerController.signal }));
+      iterator = (iter as AsyncIterable<StreamEvent>)[Symbol.asyncIterator]();
+    } catch (err) {
+      stopUncommittedStream();
+      if (parentSignal?.aborted) {
+        return { rotatable: false, err: abortError(parentSignal) };
+      }
+      const failure = classifyPreCommitFailure(err);
+      if (failure) return { rotatable: true, err, failure };
+      return { rotatable: false, err };
+    }
+    const buffered: StreamEvent[] = [];
+
+    // Drain past pure-preamble events. Keep only a bounded prefix for the
+    // caller and periodically yield to the timer queue so even a provider that
+    // emits preamble synchronously forever cannot starve the deadline.
+    const PREAMBLE_MAX = 8;
+    let preambleCount = 0;
+    while (true) {
+      let step: IteratorResult<StreamEvent>;
+      try {
+        step = await Promise.race([iterator.next(), preCommitGate]);
+        if (timedOutError) throw timedOutError;
+        if (parentAbortError) throw parentAbortError;
+      } catch (err) {
+        const surfacedError = timedOutError || parentAbortError || err;
+        stopUncommittedStream();
+        if (parentAbortError || parentSignal?.aborted) return { rotatable: false, err: surfacedError };
+        const failure = classifyPreCommitFailure(surfacedError);
+        if (failure) return { rotatable: true, err: surfacedError, failure };
+        return { rotatable: false, err: surfacedError };
+      }
+      if (step.done) {
+        // No terminal event means the transport ended early. This is distinct
+        // from a provider explicitly ending with an empty assistant message
+        // and can use the ordinary transport retry/fallback path.
+        stopUncommittedStream();
+        const err = new ProviderEmptyResponseError(cand.providerId, 'transport_empty');
+        const failure = classifyPreCommitFailure(err);
+        if (failure) {
+          return {
+            rotatable: true,
+            err,
+            failure,
+            empty: { kind: 'transport_empty', terminalEventSeen: false },
+          };
+        }
+        return {
+          rotatable: false,
+          err,
+          empty: { kind: 'transport_empty', terminalEventSeen: false },
+        };
+      }
+      const ev = step.value as StreamEvent;
+      const type = (ev as any)?.type;
+
+      // In-band error event — classify like a thrown error.
+      if (type === 'error') {
+        const err = (ev as any).error ?? new Error(String((ev as any).text ?? 'unknown stream error'));
+        stopUncommittedStream();
+        const failure = classifyPreCommitFailure(err);
+        if (failure) return { rotatable: true, err, failure };
+        return { rotatable: false, err };
+      }
+
+      // Preamble → buffer and keep draining.
+      if (PREAMBLE_TYPES.has(type)) {
+        preambleCount += 1;
+        if (buffered.length < PREAMBLE_MAX) buffered.push(ev);
+        if (preambleCount % PREAMBLE_MAX === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        continue;
+      }
+
+      // Empty text deltas are transport noise, not usable output. Keep waiting
+      // for actual text/tool content or a terminal event.
+      if (type === 'text_delta' && !String((ev as any).text ?? '').trim()) {
+        preambleCount += 1;
+        if (buffered.length < PREAMBLE_MAX) buffered.push(ev);
+        if (preambleCount % PREAMBLE_MAX === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        continue;
+      }
+
+      if (type === 'message_end') {
+        const content = Array.isArray((ev as any).content) ? (ev as any).content : [];
+        const hasUsableContent = content.some((item: any) => {
+          if (!item || typeof item !== 'object') return false;
+          if (item.type === 'text') return !!String(item.text ?? '').trim();
+          return item.type === 'tool_use';
+        });
+        if (!hasUsableContent) {
+          stopUncommittedStream();
+          const category = (ev as Extract<StreamEvent, { type: 'message_end' }>)
+            .providerTermination?.category;
+          const kind = emptyKindForTermination(category);
+          return {
+            rotatable: false,
+            err: new ProviderEmptyResponseError(cand.providerId, kind),
+            empty: {
+              kind,
+              terminalEventSeen: true,
+              terminationCategory: category ?? 'unknown',
+              ...((ev as Extract<StreamEvent, { type: 'message_end' }>).usage
+                ? { usage: (ev as Extract<StreamEvent, { type: 'message_end' }>).usage }
+                : {}),
+            },
+          };
+        }
+      }
+
+      // First real content event — commit.
+      buffered.push(ev);
+      clearFirstEventTimer();
+      return { iterator, buffered, cleanup };
+    }
+  }
+
+  return {
+    id: providerId,
+    name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
+
+    async complete(params: CompletionParams): Promise<CompletionResult> {
+      if (terminalRateLimit) throw terminalRateLimit;
+      let lastErr: unknown = new ProviderCandidatesUnavailableError();
+      let lastCand: RotatingCandidate | null = null;
+      let lastFailure: PreCommitFailure | null = null;
+      let exhaustedNetwork = false;
+      const retryAttempts = retryAttemptsFor(params);
+      // Like stream(), retry normal empty output on the same model, then fail.
+      // Auxiliary callers own recovery; empty output must not trigger rotation.
+      const allowedNormalEmptyRetries = normalEmptyRetriesFor(params);
+      let normalEmptyRetry = 0;
+      // Deferred network latch — same contract as stream(); see the comment
+      // there for why promotion only happens after a later candidate succeeds.
+      const networkFailedThisCall = new Set<string>();
+      const authRefreshAttempted = new Set<string>();
+      reportCandidates();
+      throwIfAborted(params.signal);
+      if (exhaustedRateLimitError) throw exhaustedRateLimitError;
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        if (isUnavailable(cand)) continue;
+        lastCand = cand;
+
+        let networkRetry = 0;
+        while (true) {
+          if (params.signal?.aborted) {
+            throw abortError(params.signal);
+          }
+          try {
+            throwIfAborted((params as { signal?: AbortSignal }).signal);
+            const provider = await cand.build();
+            throwIfAborted((params as { signal?: AbortSignal }).signal);
+            const result = await provider.complete(paramsFor(cand, params));
+            throwIfAborted((params as { signal?: AbortSignal }).signal);
+            if (isNormalEmptyCompletion(result)) {
+              if (normalEmptyRetry < allowedNormalEmptyRetries) {
+                normalEmptyRetry += 1;
+                log.warn('complete retrying normal terminal empty response', {
+                  profile_id: maskId(cand.profileId),
+                  attempt: normalEmptyRetry,
+                  max_attempts: allowedNormalEmptyRetries,
+                });
+                continue;
+              }
+              throw new ProviderEmptyResponseError(cand.providerId, 'normal_end_empty');
+            }
+            config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+            config.onSuccess?.(cand.profileId, cand);
+            for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+            return result;
+          } catch (err) {
+            const signal = (params as { signal?: AbortSignal }).signal;
+            if (signal?.aborted) {
+              config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+              throw abortError(signal);
+            }
+            observeFailure(cand, params, err);
+            lastErr = err;
+            const failure = err instanceof ProviderEmptyResponseError && err.kind === 'normal_end_empty'
+              ? null : classifyPreCommitFailure(err);
+            if (!failure) {
+              // Non-rotatable → this candidate owns the visible error.
+              config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+              throw err;
+            }
+            lastFailure = failure;
+
+            if (await tryRefreshAuthentication(cand, failure, authRefreshAttempted)) {
+              continue;
+            }
+
+            if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
+              networkRetry += 1;
+              log.warn('complete retrying current candidate', {
+                profile_id: maskId(cand.profileId),
+                kind: failure.kind,
+                attempt: networkRetry,
+                max_attempts: retryAttempts,
+              });
+              await sleep(networkRetryDelayMs(networkRetry), (params as { signal?: AbortSignal }).signal);
+              continue;
+            }
+
+            const reason = formatKeyFailure(err);
+            if (failure.cooldownKind && failure.cooldownKind !== 'network') {
+              markUnavailable(cand, failure.cooldownKind, reason);
+            } else if (failure.kind === 'network') {
+              networkFailedThisCall.add(cooldownIdFor(cand));
+            }
+            exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
+            log.warn('complete trying next candidate', {
+              profile_id: maskId(cand.profileId),
+              kind: failure.kind,
+              candidate_index: i + 1,
+              candidate_count: candidates.length,
+            });
+            break;
+          }
+        }
+      }
+      // Exhausted: surface the last candidate's failure as the call's owner.
+      if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
+      if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
+      if (lastFailure) {
+        const error = exhaustedCredentialError(lastErr, lastFailure);
+        if (lastFailure.kind === 'rate_limit' && candidates.every(isUnavailable)) exhaustedRateLimitError = error;
+        throw error;
+      }
+      throw lastErr;
+    },
+
+    async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
+      if (terminalRateLimit) throw terminalRateLimit;
+      let lastErr: unknown = new ProviderCandidatesUnavailableError();
+      let lastCand: RotatingCandidate | null = null;
+      let lastFailure: PreCommitFailure | null = null;
+      let exhaustedNetwork = false;
+      const retryAttempts = retryAttemptsFor(params);
+      const allowedNormalEmptyRetries = normalEmptyRetriesFor(params);
+      // Candidates whose network-class failure exhausted the same-candidate
+      // retry budget in THIS call. Promoted into `unavailableProfiles` only at
+      // the commit point — a later candidate working is the proof the failure
+      // was candidate-specific rather than a machine-local outage. An
+      // exhausted sweep latches nothing: compaction shares this instance and
+      // swallows the terminal error, so a full-network blip must leave the
+      // next call free to retry every candidate.
+      const networkFailedThisCall = new Set<string>();
+      const authRefreshAttempted = new Set<string>();
+      reportCandidates();
+      throwIfAborted(params.signal);
+      if (exhaustedRateLimitError) throw exhaustedRateLimitError;
+
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        if (isUnavailable(cand)) continue;
+        lastCand = cand;
+        let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
+        let networkRetry = 0;
+        let normalEmptyRetry = 0;
+        let normalEmptyRecoveryActive = false;
+
+        while (true) {
+          attempt = await streamOne(cand, params);
+
+          if (!('rotatable' in attempt)) break;
+
+          if (attempt.empty) {
+            yield {
+              type: 'provider_empty',
+              kind: attempt.empty.kind,
+              providerId: cand.providerId,
+              candidateIndex: i + 1,
+              candidateCount: candidates.length,
+              terminalEventSeen: attempt.empty.terminalEventSeen,
+              ...(attempt.empty.terminationCategory
+                ? { terminationCategory: attempt.empty.terminationCategory }
+                : {}),
+              ...(attempt.empty.usage ? { usage: attempt.empty.usage } : {}),
+            };
+
+            if (attempt.empty.kind === 'normal_end_empty') {
+              lastErr = attempt.err;
+              if (normalEmptyRetry < allowedNormalEmptyRetries) {
+                normalEmptyRetry += 1;
+                normalEmptyRecoveryActive = true;
+                log.warn('stream retrying normal terminal empty response', {
+                  profile_id: maskId(cand.profileId),
+                  attempt: normalEmptyRetry,
+                  max_attempts: allowedNormalEmptyRetries,
+                });
+                yield {
+                  type: 'retry',
+                  attempt: normalEmptyRetry,
+                  reason: 'empty response after normal provider termination',
+                };
+                continue;
+              }
+              break;
+            }
+
+            if (attempt.empty.kind === 'safety_filtered_empty'
+              || attempt.empty.kind === 'unknown_empty') {
+              lastErr = attempt.err;
+              break;
+            }
+          }
+
+          if (!attempt.rotatable) break;
+
+          lastErr = attempt.err;
+
+          // Once recovery was triggered by a normal terminal empty response,
+          // the exactly-one follow-up request stays on this model. A rate
+          // limit still advances to the next configured candidate; other
+          // failures cannot consume transport retry or fallback budgets.
+          if (normalEmptyRecoveryActive && attempt.failure.kind !== 'rate_limit') break;
+
+          const failure = attempt.failure;
+          lastFailure = failure;
+          if (await tryRefreshAuthentication(cand, failure, authRefreshAttempted)) {
+            continue;
+          }
+          if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
+            networkRetry += 1;
+            const reason = formatKeyFailure(attempt.err);
+            log.warn('stream retrying current candidate', {
+              profile_id: maskId(cand.profileId),
+              kind: failure.kind,
+              attempt: networkRetry,
+              max_attempts: retryAttempts,
+            });
+            yield { type: 'retry', attempt: networkRetry, reason };
+            await sleep(networkRetryDelayMs(networkRetry), (params as { signal?: AbortSignal }).signal);
+            continue;
+          }
+
+          break;
+        }
+
+        if (!attempt) continue;
+
+        if ('rotatable' in attempt) {
+          observeFailure(cand, params, attempt.err);
+          lastErr = attempt.err;
+          if (!attempt.rotatable || (normalEmptyRecoveryActive && attempt.failure.kind !== 'rate_limit')) {
+            // Non-rotatable failure before any content event → this
+            // candidate is what the user sees in the surfaced error.
+            config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+            throw attempt.err;
+          }
+          const failure = attempt.failure;
+          const reason = formatKeyFailure(attempt.err);
+          const fallbackCandidate = candidates
+            .slice(i + 1)
+            .find((candidate) => !isUnavailable(candidate));
+          const hasFallback = !!fallbackCandidate;
+          if (failure.cooldownKind && failure.cooldownKind !== 'network') {
+            markUnavailable(cand, failure.cooldownKind, reason);
+            if (failure.kind === 'auth' && hasFallback) {
+              yield {
+                type: 'provider_fallback',
+              reason: 'auth',
+              providerId: cand.providerId,
+              candidateIndex: i + 1,
+              candidateCount: candidates.length,
+              };
+            }
+          } else if (isProviderNoFirstEventTimeout(attempt.err) && hasFallback) {
+            unavailableProfiles.add(cooldownIdFor(cand));
+            yield {
+              type: 'provider_fallback',
+              reason: 'no_first_event_timeout',
+              providerId: cand.providerId,
+              candidateIndex: i + 1,
+              candidateCount: candidates.length,
+            };
+          } else if (isProviderNoFirstEventTimeout(attempt.err)) {
+            unavailableProfiles.add(cooldownIdFor(cand));
+          } else if (failure.kind === 'network') {
+            networkFailedThisCall.add(cooldownIdFor(cand));
+          }
+          exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
+          log.warn('stream trying next candidate', {
+            profile_id: maskId(cand.profileId),
+            kind: failure.kind,
+            candidate_index: i + 1,
+            candidate_count: candidates.length,
+          });
+          continue;
+        }
+
+        // Drained past preamble without hitting an error → commit to
+        // this candidate. From here on, failures propagate to caller
+        // unchanged (rotation would mean corrupting visible stream).
+        const { iterator, buffered, cleanup } = attempt;
+        config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+        config.onSuccess?.(cand.profileId, cand);
+        // This candidate works, so the network failures collected above were
+        // candidate-specific: keep those candidates out of the remaining
+        // model rounds of this run. Deliberately no markCooldown — the next
+        // run starts from the full candidate list again.
+        for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+
+        // W4-2: the committed candidate is text-only, so paramsFor stripped
+        // every attached image. Say so — the visible alternative is the model
+        // "admitting" it cannot see, which sampled users debugged as their
+        // own mistake.
+        if ((cand.imageSupport?.unsupported || cand.maxInputImages === 0) && !imagesOmittedAnnounced) {
+          const omitted = params.messages.reduce(
+            (sum, message) => sum + messageImageCount(message),
+            0,
+          );
+          if (omitted > 0) {
+            imagesOmittedAnnounced = true;
+            yield { type: 'images_omitted', count: omitted, providerId: cand.providerId } as StreamEvent;
+          }
+        }
+
+        for (const ev of buffered) yield ev;
+
+        try {
+          while (true) {
+            const { value, done } = await iterator.next();
+            if (done) return;
+            if (value?.type === 'error') observeFailure(cand, params, value.error, true);
+            if (value) yield value;
+          }
+        } catch (err) {
+          // Post-commit failure: surface upward, no rotation.
+          observeFailure(cand, params, err, true);
+          throw err;
+        } finally {
+          cleanup();
+        }
+      }
+
+      // Exhausted all candidates — surface the last one as the owner of
+      // the visible failure, then throw whatever it gave us.
+      if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
+      if (isProviderNoFirstEventTimeout(lastErr)) throw lastErr;
+      if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
+      if (lastFailure) {
+        const error = exhaustedCredentialError(lastErr, lastFailure);
+        if (lastFailure.kind === 'rate_limit' && candidates.every(isUnavailable)) exhaustedRateLimitError = error;
+        throw error;
+      }
+      throw lastErr;
+    },
+
+    async validateAuth(): Promise<boolean> {
+      for (const cand of candidates) {
+        try {
+          const provider = await cand.build();
+          if (await provider.validateAuth()) return true;
+        } catch { /* try next */ }
+      }
+      return false;
+    },
+  };
+}

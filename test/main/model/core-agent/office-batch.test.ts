@@ -1,0 +1,522 @@
+import { describe, it, expect } from 'vitest';
+
+import {
+  buildDocxBatch, buildXlsxBatch, buildXlsxCellProps, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, columnLetter,
+  serializeOfficeBatch, OfficeEditInputError,
+  type DocxParagraphSpec, type XlsxCell, type EditOp,
+} from '../../../../src/main/model/core-agent/office-batch';
+
+describe('buildDocxBatch', () => {
+  it('maps text / style / align / list to OfficeCLI props in order', () => {
+    const ops = buildDocxBatch([
+      { text: '季度报告', style: 'Heading1' },
+      { text: '正文段落 繁體 😀', align: 'justify' },
+      { text: '第一项', list: 'bullet' },
+      { text: '步骤一', list: 'ordered' },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/body', type: 'p', props: { text: '季度报告', style: 'Heading1' } },
+      { command: 'add', parent: '/body', type: 'p', props: { text: '正文段落 繁體 😀', align: 'justify' } },
+      { command: 'add', parent: '/body', type: 'p', props: { text: '第一项', listStyle: 'bullet' } },
+      { command: 'add', parent: '/body', type: 'p', props: { text: '步骤一', listStyle: 'ordered' } },
+    ]);
+  });
+
+  it('drops null / non-string-text entries the model may emit', () => {
+    const bad = [null, { style: 'Heading1' }, { text: 'kept' }] as unknown as DocxParagraphSpec[];
+    const ops = buildDocxBatch(bad);
+    expect(ops).toEqual([{ command: 'add', parent: '/body', type: 'p', props: { text: 'kept' } }]);
+  });
+
+  it('ignores an unknown list value rather than passing it through', () => {
+    const bad = [{ text: 'x', list: 'roman' }] as unknown as DocxParagraphSpec[];
+    const ops = buildDocxBatch(bad);
+    expect(ops[0].props).toEqual({ text: 'x' });
+  });
+
+  it('serializes Unicode operations as ASCII-only JSON for hidden Windows stdin', () => {
+    const text = 'a"b\n,季度报告 😀';
+    const json = serializeOfficeBatch(buildDocxBatch([{ text }]));
+    expect(Buffer.from(json, 'ascii').toString('ascii')).toBe(json);
+    expect(json).toContain('\\u5b63');
+    expect(JSON.parse(json)[0].props.text).toBe(text);
+  });
+
+  it('passes inline run styling through, coercing bool/number to strings', () => {
+    const ops = buildDocxBatch([
+      { text: '强调', bold: true, italic: false, color: '#1F4E79', size: 14, font: '微软雅黑' },
+    ]);
+    expect(ops).toEqual([
+      {
+        command: 'add', parent: '/body', type: 'p',
+        props: { text: '强调', bold: 'true', italic: 'false', color: '#1F4E79', size: '14', font: '微软雅黑' },
+      },
+    ]);
+  });
+
+  it('appends tables (add + per-cell set) and images (host p + picture) after paragraphs', () => {
+    const ops = buildDocxBatch(
+      [{ text: 'Intro' }],
+      [{ rows: [['H1', 'H2'], ['v1', '']], colWidths: '2in,3in' }],
+      [{ src: '/abs/logo.png', width: '2in', align: 'center' }],
+    );
+    expect(ops).toEqual([
+      { command: 'add', parent: '/body', type: 'p', props: { text: 'Intro' } },
+      { command: 'add', parent: '/body', type: 'table', props: { rows: '2', cols: '2', colWidths: '2in,3in' } },
+      { command: 'set', path: '/body/table[1]/tr[1]/tc[1]/p[1]', props: { text: 'H1' } },
+      { command: 'set', path: '/body/table[1]/tr[1]/tc[2]/p[1]', props: { text: 'H2' } },
+      { command: 'set', path: '/body/table[1]/tr[2]/tc[1]/p[1]', props: { text: 'v1' } },
+      { command: 'add', parent: '/body', type: 'p', props: { align: 'center' } },
+      { command: 'add', parent: '/body/p[2]', type: 'picture', props: { src: '/abs/logo.png', width: '2in' } },
+    ]);
+  });
+});
+
+describe('buildXlsxWorkbookBatch', () => {
+  it('reuses the default sheet (rename), adds later sheets, columns then cells', () => {
+    const ops = buildXlsxWorkbookBatch([
+      { name: 'Data', columns: [{ name: 'A', width: 24 }], rows: [['x']] },
+      { name: 'Summary', rows: [[{ value: 'total', bold: true }]] },
+    ]);
+    expect(ops).toEqual([
+      { command: 'set', path: '/Sheet1', props: { name: 'Data' } },
+      { command: 'add', parent: '/', type: 'sheet', props: { name: 'Summary' } },
+      { command: 'add', parent: '/Data', type: 'column', props: { name: 'A', width: '24' } },
+      { command: 'set', path: '/Data/A1', props: { value: 'x' } },
+      { command: 'set', path: '/Summary/A1', props: { value: 'total', bold: 'true' } },
+    ]);
+  });
+
+  it('creates all sheets before cross-sheet formulas and all cells before charts', () => {
+    const ops = buildXlsxWorkbookBatch([
+      {
+        name: '看板',
+        rows: [['销售额'], [{ formula: 'SUM(数据!B2:B3)' }]],
+        charts: [{
+          type: 'line',
+          dataRange: '数据!B1:B3',
+          categories: '数据!A2:A3',
+        }],
+      },
+      {
+        name: '数据',
+        rows: [['日期', '销售额'], ['7月1日', 100], ['7月2日', 120]],
+      },
+    ]);
+    const addDataSheet = ops.findIndex((op) => 'type' in op && op.type === 'sheet');
+    const dashboardFormula = ops.findIndex((op) => 'path' in op && op.path === '/看板/A2');
+    const finalDataCell = ops.findIndex((op) => 'path' in op && op.path === '/数据/B3');
+    const chart = ops.findIndex((op) => 'type' in op && op.type === 'chart');
+    expect(addDataSheet).toBeLessThan(dashboardFormula);
+    expect(dashboardFormula).toBeLessThan(finalDataCell);
+    expect(finalDataCell).toBeLessThan(chart);
+  });
+
+  it('keeps the default name when the first sheet is unnamed (no rename op)', () => {
+    expect(buildXlsxWorkbookBatch([{ rows: [['a']] }])).toEqual([
+      { command: 'set', path: '/Sheet1/A1', props: { value: 'a' } },
+    ]);
+  });
+
+  it('adds native charts after their source cells with range, labels, axes, and placement', () => {
+    const ops = buildXlsxWorkbookBatch([
+      {
+        name: '趋势',
+        rows: [['日期', '销售额'], ['7月1日', 120], ['7月2日', 180]],
+        charts: [{
+          type: 'line',
+          dataRange: '趋势!B1:B3',
+          categories: '趋势!A2:A3',
+          title: '每日销售额趋势',
+          anchor: 'D2:L18',
+          legend: 'none',
+          catTitle: '日期',
+          axistitle: '销售额（元）',
+          axismin: 0,
+          gridlines: true,
+          marker: 'circle:6',
+        }],
+      },
+    ]);
+    expect(ops.at(-2)).toEqual({
+      command: 'add',
+      parent: '/趋势',
+      type: 'chart',
+      props: {
+        chartType: 'line',
+        dataRange: '趋势!B1:B3',
+        categories: '趋势!A2:A3',
+        title: '每日销售额趋势',
+        anchor: 'D2:L18',
+        legend: 'none',
+        catTitle: '日期',
+        axistitle: '销售额（元）',
+        axismin: '0',
+        gridlines: 'true',
+        marker: 'circle:6',
+      },
+    });
+    expect(ops.at(-1)).toEqual({
+      command: 'set',
+      path: '/趋势/chart[1]',
+      props: { axismin: '0' },
+    });
+    expect(ops.findIndex((op) => 'path' in op && op.path === '/趋势/B3'))
+      .toBeLessThan(ops.findIndex((op) => 'type' in op && op.type === 'chart'));
+  });
+
+  it('drops malformed charts without a chart type', () => {
+    expect(buildXlsxWorkbookBatch([{
+      rows: [['A', 'B'], ['x', 1]],
+      charts: [{ dataRange: 'Sheet1!A1:B2' }],
+    }])).toEqual([
+      { command: 'set', path: '/Sheet1/A1', props: { value: 'A' } },
+      { command: 'set', path: '/Sheet1/B1', props: { value: 'B' } },
+      { command: 'set', path: '/Sheet1/A2', props: { value: 'x' } },
+      { command: 'set', path: '/Sheet1/B2', props: { value: '1' } },
+    ]);
+  });
+});
+
+describe('columnLetter', () => {
+  it('maps 0-based index to Excel column letters', () => {
+    expect([0, 1, 25, 26, 27, 51, 52, 701, 702].map(columnLetter))
+      .toEqual(['A', 'B', 'Z', 'AA', 'AB', 'AZ', 'BA', 'ZZ', 'AAA']);
+  });
+});
+
+describe('buildXlsxBatch', () => {
+  it('places rows as A1/B1… set ops; bare cells and objects, formula strips leading =', () => {
+    const ops = buildXlsxBatch('Sheet1', [
+      ['月份', '销售额'],
+      ['一月', 100],
+      [{ value: '合计', bold: true }, { formula: '=SUM(B2:B2)', format: '#,##0' }],
+    ] as XlsxCell[][]);
+    expect(ops).toEqual([
+      { command: 'set', path: '/Sheet1/A1', props: { value: '月份' } },
+      { command: 'set', path: '/Sheet1/B1', props: { value: '销售额' } },
+      { command: 'set', path: '/Sheet1/A2', props: { value: '一月' } },
+      { command: 'set', path: '/Sheet1/B2', props: { value: '100' } },
+      { command: 'set', path: '/Sheet1/A3', props: { value: '合计', bold: 'true' } },
+      { command: 'set', path: '/Sheet1/B3', props: { formula: 'SUM(B2:B2)', numberformat: '#,##0' } },
+    ]);
+  });
+
+  it('skips empty cells so a ragged grid leaves gaps', () => {
+    const ops = buildXlsxBatch('S', [['a', '', null as unknown as string, 'd']]);
+    expect(ops.map((o) => ('path' in o ? o.path : ''))).toEqual(['/S/A1', '/S/D1']);
+  });
+
+  it('passes cell styling props through alongside value/format', () => {
+    const ops = buildXlsxBatch('Sheet1', [
+      [{ value: '标题', bold: true, fill: '#1F4E79', 'font.color': '#FFFFFF', halign: 'center', merge: 'A1:C1' }],
+    ] as XlsxCell[][]);
+    expect(ops).toEqual([
+      {
+        command: 'set', path: '/Sheet1/A1',
+        props: { value: '标题', bold: 'true', fill: '#1F4E79', 'font.color': '#FFFFFF', halign: 'center', merge: 'A1:C1' },
+      },
+    ]);
+  });
+
+  it('uses one XLSX cell-property normalizer for create and edit callers', () => {
+    expect(buildXlsxCellProps({
+      value: 7,
+      formula: '=SUM(A1:A2)',
+      format: '#,##0.00',
+      bold: false,
+      fill: '#FFF2CC',
+    }, { allowEmptyValue: true })).toEqual({
+      formula: 'SUM(A1:A2)',
+      numberformat: '#,##0.00',
+      bold: 'false',
+      fill: '#FFF2CC',
+    });
+    expect(buildXlsxCellProps({ value: '', format: '@' }, { allowEmptyValue: true })).toEqual({
+      value: '',
+      numberformat: '@',
+    });
+  });
+});
+
+describe('buildPptxBatch', () => {
+  it('emits add-slide ops with title/body(text)/layout', () => {
+    const ops = buildPptxBatch([
+      { title: '封面', body: '副标题' },
+      { title: '要点', body: '第一行\n第二行', layout: 'Title and Content' },
+      {},
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: { title: '封面', text: '副标题' } },
+      { command: 'add', parent: '/', type: 'slide', props: { title: '要点', text: '第一行\n第二行', layout: 'Title and Content' } },
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+    ]);
+  });
+
+  it('adds free-positioned shapes under /slide[N] with slide background/transition', () => {
+    const ops = buildPptxBatch([
+      {
+        background: '#06101D', transition: 'fade',
+        shapes: [
+          { text: 'Hi', x: '0.65in', y: '0.58in', width: '3.2in', height: '0.32in', fill: '#38BDF8', color: '#FFFFFF', bold: true, align: 'center', size: 24 },
+        ],
+      },
+      { title: '要点', shapes: [{ text: 'box2', x: '1in', y: '1in', width: '2in', height: '0.5in' }] },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: { background: '#06101D', transition: 'fade' } },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Hi', x: '0.65in', y: '0.58in', width: '3.2in', height: '0.32in', fill: '#38BDF8', color: '#FFFFFF', bold: 'true', align: 'center', size: '24' },
+      },
+      { command: 'add', parent: '/', type: 'slide', props: { title: '要点' } },
+      { command: 'add', parent: '/slide[2]', type: 'shape', props: { text: 'box2', x: '1in', y: '1in', width: '2in', height: '0.5in' } },
+    ]);
+  });
+
+  it('skips a shape that coerces to no props while keeping the slide index in step', () => {
+    const ops = buildPptxBatch([
+      {},
+      { shapes: [{}, { text: 'x' }] },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      { command: 'add', parent: '/slide[2]', type: 'shape', props: { text: 'x' } },
+    ]);
+  });
+
+  it('drops orphan shape opacity modifiers but preserves them with explicit carriers', () => {
+    const ops = buildPptxBatch([{
+      shapes: [
+        { text: 'No fill', opacity: 0, lineOpacity: 0 },
+        { text: 'Filled', fill: '#FFFFFF', opacity: 0, line: '#111827', lineOpacity: 25 },
+        { text: 'Gradient', gradient: '#111827-#334155-0', opacity: 80 },
+      ],
+    }]);
+
+    expect(ops.slice(1)).toEqual([
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'No fill' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Filled', fill: '#FFFFFF', opacity: '0', line: '#111827', lineOpacity: '0.25' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Gradient', gradient: '#111827-#334155-0', opacity: '80' },
+      },
+    ]);
+  });
+
+  it.each([
+    [0, '0'], [0.5, '0.005'], [1, '0.01'], [45, '0.45'],
+    [50, '0.5'], [55, '0.55'], [100, '1'],
+  ])('converts the declared %s percent outline opacity to the engine fraction', (percent, fraction) => {
+    const ops = buildPptxBatch([{ shapes: [{ line: '#112233', lineOpacity: percent }] }]);
+    expect(ops[1].props).toEqual({ line: '#112233', lineOpacity: fraction });
+  });
+
+  it.each([-1, 101, Number.POSITIVE_INFINITY, Number.NaN])('does not normalize invalid outline opacity %s into a valid value', (value) => {
+    const ops = buildPptxBatch([{ shapes: [{ line: '#112233', lineOpacity: value }] }]);
+    expect(ops[1].props.lineOpacity).toBe(String(value));
+  });
+
+  it('normalizes the legacy outer shadow preset to OfficeCLI default shadow', () => {
+    const ops = buildPptxBatch([{
+      shapes: [
+        { text: 'Legacy card', shadow: 'outer' },
+        { text: 'Explicit shadow', shadow: '#808080' },
+      ],
+    }]);
+
+    expect(ops.slice(1)).toEqual([
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Legacy card', shadow: 'true' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Explicit shadow', shadow: '#808080' },
+      },
+    ]);
+  });
+
+  it('adds pictures and tables (with per-cell text, no /p[1]) under the slide', () => {
+    const ops = buildPptxBatch([
+      {
+        images: [{ src: '/abs/p.png', x: '1in', y: '1in', width: '2in', height: '2in' }],
+        tables: [{ rows: [['A', 'B'], ['c', 'd']], x: '1in', y: '4in' }],
+      },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      { command: 'add', parent: '/slide[1]', type: 'picture', props: { src: '/abs/p.png', x: '1in', y: '1in', width: '2in', height: '2in' } },
+      { command: 'add', parent: '/slide[1]', type: 'table', props: { rows: '2', cols: '2', x: '1in', y: '4in' } },
+      { command: 'set', path: '/slide[1]/table[1]/tr[1]/tc[1]', props: { text: 'A' } },
+      { command: 'set', path: '/slide[1]/table[1]/tr[1]/tc[2]', props: { text: 'B' } },
+      { command: 'set', path: '/slide[1]/table[1]/tr[2]/tc[1]', props: { text: 'c' } },
+      { command: 'set', path: '/slide[1]/table[1]/tr[2]/tc[2]', props: { text: 'd' } },
+    ]);
+  });
+
+  it('adds native editable charts and passes visual chart props through', () => {
+    const ops = buildPptxBatch([
+      {
+        charts: [{
+          type: 'column',
+          data: '营收:32,48,66;利润:8,14,21',
+          categories: 'Q1,Q2,Q3',
+          title: '业务增长',
+          x: '0.8in', y: '1.5in', width: '7.4in', height: '4.5in',
+          colors: '#5B5BD6,#22A06B', legend: 'bottom', dataLabels: 'value',
+        }],
+      },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      {
+        command: 'add', parent: '/slide[1]', type: 'chart',
+        props: {
+          chartType: 'column', data: '营收:32,48,66;利润:8,14,21', categories: 'Q1,Q2,Q3',
+          title: '业务增长', x: '0.8in', y: '1.5in', width: '7.4in', height: '4.5in',
+          colors: '#5B5BD6,#22A06B', legend: 'bottom', dataLabels: 'value',
+        },
+      },
+    ]);
+  });
+
+  it('accepts chartType alias and skips charts without a type', () => {
+    expect(buildPptxBatch([{
+      charts: [
+        { data: 'A:1,2' },
+        { chartType: 'line', data: 'A:1,2', categories: '一,二' },
+      ],
+    }])).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      {
+        command: 'add', parent: '/slide[1]', type: 'chart',
+        props: { chartType: 'line', data: 'A:1,2', categories: '一,二' },
+      },
+    ]);
+  });
+
+  it('passes advanced picture and table styling props through', () => {
+    const ops = buildPptxBatch([{
+      images: [{ src: '/abs/hero.png', crop: 'cover', opacity: 92, alt: '产品界面' }],
+      tables: [{
+        rows: [['指标', '结果']], width: '5in', headerFill: '#111827', bodyFill: '#F8FAFC',
+        style: 'Medium2', 'border.horizontal': '#D7DEE8', firstRow: true,
+      }],
+    }]);
+    expect(ops[1]).toEqual({
+      command: 'add', parent: '/slide[1]', type: 'picture',
+      props: { src: '/abs/hero.png', crop: 'cover', opacity: '92', alt: '产品界面' },
+    });
+    expect(ops[2]).toEqual({
+      command: 'add', parent: '/slide[1]', type: 'table',
+      props: {
+        rows: '1', cols: '2', width: '5in', headerFill: '#111827', bodyFill: '#F8FAFC',
+        style: 'Medium2', 'border.horizontal': '#D7DEE8', firstRow: 'true',
+      },
+    });
+  });
+
+  it('skips a picture without a src', () => {
+    expect(buildPptxBatch([{ images: [{ x: '1in' }] }])).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+    ]);
+  });
+});
+
+describe('buildEditBatch', () => {
+  it('maps set/add/remove to batch commands and stringifies props', () => {
+    const ops = buildEditBatch([
+      { action: 'set', path: '/body/p[2]', props: { text: '改后', align: 'center' } },
+      { action: 'set', path: '/Sheet1/B2', props: { value: 42, formula: '=SUM(A1:A2)' } },
+      { action: 'add', parent: '/body', type: 'p', props: { text: '新段' } },
+      { action: 'remove', path: '/body/p[1]' },
+    ]);
+    expect(ops).toEqual([
+      { command: 'set', path: '/body/p[2]', props: { text: '改后', align: 'center' } },
+      { command: 'set', path: '/Sheet1/B2', props: { value: '42', formula: 'SUM(A1:A2)' } },
+      { command: 'add', parent: '/body', type: 'p', props: { text: '新段' } },
+      { command: 'remove', path: '/body/p[1]' },
+    ]);
+  });
+
+  it('drops malformed ops (missing path/parent/type, unknown action, null props)', () => {
+    const bad = [
+      { action: 'set' },
+      { action: 'add', parent: '/body' },
+      { action: 'frobnicate', path: '/x' },
+      null,
+      { action: 'remove', path: '/body/p[9]' },
+      { action: 'set', path: '/ok', props: { a: null, b: undefined, c: 0 } },
+    ] as unknown as EditOp[];
+    const ops = buildEditBatch(bad);
+    expect(ops).toEqual([
+      { command: 'remove', path: '/body/p[9]' },
+      { command: 'set', path: '/ok', props: { c: '0' } },
+    ]);
+  });
+
+  it('seeds table grids on each add without guessing existing table indexes', () => {
+    const ops = buildEditBatch([
+      {
+        action: 'add',
+        parent: '/body',
+        type: 'table',
+        props: {
+          rows: [['参数', 'Overall'], ['记录数', 57_750], ['完整', true], ['备注', null]],
+          style: 'medium2',
+        },
+      },
+      {
+        action: 'add',
+        parent: '/body',
+        type: 'table',
+        props: { rows: [['第二张'], ['表格']] },
+      },
+    ]);
+
+    expect(ops).toEqual([
+      {
+        command: 'add',
+        parent: '/body',
+        type: 'table',
+        props: {
+          rows: '4', cols: '2', style: 'medium2',
+          r1c1: '参数', r1c2: 'Overall', r2c1: '记录数', r2c2: '57750',
+          r3c1: '完整', r3c2: 'true', r4c1: '备注',
+        },
+      },
+      {
+        command: 'add',
+        parent: '/body',
+        type: 'table',
+        props: { rows: '2', cols: '1', r1c1: '第二张', r2c1: '表格' },
+      },
+    ]);
+  });
+
+  it('rejects ragged/conflicting table grids and other nested props instead of stringifying them', () => {
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [] },
+    }])).toThrow(/at least one row/);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [['A', 'B'], ['C']] },
+    }])).toThrow(/must be rectangular/);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [['A']], cols: 1 },
+    }])).toThrow(/cannot be combined/);
+    expect(() => buildEditBatch([{
+      action: 'set', path: '/body/p[1]', props: { font: { color: 'FF0000' } },
+    }])).toThrow(OfficeEditInputError);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [[{ text: 'nested' }]] },
+    }])).toThrow(/table cell at row 1, column 1/);
+  });
+});

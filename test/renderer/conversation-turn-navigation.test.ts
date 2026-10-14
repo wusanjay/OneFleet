@@ -1,0 +1,442 @@
+import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+// Pure renderer helpers are exposed through a guarded CommonJS bridge. The
+// browser path still initializes from the same file without a module runtime.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const turnNav = require('../../src/renderer/modules/conversation-turn-nav.js');
+
+const moduleSource = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/modules/conversation-turn-nav.js'),
+  'utf8',
+);
+const rendererHtml = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/index.html'),
+  'utf8',
+);
+const conversationSource = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/modules/conversation.js'),
+  'utf8',
+);
+const styleSource = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/style.css'),
+  'utf8',
+);
+
+function fakeMessage(role: 'user' | 'assistant', text: string): any {
+  return {
+    role,
+    text,
+    nextElementSibling: null,
+    matches(selector: string) {
+      return selector === `.chat-message.${role}`;
+    },
+    querySelector(selector: string) {
+      return selector === '.chat-bubble .markdown-body' ? { textContent: text } : null;
+    },
+  };
+}
+
+function fakeClassList() {
+  const values = new Set<string>();
+  return {
+    add(value: string) { values.add(value); },
+    remove(value: string) { values.delete(value); },
+    toggle(value: string, force?: boolean) {
+      const enabled = force === undefined ? !values.has(value) : force;
+      if (enabled) values.add(value);
+      else values.delete(value);
+      return enabled;
+    },
+    contains(value: string) { return values.has(value); },
+  };
+}
+
+function fakeTurnNavElement(tagName = 'div'): any {
+  const attributes = new Map<string, string>();
+  const element: any = {
+    tagName: tagName.toUpperCase(),
+    children: [],
+    dataset: {},
+    className: '',
+    classList: fakeClassList(),
+    hidden: false,
+    clientHeight: 216,
+    scrollHeight: 216,
+    scrollTop: 0,
+    offsetTop: 0,
+    offsetHeight: 18,
+    style: {
+      scrollBehavior: '',
+      setProperty() {},
+    },
+    addEventListener() {},
+    appendChild(child: any) {
+      child.parentElement = element;
+      child.offsetTop = element.children.length * 18;
+      element.children.push(child);
+      element.scrollHeight = Math.max(element.clientHeight, element.children.length * 18);
+      return child;
+    },
+    replaceChildren(...children: any[]) {
+      element.children.forEach((child: any) => { child.parentElement = null; });
+      element.children = [];
+      children.flatMap((child) => child?.isFragment ? child.children : child).forEach((child) => {
+        element.appendChild(child);
+      });
+    },
+    contains(target: any) {
+      return target === element || element.children.some((child: any) => child.contains(target));
+    },
+    querySelectorAll(selector: string) {
+      if (selector !== '.chat-turn-nav-marker') return [];
+      return element.children.filter((child: any) => (
+        String(child.className).split(/\s+/).includes('chat-turn-nav-marker')
+      ));
+    },
+    setAttribute(name: string, value: string) { attributes.set(name, String(value)); },
+    removeAttribute(name: string) { attributes.delete(name); },
+    getAttribute(name: string) { return attributes.get(name) ?? null; },
+  };
+  return element;
+}
+
+function fakeUserTurn(messageId: string, messageIndex: number): any {
+  const element = fakeTurnNavElement();
+  element.dataset.msgId = messageId;
+  element.dataset.msgIndex = String(messageIndex);
+  element.dataset.clientMsgId = `client-${messageId}`;
+  element.matches = (selector: string) => selector === '.chat-message.user';
+  element.querySelector = () => ({ textContent: `request ${messageId}` });
+  return element;
+}
+
+function fakeTurnNavDocument(userTurns: any[]) {
+  const history = fakeTurnNavElement();
+  history.clientHeight = 600;
+  userTurns.forEach((turn) => history.appendChild(turn));
+  const nav = fakeTurnNavElement('nav');
+  const markers = fakeTurnNavElement();
+  const preview = fakeTurnNavElement();
+  const previewTitle = fakeTurnNavElement();
+  const previewBody = fakeTurnNavElement();
+  const elements: Record<string, any> = {
+    'chat-history': history,
+    'chat-turn-nav': nav,
+    'chat-turn-nav-markers': markers,
+    'chat-turn-nav-preview': preview,
+    'chat-turn-nav-preview-title': previewTitle,
+    'chat-turn-nav-preview-body': previewBody,
+  };
+  const documentRef: any = {
+    getElementById(id: string) { return elements[id] || null; },
+    createElement(tagName: string) {
+      const element = fakeTurnNavElement(tagName);
+      element.ownerDocument = documentRef;
+      return element;
+    },
+    createDocumentFragment() {
+      return {
+        isFragment: true,
+        children: [],
+        appendChild(child: any) { this.children.push(child); },
+      };
+    },
+  };
+  Object.values(elements).forEach((element) => { element.ownerDocument = documentRef; });
+  nav.appendChild(markers);
+  return { documentRef, history, markers };
+}
+
+describe('conversation turn navigation', () => {
+  it.each([
+    { name: 'true top wins when all turns fit', tops: [20, 120, 220], metrics: { atStart: true, atEnd: true, scrollTop: 0, lastTop: 260, lastBottom: 340 }, expected: 0 },
+    { name: 'final reply is visible before reaching bottom', tops: [-1200, -300, 230], metrics: { atEnd: true, lastTop: 380, lastBottom: 520, distanceToBottom: 400 }, expected: 2 },
+    { name: 'bottom with a trailing spacer', tops: [-2000, -1000, -700], metrics: { atEnd: true, lastTop: -300, lastBottom: -100, distanceToBottom: 0 }, expected: 2 },
+    { name: 'long reply keeps its owning turn', tops: [-1200, -300, 500], metrics: {}, expected: 1 },
+    { name: 'the next question below the reading line does not steal focus', tops: [-700, -100, 200], metrics: {}, expected: 1 },
+    { name: 'partial history top is not the conversation start', tops: [-100, 100, 500], metrics: { scrollTop: 0, atStart: false }, expected: 1 },
+    { name: 'partial history bottom is not the conversation end', tops: [-700, -100, 350], metrics: { atEnd: false, lastTop: 450, lastBottom: 550, distanceToBottom: 0 }, expected: 1 },
+    { name: 'last message outside the viewport does not steal focus', tops: [-700, -100, 500], metrics: { atEnd: true, lastTop: 600, lastBottom: 800, distanceToBottom: 400 }, expected: 1 },
+  ])('$name', ({ tops, metrics, expected }) => {
+    expect(turnNav.viewportTurnIndex(tops, {
+      height: 600, scrollTop: 100, distanceToBottom: 1000,
+      atStart: false, atEnd: false, lastTop: 900, lastBottom: 1000,
+      ...metrics,
+    })).toBe(expected);
+  });
+
+  it('does not choose a turn for an empty or hidden transcript', () => {
+    expect(turnNav.viewportTurnIndex([], { height: 600 })).toBe(-1);
+    expect(turnNav.viewportTurnIndex([0], { height: 0 })).toBe(-1);
+  });
+
+  it('appears at five indexed user turns, not four', () => {
+    expect(turnNav.shouldShowTurnNav(4)).toBe(false);
+    expect(turnNav.shouldShowTurnNav(5)).toBe(true);
+  });
+
+  it('merges complete fifteen-turn pages without sampling or duplicating overlap', () => {
+    const latest = Array.from({ length: 15 }, (_, index) => ({
+      turn_no: index + 16,
+      message_id: `u${index + 16}`,
+      message_index: (index + 15) * 2,
+      user_preview: `user ${index + 16}`,
+      assistant_preview: `reply ${index + 16}`,
+    }));
+    const older = Array.from({ length: 15 }, (_, index) => ({
+      turn_no: index + 1,
+      message_id: `u${index + 1}`,
+      message_index: index * 2,
+      user_preview: `user ${index + 1}`,
+      assistant_preview: `reply ${index + 1}`,
+    }));
+    const merged = turnNav.mergeTurnPage(
+      turnNav.mergeTurnPage([], latest),
+      [...older, latest[0]],
+    );
+
+    expect(turnNav.PAGE_SIZE).toBe(15);
+    expect(turnNav.VISIBLE_MARKERS).toBe(12);
+    expect(merged).toHaveLength(30);
+    expect(merged.map((turn: any) => turn.turnNo)).toEqual(
+      Array.from({ length: 30 }, (_, index) => index + 1),
+    );
+
+    const claimedLive = turnNav.mergeTurnPage([{
+      turnNo: 21,
+      liveKey: 'client-21',
+      clientMessageId: 'client-21',
+      provisional: true,
+      userPreview: 'optimistic',
+    }], [{
+      turn_no: 21,
+      message_id: 'u21',
+      client_message_id: 'client-21',
+      message_index: 40,
+      user_preview: 'persisted',
+    }]);
+    expect(claimedLive).toHaveLength(1);
+    expect(claimedLive[0]).toMatchObject({
+      turnNo: 21,
+      messageId: 'u21',
+      messageIndex: 40,
+      userPreview: 'persisted',
+      provisional: false,
+    });
+
+    const sentBeforeInitialPage = [{
+      turnNo: 1,
+      liveKey: 'client-22',
+      clientMessageId: 'client-22',
+      provisional: true,
+    }];
+    expect(turnNav.rebaseProvisionalTurns(sentBeforeInitialPage, 21)).toBe(22);
+    expect(sentBeforeInitialPage[0].turnNo).toBe(22);
+  });
+
+  it('stores at most one user line and two compact assistant lines', () => {
+    const turn = turnNav.normalizeTurnDescriptor({
+      turn_no: 1,
+      user_preview: '用'.repeat(50),
+      assistant_preview: '答'.repeat(100),
+    });
+    expect(Array.from(turn.userPreview)).toHaveLength(40);
+    expect(Array.from(turn.assistantPreview)).toHaveLength(80);
+    expect(turn.userPreview.endsWith('…')).toBe(true);
+    expect(turn.assistantPreview.endsWith('…')).toBe(true);
+  });
+
+  it('previews only the selected user turn and replies before the next turn', () => {
+    const first = fakeMessage('user', '  First   request  ');
+    const answer = fakeMessage('assistant', 'First answer');
+    const followup = fakeMessage('assistant', 'Additional detail');
+    const second = fakeMessage('user', 'Second request must stay out');
+    const secondAnswer = fakeMessage('assistant', 'Second answer must stay out');
+    first.nextElementSibling = answer;
+    answer.nextElementSibling = followup;
+    followup.nextElementSibling = second;
+    second.nextElementSibling = secondAnswer;
+
+    expect(turnNav.previewForTurn(first)).toEqual({
+      title: 'First request',
+      body: 'First answer · Additional detail',
+    });
+  });
+
+  it('marks a jump as programmatic and pauses sticky following', () => {
+    const calls: string[] = [];
+    const targetClasses = new Set<string>();
+    const container: any = {
+      scrollTop: 100,
+      clientHeight: 400,
+      style: { scrollBehavior: 'smooth' },
+      getBoundingClientRect: () => ({ top: 0 }),
+    };
+    const target: any = {
+      getBoundingClientRect: () => ({ top: 300, height: 100 }),
+      classList: {
+        add: (value: string) => targetClasses.add(value),
+        remove: (value: string) => targetClasses.delete(value),
+      },
+    };
+
+    expect(turnNav.jumpToTurn(container, target, {
+      markProgrammatic: () => calls.push('marked'),
+      requestFrame: (callback: () => void) => callback(),
+      setTimer: (callback: () => void) => callback(),
+    })).toBe(true);
+    expect(calls).toEqual(['marked']);
+    expect(container.scrollTop).toBe(250);
+    expect(container._stickyEnabled).toBe(false);
+    expect(container._stickyUserPaused).toBe(true);
+    expect(container.style.scrollBehavior).toBe('smooth');
+    expect(targetClasses.size).toBe(0);
+  });
+
+  it('centers the selected marker and clamps only at the rail boundaries', () => {
+    expect(turnNav.centeredMarkerScrollTop({
+      markerTop: 252,
+      markerHeight: 18,
+      clientHeight: 216,
+      scrollHeight: 540,
+    })).toBe(153);
+    expect(turnNav.centeredMarkerScrollTop({
+      markerTop: 0,
+      markerHeight: 18,
+      clientHeight: 216,
+      scrollHeight: 540,
+    })).toBe(0);
+    expect(turnNav.centeredMarkerScrollTop({
+      markerTop: 522,
+      markerHeight: 18,
+      clientHeight: 216,
+      scrollHeight: 540,
+    })).toBe(324);
+  });
+
+  it('exposes independent before and after overflow markers', () => {
+    expect(turnNav.turnNavOverflowState({
+      scrollTop: 27,
+      clientHeight: 216,
+      scrollHeight: 270,
+    })).toEqual({ before: true, after: true });
+    expect(turnNav.turnNavOverflowState({
+      scrollTop: 54,
+      clientHeight: 216,
+      scrollHeight: 270,
+    })).toEqual({ before: true, after: false });
+    expect(turnNav.turnNavOverflowState({
+      scrollTop: 0,
+      clientHeight: 216,
+      scrollHeight: 216,
+    }, true)).toEqual({ before: true, after: false });
+    expect(turnNav.turnNavOverflowState({
+      scrollTop: 0,
+      clientHeight: 216,
+      scrollHeight: 216,
+    })).toEqual({ before: false, after: false });
+  });
+
+  it('tapers only visible edge markers without adding rail height', () => {
+    const markers = Array.from({ length: 15 }, (_, index) => ({
+      offsetTop: index * 18,
+      offsetHeight: 18,
+    }));
+    const ranks = turnNav.overflowEdgeRanks(markers, {
+      scrollTop: 27,
+      clientHeight: 216,
+    }, { before: true, after: true });
+    expect(ranks.slice(0, 5)).toEqual([0, 1, 2, 3, 0]);
+    expect(ranks.slice(-5)).toEqual([0, 3, 2, 1, 0]);
+    expect(turnNav.overflowEdgeRanks(markers, {
+      scrollTop: 27,
+      clientHeight: 216,
+    }, { before: false, after: false })).toEqual(markers.map(() => 0));
+  });
+
+  it('follows a live turn without duplicate or cross-conversation position drift', async () => {
+    const mounted = Array.from({ length: 15 }, (_, index) => (
+      fakeUserTurn(`u${index + 1}`, index * 2)
+    ));
+    const { documentRef, history, markers } = fakeTurnNavDocument(mounted);
+    turnNav.init({
+      document: documentRef,
+      MutationObserver: class {
+        observe() {}
+      },
+    });
+    await turnNav.open({
+      cid: 'current-conversation',
+      loadPage: async () => ({
+        turns: mounted.map((target, index) => ({
+          turn_no: index + 1,
+          message_id: target.dataset.msgId,
+          message_index: Number(target.dataset.msgIndex),
+        })),
+        total: mounted.length,
+        next_cursor: null,
+      }),
+    });
+
+    const nextTurn = fakeUserTurn('u16', 30);
+    history.appendChild(nextTurn);
+    const appended = turnNav.appendLiveTurn(
+      'current-conversation', nextTurn, 'request u16',
+    );
+
+    let rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(appended).not.toBeNull();
+    expect(rendered).toHaveLength(16);
+    expect(rendered.filter((marker: any) => (
+      marker.getAttribute('aria-current') === 'location'
+    ))).toEqual([rendered[15]]);
+    expect(markers.scrollTop).toBe(72);
+
+    expect(turnNav.appendLiveTurn(
+      'current-conversation', nextTurn, 'request u16',
+    )).toBe(appended);
+    rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(rendered).toHaveLength(16);
+    expect(rendered[15].getAttribute('aria-current')).toBe('location');
+
+    const foreignTurn = fakeUserTurn('foreign-u17', 32);
+    history.appendChild(foreignTurn);
+    expect(turnNav.appendLiveTurn(
+      'another-conversation', foreignTurn, 'foreign request',
+    )).toBeNull();
+    rendered = markers.querySelectorAll('.chat-turn-nav-marker');
+    expect(rendered).toHaveLength(16);
+    expect(rendered[15].getAttribute('aria-current')).toBe('location');
+
+    turnNav.prepare('next-conversation');
+    expect(markers.querySelectorAll('.chat-turn-nav-marker')).toHaveLength(0);
+    expect(documentRef.getElementById('chat-turn-nav').hidden).toBe(true);
+  });
+
+  it('pages the compact rail independently without adding transcript prefetch', () => {
+    expect(rendererHtml).toContain('id="chat-turn-nav"');
+    expect(rendererHtml).toContain('./modules/conversation-turn-nav.js');
+    expect(rendererHtml).not.toContain('chat-turn-nav-overflow');
+    expect(moduleSource).not.toContain('apiFetch(');
+    expect(moduleSource).toContain('const PAGE_SIZE = 15;');
+    expect(moduleSource).toContain('const VISIBLE_MARKERS = 12;');
+    expect(moduleSource).toContain('state.loadPage(cursor)');
+    expect(moduleSource).toContain('previousTop + nextHeight - previousHeight');
+    expect(moduleSource).toContain('attributeFilter: [\'data-msg-id\', \'data-msg-index\']');
+    expect(moduleSource).not.toContain('subtree: true');
+    expect(moduleSource).not.toContain('MAX_MARKERS');
+    expect(conversationSource).toContain('/turns?limit=15');
+    expect(conversationSource).toContain('_activateConversationTurnNavigationEntry');
+    expect(styleSource).toContain('max-height: 216px');
+    expect(styleSource).toContain('flex: 0 0 18px');
+    expect(styleSource).toContain('.chat-turn-nav-marker.is-overflow-edge-1::before');
+    expect(styleSource).toContain('left: 6.5px');
+    expect(styleSource).toContain('border-radius: 99px');
+    expect(styleSource).toMatch(/\.chat-turn-nav-marker::before\s*\{[^}]*height: 2px;/s);
+    expect(styleSource).toContain('width: clamp(200px, 26cqw, 260px)');
+    expect(styleSource).toContain('-webkit-line-clamp: 1');
+    expect(styleSource).toContain('-webkit-line-clamp: 2');
+  });
+});

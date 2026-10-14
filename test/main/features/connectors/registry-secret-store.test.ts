@@ -1,0 +1,210 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const TEST_UID = 'u-connectors';
+
+let tmpDir: string;
+let prevWs: string | undefined;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-connectors-secret-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.resetModules();
+});
+
+afterEach(() => {
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function sampleInstance() {
+  const now = new Date().toISOString();
+  return {
+    id: 'github',
+    display_name: 'GitHub',
+    transport: {
+      kind: 'streamable-http' as const,
+      url: 'https://api.githubcopilot.com/mcp/',
+      headers: { Authorization: 'Bearer access-secret' },
+    },
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connected' as const, since: 1 },
+    oauth_grant: {
+      access_token: 'access-secret',
+      refresh_token: 'refresh-secret',
+      expires_at: Date.now() + 60_000,
+      scopes: ['repo'],
+      token_type: 'Bearer',
+      account_label: 'dev@example.com',
+    },
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+describe('connectors registry secret storage', () => {
+  it('keeps the one-time Composio credential encrypted across restart and metadata updates', async () => {
+    let registry = await import('../../../../src/main/features/connectors/registry');
+    const paths = await import('../../../../src/main/paths');
+    const inst = { ...sampleInstance(), id: 'paid-mail', composio_grant: {
+      connection_id: 'connection-1', toolkit: 'gmail', auth_config_id: 'ac_public', connection_token: 'a'.repeat(43),
+    } };
+    await registry.upsert(TEST_UID, inst);
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw).not.toContain(inst.composio_grant.connection_token);
+    expect(JSON.parse(raw).connections['paid-mail'].composio_grant).toBeUndefined();
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections['paid-mail'].composio_grant).toEqual(inst.composio_grant);
+    await registry.update(TEST_UID, 'paid-mail', (value) => ({ ...value, tools_cached_at: 42 }));
+    expect(fs.readFileSync(file, 'utf8')).not.toContain(inst.composio_grant.connection_token);
+    expect(registry.load(TEST_UID).connections['paid-mail'].composio_grant).toEqual(inst.composio_grant);
+  });
+
+  it.each(['tampered', 'other_owner', 'other_connector'])('preserves unavailable %s connection ciphertext and recovers after restoring the original', async (variation) => {
+    let registry = await import('../../../../src/main/features/connectors/registry');
+    const paths = await import('../../../../src/main/paths');
+    const inst = { ...sampleInstance(), id: 'paid-mail', composio_grant: {
+      connection_id: 'connection-1', toolkit: 'gmail', auth_config_id: 'ac_public', connection_token: 'a'.repeat(43),
+    } };
+    await registry.upsert(TEST_UID, inst);
+    const originalFile = paths.userConnectorsConfigFile(TEST_UID);
+    const original = fs.readFileSync(originalFile, 'utf8');
+    const disk = JSON.parse(original);
+    const uid = variation === 'other_owner' ? 'another-owner' : TEST_UID;
+    const id = variation === 'other_connector' ? 'other-mail' : inst.id;
+    const row = disk.connections[inst.id];
+    if (variation === 'tampered') {
+      const bytes = Buffer.from(row.secrets_enc, 'base64');
+      bytes[bytes.length - 1] ^= 1;
+      row.secrets_enc = bytes.toString('base64');
+    }
+    disk.connections = { [id]: { ...row, id } };
+    const file = paths.userConnectorsConfigFile(uid);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(disk));
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    const unavailable = registry.load(uid).connections[id];
+    expect(registry.hasUnavailableSecrets(unavailable)).toBe(true);
+    expect(unavailable.status).toMatchObject({ kind: 'error', message: 'connector_secrets_unavailable' });
+    expect(unavailable.composio_grant).toBeUndefined();
+    expect(unavailable.transport).toBeUndefined();
+    await registry.update(uid, id, (value) => ({ ...value, tools_cached_at: 42 }));
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(after.connections[id].secrets_enc).toBe(row.secrets_enc);
+    expect(JSON.stringify(after)).not.toContain(inst.composio_grant.connection_token);
+    // Restoring the original encrypted file in its original context remains usable.
+    fs.writeFileSync(originalFile, original);
+    vi.resetModules();
+    registry = await import('../../../../src/main/features/connectors/registry');
+    expect(registry.load(TEST_UID).connections[inst.id].composio_grant).toEqual(inst.composio_grant);
+  });
+
+  it('writes token-bearing fields as local-secret ciphertext', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+
+    await registry.upsert(TEST_UID, sampleInstance());
+
+    const raw = fs.readFileSync(paths.userConnectorsConfigFile(TEST_UID), 'utf8');
+    expect(raw).not.toContain('access-secret');
+    expect(raw).not.toContain('refresh-secret');
+    const disk = JSON.parse(raw);
+    expect(disk.connections.github.oauth_grant).toBeUndefined();
+    expect(localSecrets.isEncryptedSecret(disk.connections.github.secrets_enc)).toBe(true);
+
+    const loaded = registry.load(TEST_UID);
+    expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');
+    expect(loaded.connections.github.transport.kind).toBe('streamable-http');
+  });
+
+  it('migrates previous per-instance crypto-vault secrets on read', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const cryptoVault = await import('../../../../src/main/util/crypto-vault');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+
+    const inst = sampleInstance();
+    const { oauth_grant, transport, ...rest } = inst;
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      connections: {
+        github: {
+          ...rest,
+          secrets_enc: cryptoVault.encrypt(TEST_UID, JSON.stringify({ oauth_grant, transport })),
+        },
+      },
+    }, null, 2), 'utf8');
+
+    const loaded = registry.load(TEST_UID);
+    expect(loaded.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
+
+    const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(cryptoVault.isEncryptedPayload(migrated.connections.github.secrets_enc)).toBe(true);
+    expect(JSON.stringify(migrated)).not.toContain('refresh-secret');
+  });
+
+  it('reuses decrypted data while the registry file is unchanged', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    const inst = sampleInstance();
+    const { oauth_grant, transport, ...rest } = inst;
+    const decryptSpy = vi.spyOn(localSecrets, 'decryptLocalSecretWithMeta');
+
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      connections: {
+        github: {
+          ...rest,
+          secrets_enc: localSecrets.encryptLocalSecret({
+            namespace: 'connectors.instance',
+            ownerId: TEST_UID,
+            recordId: 'github',
+          }, JSON.stringify({ oauth_grant, transport })),
+        },
+      },
+    }, null, 2), 'utf8');
+
+    const first = registry.load(TEST_UID);
+    first.connections.github.display_name = 'mutated outside registry';
+    const second = registry.load(TEST_UID);
+
+    expect(decryptSpy).toHaveBeenCalledTimes(1);
+    expect(second.connections.github.display_name).toBe('GitHub');
+    expect(second.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
+  });
+
+  it('reuses unchanged encrypted envelopes for metadata-only updates', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    await registry.upsert(TEST_UID, sampleInstance());
+    const before = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const encryptSpy = vi.spyOn(localSecrets, 'encryptLocalSecret');
+
+    await registry.update(TEST_UID, 'github', (cur) => ({
+      ...cur,
+      status: { kind: 'connected', since: 2 },
+      tools_cached_at: 2,
+      updated_at: '2026-06-01T12:01:00.000Z',
+    }));
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(encryptSpy).not.toHaveBeenCalled();
+    expect(after.connections.github.secrets_enc).toBe(before.connections.github.secrets_enc);
+    expect(after.connections.github.tools_cached_at).toBe(2);
+  });
+});

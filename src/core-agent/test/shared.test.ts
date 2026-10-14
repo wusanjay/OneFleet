@@ -1,0 +1,473 @@
+import { afterEach, describe, it, expect } from "vitest";
+import {
+  CoreAgentError,
+  AuthError,
+  RateLimitError,
+  ContextOverflowError,
+  ProviderError,
+  StorageFullError,
+  TimeoutError,
+  RetryExhaustedError,
+  RETRY_EXHAUSTED_CODE,
+  configureRetryErrorPolicy,
+  classifyRetryableError,
+  classifyRetryableErrorWithPolicy,
+  classifyTransientNetworkError,
+  getRetryErrorPolicy,
+  isRetryableError,
+  isStorageFullError,
+  isTransientNetworkError,
+  errorCodeForLog,
+  formatError,
+  providerHttpStatusOf,
+} from "../src/shared/errors.js";
+import { createLogger } from "../src/shared/logger.js";
+
+afterEach(() => {
+  configureRetryErrorPolicy();
+});
+
+describe("Errors", () => {
+  it("CoreAgentError has code and name", () => {
+    const err = new CoreAgentError("test", "TEST_CODE");
+    expect(err.message).toBe("test");
+    expect(err.code).toBe("TEST_CODE");
+    expect(err.name).toBe("CoreAgentError");
+  });
+
+  it("AuthError inherits from CoreAgentError", () => {
+    const err = new AuthError("bad key");
+    expect(err).toBeInstanceOf(CoreAgentError);
+    expect(err.code).toBe("AUTH_ERROR");
+  });
+
+  it("RateLimitError includes retryAfterMs", () => {
+    const err = new RateLimitError("too fast", 5000);
+    expect(err.retryAfterMs).toBe(5000);
+    expect(err.code).toBe("RATE_LIMIT");
+  });
+
+  it("ProviderError includes provider and statusCode", () => {
+    const err = new ProviderError("boom", "anthropic", 500);
+    expect(err.provider).toBe("anthropic");
+    expect(err.statusCode).toBe(500);
+  });
+
+  it("StorageFullError carries a stable machine-readable code", () => {
+    const err = new StorageFullError("no space left on device");
+    expect(err).toBeInstanceOf(CoreAgentError);
+    expect(err.code).toBe("STORAGE_FULL");
+  });
+
+  describe("isRetryableError", () => {
+    it("does not automatically retry RateLimitError", () => {
+      expect(isRetryableError(new RateLimitError("rate"))).toBe(false);
+    });
+
+    it("returns true for TimeoutError", () => {
+      expect(isRetryableError(new TimeoutError("timeout"))).toBe(true);
+    });
+
+    it("does not automatically retry 429 ProviderError", () => {
+      expect(isRetryableError(new ProviderError("429", "test", 429))).toBe(false);
+    });
+
+    it("keeps nested throttling terminal even when server policy clears all blacklists", () => {
+      const policy = { permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [] };
+      for (const cause of [{ status: 429, message: 'opaque' }, { code: 'RATE_LIMIT', message: 'opaque' }]) {
+        const error = Object.assign(new Error('fetch failed'), { cause });
+        expect(classifyRetryableErrorWithPolicy(error, policy)).toBeNull();
+      }
+      expect(classifyRetryableErrorWithPolicy(new ProviderError('unavailable', 'test', 503), policy)).toBe('service_unavailable');
+    });
+
+    it("returns false for 429 balance/quota-exhausted errors", () => {
+      const body = '429 {"error":{"message":"积分不足","type":"insufficient_quota","code":"quota_exceeded"}}';
+      expect(isRetryableError(new ProviderError(body, "deepseek", 429))).toBe(false);
+      expect(classifyRetryableError(new RateLimitError(`deepseek rate limited: ${body}`))).toBeNull();
+    });
+
+    it("returns true for 500/502/503 ProviderError", () => {
+      expect(isRetryableError(new ProviderError("500", "test", 500))).toBe(true);
+      expect(isRetryableError(new ProviderError("502", "test", 502))).toBe(true);
+      expect(isRetryableError(new ProviderError("503", "test", 503))).toBe(true);
+    });
+
+    it("returns false for AuthError", () => {
+      expect(isRetryableError(new AuthError("auth"))).toBe(false);
+    });
+
+    it.each([
+      'Encountered invalidated oauth token for user, failing request',
+      'The authentication token is expired',
+      "400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+      'Stream ended without finish_reason', 'invalid argument',
+      'ENOSPC: no space left on device, write',
+      'Codex SSE response headers timed out after 10000ms',
+    ])('keeps message-only failures unknown: %s', message => {
+      const error = new ProviderError(message, 'fixture');
+      expect(classifyRetryableError(error)).toBe('network');
+      expect(classifyTransientNetworkError(error)).toBeNull();
+    });
+
+    it("returns false for 400 ProviderError", () => {
+      expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(false);
+    });
+
+
+    it("defaults unknown errors to retryable network failures", () => {
+      expect(isRetryableError(new Error("plain"))).toBe(true);
+      expect(classifyRetryableError(new Error("plain"))).toBe("network");
+    });
+
+    it("returns true for undici 'terminated' (mid-stream SSE cutoff)", () => {
+      expect(isRetryableError(new TypeError("terminated"))).toBe(true);
+      // pi-provider wraps it into a statusCode-less ProviderError — must
+      // still classify as retryable (this is the primary bug we're fixing)
+      expect(isRetryableError(new ProviderError("terminated", "openai-codex"))).toBe(true);
+    });
+
+
+    it("retries only transport-class empty responses", () => {
+      const transport = Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_TRANSPORT" });
+      expect(classifyRetryableError(transport)).toBe("connection_dropped");
+      for (const code of [
+        "PROVIDER_EMPTY_RESPONSE",
+        "PROVIDER_EMPTY_NORMAL",
+        "PROVIDER_EMPTY_SAFETY",
+        "PROVIDER_EMPTY_UNKNOWN",
+      ]) {
+        expect(isRetryableError(Object.assign(new Error("empty response"), { code }))).toBe(false);
+      }
+    });
+
+    it("returns true for hosted WebSocket stream drops", () => {
+      expect(isRetryableError(new ProviderError("WebSocket error", "openai-codex"))).toBe(true);
+      expect(isRetryableError(new Error("WebSocket closed unexpectedly"))).toBe(true);
+    });
+
+
+    it("returns true for provider-agnostic stream/connection drops", () => {
+      expect(isRetryableError(new ProviderError("Connection closed", "anthropic"))).toBe(true);
+      expect(isRetryableError(new ProviderError("stream disconnected before completion", "openai"))).toBe(true);
+      expect(isRetryableError(new Error("ERR_STREAM_PREMATURE_CLOSE"))).toBe(true);
+      expect(isRetryableError(new Error("read ECONNRESET"))).toBe(true);
+    });
+
+    it("keeps HTTP 400 terminal despite a transient-sounding message", () => {
+      expect(isRetryableError(new ProviderError("terminated", "x", 400))).toBe(false);
+    });
+
+    it("returns true for Node fetch 'fetch failed'", () => {
+      expect(isRetryableError(new TypeError("fetch failed"))).toBe(true);
+    });
+
+    it("returns true for retryable HTTP gateway/status families", () => {
+      expect(classifyRetryableError(new ProviderError("Request Timeout", "test", 408))).toBe("timeout");
+      expect(classifyRetryableError(new ProviderError("Gateway Timeout", "test", 504))).toBe("service_unavailable");
+      expect(classifyRetryableError(new ProviderError("Cloudflare timeout", "test", 524))).toBe("timeout");
+      expect(isRetryableError(new ProviderError("Gateway Timeout", "test", 504))).toBe(true);
+    });
+
+    it("returns true for raw socket codes via err.code", () => {
+      const mk = (code: string) => Object.assign(new Error("net"), { code });
+      expect(isRetryableError(mk("ECONNRESET"))).toBe(true);
+      expect(isRetryableError(mk("ETIMEDOUT"))).toBe(true);
+      expect(isRetryableError(mk("ECONNREFUSED"))).toBe(true);
+      expect(isRetryableError(mk("EPIPE"))).toBe(true);
+    });
+
+    it("returns true for undici UND_ERR_* cause chain", () => {
+      const inner = Object.assign(new Error("socket"), { code: "UND_ERR_SOCKET" });
+      const outer = new TypeError("terminated");
+      (outer as Error & { cause?: unknown }).cause = inner;
+      expect(isRetryableError(outer)).toBe(true);
+
+      // Even with a generic outer message, cause chain should still match
+      const outer2 = Object.assign(new Error("something"), { cause: inner });
+      expect(isRetryableError(outer2)).toBe(true);
+    });
+
+
+    it("returns false for explicit permanent failures", () => {
+      expect(isRetryableError(new ContextOverflowError("context_length_exceeded"))).toBe(false);
+      expect(isRetryableError(new ProviderError("model_not_found", "test", 404))).toBe(false);
+      expect(isRetryableError(new ProviderError("content_filter triggered", "test", 400))).toBe(false);
+      expect(isRetryableError(Object.assign(new Error("Request was aborted by user"), { name: "AbortError" }))).toBe(false);
+
+      const wrappedAuth = Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("Unauthorized"), { status: 401 }),
+      });
+      expect(isRetryableError(wrappedAuth)).toBe(false);
+    });
+
+    it("never retries structured provider safety errors even when runtime policy removes every blacklist", () => {
+      const policy = {
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      };
+      const azureSafety = Object.assign(new Error("Request rejected by provider"), {
+        code: "ResponsibleAIPolicyViolation",
+      });
+      const wrappedGoogleSafety = Object.assign(new Error("Provider request failed"), {
+        cause: {
+          code: "PROHIBITED_CONTENT",
+          message: "Candidate unavailable",
+        },
+      });
+
+      expect(classifyRetryableErrorWithPolicy(azureSafety, policy)).toBeNull();
+      expect(classifyRetryableErrorWithPolicy(wrappedGoogleSafety, policy)).toBeNull();
+    });
+
+    it("does not suppress recovery for unrelated safety-service transport failures", () => {
+      expect(classifyRetryableError(
+        new Error("Safety telemetry connection rejected by proxy"),
+      )).toBe("network");
+      expect(classifyRetryableError(
+        Object.assign(new Error("Request failed"), { code: "SAFETY_CHECK_TIMEOUT" }),
+      )).toBe("network");
+    });
+
+    it("never retries exhausted-storage errors", () => {
+      const enospc = Object.assign(new Error("write failed"), { code: "ENOSPC" });
+      const sqliteFull = Object.assign(new Error("database write failed"), { code: "SQLITE_FULL" });
+      const wrapped = Object.assign(new TypeError("fetch failed"), { cause: enospc });
+
+      expect(isStorageFullError(enospc)).toBe(true);
+      expect(isRetryableError(enospc)).toBe(false);
+      expect(isRetryableError(sqliteFull)).toBe(false);
+      expect(isRetryableError(wrapped)).toBe(false);
+      expect(isRetryableError(new ProviderError("Insufficient Storage", "test-provider", 507))).toBe(false);
+    });
+
+    it("runtime retry policy cannot make storage exhaustion retryable", () => {
+      const policy = {
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      };
+      expect(classifyRetryableErrorWithPolicy(
+        Object.assign(new Error("write failed"), { code: "ENOSPC" }),
+        policy,
+      )).toBeNull();
+      expect(classifyRetryableErrorWithPolicy(
+        new ProviderError("Insufficient Storage", "test-provider", 507),
+        policy,
+      )).toBeNull();
+    });
+
+    it("allows runtime retry policy to override the permanent blacklist", () => {
+      configureRetryErrorPolicy({
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      });
+      expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(true);
+      expect(isRetryableError(new TypeError("invalid argument"))).toBe(true);
+      expect(getRetryErrorPolicy().permanent_statuses).toEqual([]);
+    });
+
+    it("never retries rotating-provider terminal outcomes", () => {
+      for (const code of [
+        "PROVIDER_NO_FIRST_EVENT_TIMEOUT",
+        "PROVIDER_EMPTY_RESPONSE",
+        "PROVIDER_EMPTY_NORMAL",
+        "PROVIDER_EMPTY_SAFETY",
+        "PROVIDER_EMPTY_UNKNOWN",
+        "PROVIDER_NETWORK_EXHAUSTED",
+        "PROVIDER_RATE_LIMIT_EXHAUSTED",
+      ]) {
+        const err = Object.assign(new Error("provider candidates exhausted"), { code });
+        expect(classifyRetryableErrorWithPolicy(err, {
+          permanent_statuses: [],
+          permanent_message_patterns: [],
+          permanent_code_patterns: [],
+        })).toBeNull();
+      }
+    });
+
+    it("does not retry the task backstop even with empty runtime blacklists", () => {
+      expect(classifyRetryableErrorWithPolicy(
+        Object.assign(new Error("Task token limit reached"), { code: "TASK_TOKEN_LIMIT_REACHED" }),
+        { permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [] },
+      )).toBeNull();
+    });
+
+    it("ignores legacy runtime message patterns in both configured and inline policies", () => {
+      configureRetryErrorPolicy({
+        permanent_message_patterns: ["custom_hard_stop"],
+      });
+      expect(isRetryableError(new Error("custom_hard_stop"))).toBe(true);
+      expect(classifyRetryableErrorWithPolicy(new Error("inline_hard_stop"), {
+        permanent_message_patterns: ["inline_hard_stop"],
+      })).toBe("network");
+    });
+
+    it("ignores invalid runtime regex patterns instead of throwing", () => {
+      expect(() => configureRetryErrorPolicy({
+        permanent_message_patterns: ["["],
+      })).not.toThrow();
+      expect(isRetryableError(new Error("plain"))).toBe(true);
+    });
+
+    it("returns null for RetryExhaustedError even with a transient cause/message", () => {
+      // The rotating provider already retried each candidate on network-class
+      // failures; re-retrying its exhausted summary at the runner would replay
+      // the whole rotation (~candidates × retries extra full-prompt calls).
+      const err = new RetryExhaustedError(
+        "All configured model candidates failed after network retries: connection failed",
+        new TypeError("fetch failed"),
+      );
+      expect(err.code).toBe(RETRY_EXHAUSTED_CODE);
+      expect(classifyRetryableError(err)).toBeNull();
+      expect(isRetryableError(err)).toBe(false);
+    });
+
+    it("does not turn an exhausted save into a provider retry across module boundaries", () => {
+      const error = Object.assign(new Error("save failed"), { code: "SESSION_PERSISTENCE_FAILED" });
+      expect(classifyRetryableError(error)).toBeNull();
+    });
+
+    it("honors the RETRY_EXHAUSTED code structurally (no instanceof needed)", () => {
+      // A duplicated errors-module load (main vs #core-agent) breaks
+      // instanceof; the code check must still classify it non-retryable.
+      const foreign = Object.assign(
+        new Error("All configured model candidates failed after network retries: connection failed"),
+        { code: RETRY_EXHAUSTED_CODE },
+      );
+      expect(classifyRetryableError(foreign)).toBeNull();
+    });
+
+    it("look-alike guard: plain network errors and un-coded summary text stay retryable", () => {
+      // Without a machine code, transport-looking prose remains unknown.
+      expect(classifyRetryableError(new TypeError("fetch failed"))).toBe("network");
+      // The same summary WORDING without the RETRY_EXHAUSTED marker still
+      // falls back to the retry-by-default policy — only the typed/coded
+      // error is exempt from outer retries.
+      expect(classifyRetryableError(
+        new Error("All configured model candidates failed after network retries: connection failed"),
+      )).toBe("network");
+    });
+  });
+
+  it.each(['forbidden', 'invalid_request', '余额不足', '',
+    '{"error":{"code":"invalid_api_key"}}', 'fetch failed', 'no space left on device'])
+  ('ignores every diagnostic body when machine facts stay fixed: %s', message => {
+    const error = (status: number, type = 'upstream_error') => Object.assign(new Error(message), {
+      status, error: { type, message },
+    });
+    expect(classifyRetryableError(error(502))).toBe('service_unavailable');
+    expect(classifyRetryableError(error(400))).toBeNull();
+    expect(classifyRetryableError(error(502, 'invalid_request_error'))).toBeNull();
+    expect(classifyRetryableError(Object.assign(new Error(message), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBe('timeout');
+  });
+
+  it('keeps nested cancellation and spent budgets terminal under an empty remote policy', () => {
+    for (const cause of [{ name: 'AbortError' }, { code: 'UND_ERR_ABORTED' }, { code: 'RETRY_EXHAUSTED' },
+      { code: 'TASK_TOKEN_LIMIT_REACHED' }, { code: 'SESSION_PERSISTENCE_FAILED' }]) {
+      expect(classifyRetryableErrorWithPolicy({ message: '502', cause }, {
+        permanent_statuses: [], permanent_message_patterns: [], permanent_code_patterns: [],
+      })).toBeNull();
+    }
+  });
+
+  describe("isTransientNetworkError", () => {
+    it.each(['terminated', 'fetch failed', 'WebSocket error', 'ws closed unexpectedly',
+      'Codex SSE response headers timed out after 10000ms', 'Connection closed',
+      'stream disconnected before completion', 'ERR_STREAM_PREMATURE_CLOSE',
+      'read ECONNRESET', 'Stream ended without finish_reason', 'missing final chunk'])
+    ('does not establish a transport cause from prose: %s', message => {
+      expect(isTransientNetworkError(new Error(message))).toBe(false);
+    });
+
+    it("matches via code on direct error", () => {
+      expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "ECONNRESET" }))).toBe(true);
+      expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "UND_ERR_CONNECT_TIMEOUT" }))).toBe(true);
+      expect(classifyTransientNetworkError(Object.assign(new Error("x"), { code: "ETIMEDOUT" }))).toBe("timeout");
+      expect(classifyTransientNetworkError(Object.assign(new Error("x"), { code: "UND_ERR_HEADERS_TIMEOUT" }))).toBe("timeout");
+    });
+
+    it("walks cause chain", () => {
+      const inner = Object.assign(new Error("inner"), { code: "UND_ERR_SOCKET" });
+      const outer = Object.assign(new Error("outer"), { cause: inner });
+      expect(isTransientNetworkError(outer)).toBe(true);
+    });
+
+    it("walks plain-object provider causes", () => {
+      const err = { message: "Provider failed", cause: { code: "UND_ERR_HEADERS_TIMEOUT" } };
+      expect(classifyTransientNetworkError(err)).toBe("timeout");
+    });
+
+    it("guards against runaway cause cycles", () => {
+      const a: Error & { cause?: unknown } = new Error("a");
+      const b: Error & { cause?: unknown } = new Error("b");
+      a.cause = b;
+      b.cause = a;
+      // must not infinite-loop; result doesn't matter, just that it returns
+      expect(() => isTransientNetworkError(a)).not.toThrow();
+    });
+
+    it("returns false for unrelated errors", () => {
+      expect(isTransientNetworkError(new Error("some other thing"))).toBe(false);
+      expect(isTransientNetworkError(new Error("Request was aborted"))).toBe(false);
+      expect(isTransientNetworkError(null)).toBe(false);
+      expect(isTransientNetworkError(undefined)).toBe(false);
+      expect(isTransientNetworkError({})).toBe(false);
+    });
+  });
+
+  describe("formatError", () => {
+    it("formats Error objects", () => {
+      expect(formatError(new Error("oops"))).toBe("oops");
+    });
+
+    it("formats non-Error values", () => {
+      expect(formatError("string error")).toBe("string error");
+      expect(formatError(42)).toBe("42");
+    });
+  });
+
+  describe("errorCodeForLog", () => {
+    it("retains a bounded machine code without exposing the message", () => {
+      const err = Object.assign(new Error("failed at /private/user/session.jsonl"), {
+        code: "EACCES",
+      });
+      expect(errorCodeForLog(err)).toBe("EACCES");
+    });
+
+    it("rejects untrusted or missing codes", () => {
+      expect(errorCodeForLog(new Error("/private/user/session.jsonl"))).toBe("UNKNOWN");
+      expect(errorCodeForLog({ code: "../../private/path" })).toBe("UNKNOWN");
+    });
+  });
+
+  describe("providerHttpStatusOf", () => {
+    it("reads the status from a ProviderError", () => {
+      expect(providerHttpStatusOf(new ProviderError("gone", "custom", 410))).toBe(410);
+    });
+
+    it("finds a wrapped status through the cause chain", () => {
+      const cause = Object.assign(new Error("bad request"), { status: 400 });
+      expect(providerHttpStatusOf(new ProviderError("wrapped", "custom", undefined, cause))).toBe(400);
+    });
+
+    it("ignores errors without a plausible HTTP status", () => {
+      expect(providerHttpStatusOf(new Error("terminated"))).toBeUndefined();
+      expect(providerHttpStatusOf(Object.assign(new Error("x"), { status: 9000 }))).toBeUndefined();
+      expect(providerHttpStatusOf(undefined)).toBeUndefined();
+    });
+  });
+});
+
+describe("Logger", () => {
+  it("creates a logger with subsystem prefix", () => {
+    const logger = createLogger("test-subsystem");
+    expect(logger).toBeDefined();
+    expect(typeof logger.debug).toBe("function");
+    expect(typeof logger.info).toBe("function");
+    expect(typeof logger.warn).toBe("function");
+    expect(typeof logger.error).toBe("function");
+  });
+});

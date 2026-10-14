@@ -1,0 +1,1554 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const loggerMocks = vi.hoisted(() => ({
+  warn: vi.fn(),
+}));
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: loggerMocks.warn, error: vi.fn() }),
+}));
+
+// auth.ts has two layers:
+//   - pure helpers (maskKey, FEATURED_PROVIDERS, getConfig, saveConfig)
+//   - core-agent integration (listProviders, listModels, saveApiKey,
+//     removeCredential, testConnection)
+// Per test/README, the integration layer is out of scope for unit tests —
+// it requires real provider credentials and network reach. We cover only
+// the pure helpers + the local config file IO here.
+
+let tmpDir: string;
+let prevWs: string | undefined;
+const TEST_UID = '99999999';
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-auth-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.resetModules();
+  loggerMocks.warn.mockReset();
+  // auth.ts goes through `getActiveUserId()` for every file path, so we
+  // must pin an active uid before any dynamic import of auth-related modules.
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(TEST_UID);
+});
+
+afterEach(() => {
+  vi.doUnmock('node:fs');
+  vi.doUnmock('@earendil-works/pi-ai/oauth');
+  vi.doUnmock('#core-agent');
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+async function setDeepSeekEnabled(enabled: boolean): Promise<void> {
+  const { clientConfig } = await import('../../../src/main/features/client_config');
+  clientConfig.applyServerPayload({
+    immediate: { 'model.deepseek.enabled': enabled },
+    restart: {},
+    config_hash: `sha256:deepseek-${enabled ? 'on' : 'off'}`,
+  }, `"deepseek-${enabled ? 'on' : 'off'}"`);
+}
+
+describe('auth › maskKey', () => {
+  it('returns empty for non-string inputs', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.maskKey(null)).toBe('');
+    expect(a.maskKey(undefined)).toBe('');
+    expect(a.maskKey(123)).toBe('');
+    expect(a.maskKey({})).toBe('');
+    expect(a.maskKey('')).toBe('');
+  });
+
+  it('replaces short keys (≤ 8 chars) entirely with stars', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.maskKey('abc')).toBe('***');
+    expect(a.maskKey('12345678')).toBe('********');
+  });
+
+  it('keeps first-4 and last-4 chars for normal-length keys', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.maskKey('sk-abcdefghijklmnop')).toBe('sk-a…mnop');
+    expect(a.maskKey('1234567890abcdef')).toBe('1234…cdef');
+  });
+
+  it('trims surrounding whitespace before masking', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.maskKey('  sk-abcdefghijkl  ')).toBe('sk-a…ijkl');
+  });
+});
+
+describe('auth › external navigation', () => {
+  it('rejects non-http and credential-bearing URLs', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.openExternalUrl('javascript:alert(1)')).toEqual({
+      ok: false,
+      error: 'url must be a safe external link',
+    });
+    expect(a.openExternalUrl('https://user:password@example.com/')).toEqual({
+      ok: false,
+      error: 'url must be a safe external link',
+    });
+  });
+});
+
+describe('auth › FEATURED_PROVIDERS', () => {
+  it('lists the curated API-key providers in CATALOG order', async () => {
+    const a = await import('../../../src/main/features/auth');
+    // DeepSeek 直连先（pi-ai 不带，自建适配）→ 全球前沿 OpenAI / Google /
+    // Anthropic（去掉 oauthOnly 的 OpenAI Codex）→ CN 主流（Zhipu / Moonshot
+    // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
+    // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
+    expect(a.FEATURED_PROVIDERS).toEqual([
+      'orkas-api',
+      'deepseek',
+      'openai',
+      'google',
+      'anthropic',
+      'zai',
+      'moonshot',
+      'kimi-coding',
+      'minimax-cn',
+      'doubao',
+      'openrouter',
+    ]);
+    // openai-codex / minimax-portal / minimax-portal-cn are oauthOnly and
+    // excluded from the API-key docs list (FEATURED_PROVIDERS). They still
+    // appear in CATALOG / VISIBLE_PROVIDERS.
+  });
+});
+
+describe('auth › Orkas API quick setup', () => {
+  it('configures all five public services idempotently with the documented model ids', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKeyEntry('anthropic', 'claude-opus-4-8', 'third-party-key-xxxxxxxx', 'work');
+
+    expect(a.configureAllOrkasApiServices('  orkas-key-first-xxxxxxxx  ')).toEqual({ configured: true });
+    a.saveImageProfiles(a.loadImageProfiles().map((profile) => (
+      profile.provider === 'orkas-api' ? { ...profile, model: 'old-image-model' } : profile
+    )));
+    a.saveVideoProfiles(a.loadVideoProfiles().map((profile) => (
+      profile.provider === 'orkas-api' ? { ...profile, model: 'old-video-model' } : profile
+    )));
+    a.saveTtsProfiles(a.loadTtsProfiles().map((profile) => (
+      profile.provider === 'orkas-api'
+        ? { ...profile, baseUrl: 'https://legacy.example/v1', model: 'old-tts-model' }
+        : profile
+    )));
+    expect(a.configureAllOrkasApiServices('orkas-key-second-xxxxxxxx')).toEqual({ configured: true });
+
+    const entries = (await a.listEntries({ includeUnavailable: true })).entries;
+    expect(entries.filter((entry) => entry.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({
+        model: 'orkas-llm-1.5',
+        modelName: 'Orkas-1.5',
+        official: true,
+        profileLabel: 'Orkas',
+        profileMasked: 'orka…xxxx',
+        recommended: true,
+        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
+      }),
+      expect.objectContaining({
+        model: 'orkas-llm-1.5-pro',
+        modelName: 'Orkas-1.5 Pro',
+        official: true,
+        profileLabel: 'Orkas',
+        profileMasked: 'orka…xxxx',
+        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
+      }),
+    ]);
+    expect((await a.listComposerEntries()).entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          provider: 'orkas-api',
+          model: 'orkas-llm-1.5',
+          modelName: 'Orkas-1.5',
+          official: true,
+        }),
+        expect.objectContaining({
+          provider: 'orkas-api',
+          model: 'orkas-llm-1.5-pro',
+          modelName: 'Orkas-1.5 Pro',
+          official: true,
+        }),
+      ]),
+    );
+    expect(entries[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-5' });
+
+    expect(a.loadSearchProfiles().filter((profile) => profile.provider === 'orkas-api')).toHaveLength(1);
+    expect(a.loadImageProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({ model: 'orkas-image' }),
+    ]);
+    expect(a.loadVideoProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({ model: 'orkas-video' }),
+    ]);
+    expect(a.loadTtsProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
+      expect.objectContaining({
+        baseUrl: 'https://orkas.ai/v1',
+        model: 'orkas-tts-1',
+        voice: 'zh_female_vv_uranus_bigtts',
+      }),
+    ]);
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
+    expect(raw).not.toContain('orkas-key-second-xxxxxxxx');
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' },
+      raw,
+      { legacySeeds: [TEST_UID] },
+    ));
+    const orkasKeys = [
+      ...Object.values(persisted.profiles as Record<string, any>)
+        .filter((profile: any) => profile.provider === 'orkas-api')
+        .map((profile: any) => profile.key),
+      ...persisted.searchProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.imageProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.videoProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+      ...persisted.ttsProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
+    ];
+    expect(new Set(orkasKeys)).toEqual(new Set(['orkas-key-second-xxxxxxxx']));
+  });
+
+});
+
+describe('auth › multi-profile store (addApiKey / removeCredential / renameProfile)', () => {
+  it('addApiKey creates a default-labelled profile for a new provider', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { profileId } = await a.addApiKey('anthropic', 'sk-first-one-xxxxxxx');
+    expect(profileId).toBe('anthropic:default');
+
+    const { providers } = await a.listProviders();
+    const anth = providers.find((p) => p.id === 'anthropic')!;
+    expect(anth.profiles).toHaveLength(1);
+    expect(anth.profiles[0].label).toBe('default');
+    expect(anth.profiles[0].type).toBe('api_key');
+    expect(anth.profiles[0].masked).toBe('sk-f…xxxx');
+  });
+
+  it('addApiKey generates unique auto-labels when default already exists', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const r1 = await a.addApiKey('anthropic', 'key-1-xxxxxxxxxxxx');
+    const r2 = await a.addApiKey('anthropic', 'key-2-xxxxxxxxxxxx');
+    const r3 = await a.addApiKey('anthropic', 'key-3-xxxxxxxxxxxx');
+    expect(r1.profileId).toBe('anthropic:default');
+    expect(r2.profileId).toBe('anthropic:account2');
+    expect(r3.profileId).toBe('anthropic:account3');
+  });
+
+  it('concurrent addApiKey for distinct providers persists every profile', async () => {
+    // auth-profiles.json is read-modify-written. Today's impl is incidentally
+    // safe because both load and save are sync fs calls (no await in the
+    // critical section). This test guards against a future refactor to async
+    // fs — the moment a real microtask boundary opens between read and write,
+    // overlapping calls will silently lose profiles.
+    const a = await import('../../../src/main/features/auth');
+    const N = 8;
+    const providers = Array.from({ length: N }, (_, i) => `prov${i}`);
+    await Promise.all(providers.map((p) => a.addApiKey(p, `key-${p}-xxxxxxxx`)));
+    const { providers: list } = await a.listProviders();
+    const seen = new Set(list.map((p) => p.id));
+    for (const p of providers) expect(seen.has(p)).toBe(true);
+  });
+
+  it('addApiKey with explicit label sanitises invalid characters', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { profileId } = await a.addApiKey('openai', 'key-xxxxxxxxxxxx', 'work @home/1');
+    expect(profileId).toBe('openai:work--home-1');
+  });
+
+  it('stores auth-profiles with the local-secret facade', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    await a.addApiKey('openai', 'sk-local-secret-xxxxxxxx');
+    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
+    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
+    expect(raw).not.toContain('sk-local-secret-xxxxxxxx');
+  });
+
+  it('migrates legacy crypto-vault auth-profiles on read', async () => {
+    const paths = await import('../../../src/main/paths');
+    const cryptoVault = await import('../../../src/main/util/crypto-vault');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, cryptoVault.encrypt(TEST_UID, JSON.stringify({
+      version: 4,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-legacy-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+    expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
+    expect(raw).not.toContain('sk-legacy-xxxxxxxx');
+  });
+
+  it('migrates saved entries when their model id is no longer selectable', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 4,
+      profiles: {
+        'kimi-coding:default': {
+          type: 'api_key',
+          provider: 'kimi-coding',
+          label: 'default',
+          key: 'sk-kimi-legacy-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [{
+        entryId: 'entry-1',
+        provider: 'kimi-coding',
+        model: 'k2p6',
+        profileId: 'kimi-coding:default',
+        createdAt: 1,
+        lastUsed: 0,
+      }],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    const { entries } = await a.listEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe('k2p7');
+
+    const rewritten = JSON.parse(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')));
+    expect(rewritten.entries[0].model).toBe('k2p7');
+  });
+
+  it('removeCredential drops the profile', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { profileId } = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'work');
+    const res = await a.removeCredential(profileId);
+    expect(res.removed).toBe(true);
+    const { providers } = await a.listProviders();
+    const anth = providers.find((p) => p.id === 'anthropic')!;
+    expect(anth.profiles).toHaveLength(0);
+  });
+
+  it('removeCredential on unknown id returns removed=false', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const res = await a.removeCredential('anthropic:missing');
+    expect(res.removed).toBe(false);
+  });
+
+  it('renameProfile changes the label and rewrites the profile id', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { profileId } = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'old');
+    const res = await a.renameProfile(profileId, 'new-name');
+    expect(res.profileId).toBe('anthropic:new-name');
+    const { providers } = await a.listProviders();
+    const anth = providers.find((p) => p.id === 'anthropic')!;
+    expect(anth.profiles.map((p) => p.label)).toEqual(['new-name']);
+  });
+
+  it('renameProfile rejects collisions with an existing label', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const r1 = await a.addApiKey('anthropic', 'k1-xxxxxxxxxxxx', 'one');
+    await a.addApiKey('anthropic', 'k2-xxxxxxxxxxxx', 'two');
+    await expect(a.renameProfile(r1.profileId, 'two')).rejects.toThrow();
+  });
+});
+
+describe('auth › listProviders grouping', () => {
+  it('returns providers in catalog order regardless of insertion order', async () => {
+    const a = await import('../../../src/main/features/auth');
+    // 插入顺序：anthropic → openai。CATALOG 顺序：openai 在 anthropic 之前。
+    // listProviders 必须按 CATALOG 排，所以即便先插 anthropic、再插 openai，
+    // 也要 openai.indexOf < anthropic.indexOf（CATALOG 排序压过插入顺序）。
+    await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
+    const { providers } = await a.listProviders();
+    const ids = providers.map((p) => p.id);
+    expect(ids.indexOf('openai')).toBeLessThan(ids.indexOf('anthropic'));
+  });
+
+  it('exposes supportsApiKey / supportsOAuth flags consistent with the catalog', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+
+    // anthropic — both API-key and OAuth work against the same endpoint.
+    const anth = providers.find((p) => p.id === 'anthropic')!;
+    expect(anth.supportsApiKey).toBe(true);
+    expect(anth.supportsOAuth).toBe(true);
+    expect(anth.oauthProvider).toBe('anthropic');
+
+    // pi-ai 0.99.1 exposes native OpenAI OAuth alongside the Codex endpoint.
+    const openai = providers.find((p) => p.id === 'openai')!;
+    expect(openai.supportsApiKey).toBe(true);
+    expect(openai.supportsOAuth).toBe(true);
+    expect(openai.oauthProvider).toBe('openai');
+    expect(providers.find((p) => p.id === 'openai-codex')).toMatchObject({
+      supportsApiKey: false, supportsOAuth: true, oauthProvider: 'openai-codex',
+    });
+  });
+});
+
+describe('auth › custom model configuration', () => {
+
+  it('retains legacy OpenAI configuration when protocol is absent after restart', async () => {
+    const paths = await import('../../../src/main/paths');
+    const secrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, secrets.encryptLocalSecret(
+      { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' },
+      JSON.stringify({ version: 6, profiles: { 'custom:legacy': {
+        type: 'api_key', provider: 'custom', label: 'legacy', key: 'synthetic-legacy-key',
+        baseUrl: 'https://gateway.example.test/v1', contextWindow: 131072,
+        createdAt: 1, lastUsed: 0,
+      } }, entries: [{ entryId: 'legacy-entry', provider: 'custom',
+        profileId: 'custom:legacy', model: 'legacy-model', lastUsed: 0 }] }),
+    ));
+    const auth = await import('../../../src/main/features/auth');
+    expect((await auth.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: 'legacy-entry', model: 'legacy-model', apiKey: 'synthetic-legacy-key',
+      customConfig: { protocol: 'openai', baseUrl: 'https://gateway.example.test/v1',
+        contextWindow: 131072, maxTokens: 32768 },
+    });
+  });
+
+  it.each(['https://gateway.example.test/proxy',
+    'https://gateway.example.test/proxy/v1/',
+    'https://gateway.example.test/proxy/v1/messages/'])('saves an Anthropic SDK base from %s and reloads its protocol', async (baseUrl) => {
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic', baseUrl,
+      model: 'claude-gateway-alias', apiKey: 'synthetic-anthropic-key' });
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const restarted = await import('../../../src/main/features/auth');
+    expect((await restarted.pickChatEntryGroup())[0]?.customConfig).toMatchObject({
+      protocol: 'anthropic', baseUrl: 'https://gateway.example.test/proxy',
+    });
+  });
+
+  it('does not normalize an already saved versioned gateway prefix a second time', async () => {
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic',
+      baseUrl: 'https://gateway.example.test/proxy/v1/v1/messages',
+      model: 'claude-gateway-alias', apiKey: 'synthetic-prefix-key' });
+    expect((await auth.pickChatEntryGroup())[0]?.customConfig?.baseUrl)
+      .toBe('https://gateway.example.test/proxy/v1');
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users'); users.activateUser(TEST_UID);
+    const restarted = await import('../../../src/main/features/auth');
+    expect((await restarted.pickChatEntryGroup())[0]?.customConfig?.baseUrl)
+      .toBe('https://gateway.example.test/proxy/v1');
+  });
+
+  it('persists Anthropic protocol and returns it in the runtime choice', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      protocol: 'anthropic',
+      baseUrl: 'https://gateway.example.test',
+      model: 'claude-3-7-sonnet',
+      apiKey: 'sk-custom-anthropic-xxxxxxxx',
+    });
+    expect((await a.pickChatEntryGroup()).find((entry) => entry.entryId === added.entryId)).toEqual(
+      expect.objectContaining({
+        customConfig: expect.objectContaining({
+          protocol: 'anthropic',
+          baseUrl: 'https://gateway.example.test',
+        }),
+      }),
+    );
+  });
+
+  it('atomically stores endpoint metadata and carries it into the runtime choice', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      label: '公司网关',
+      baseUrl: 'https://gateway.example.test/v1/',
+      model: 'acme/reasoner-v2',
+      apiKey: 'sk-custom-runtime-xxxxxxxx',
+      contextWindow: 262_144,
+      maxTokens: 16_384,
+      supportsReasoning: true,
+      supportsVision: true,
+      reasoningEffort: 'medium',
+    });
+
+    expect(added.profileId).toBe('custom:公司网关');
+    expect((await a.listEntries()).entries).toEqual([
+      expect.objectContaining({
+        provider: 'custom',
+        providerLabelKey: 'provider.custom.label',
+        model: 'acme/reasoner-v2',
+        modelEditable: false,
+        modelAvailable: true,
+        profileMasked: 'sk-c…xxxx',
+      }),
+    ]);
+    expect(await a.pickChatEntryGroup()).toEqual([
+      expect.objectContaining({
+        entryId: added.entryId,
+        provider: 'custom',
+        model: 'acme/reasoner-v2',
+        apiKey: 'sk-custom-runtime-xxxxxxxx',
+        customConfig: {
+          protocol: 'openai',
+          baseUrl: 'https://gateway.example.test/v1',
+          contextWindow: 262_144,
+          maxTokens: 16_384,
+          supportsReasoning: true,
+          supportsVision: true,
+          reasoningEffort: 'medium',
+        },
+      }),
+    ]);
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(persisted.profiles['custom:公司网关']).toMatchObject({
+      maxTokens: 16_384,
+      supportsReasoning: true,
+      supportsVision: true,
+      reasoningEffort: 'medium',
+    });
+    expect(persisted.profiles['custom:公司网关']).not.toHaveProperty('maxTokensSource');
+
+    const custom = (await a.listProviders()).providers.find((provider) => provider.id === 'custom');
+    expect(custom).toMatchObject({
+      labelKey: 'provider.custom.label',
+      supportsApiKey: true,
+      supportsOAuth: false,
+      customOpenAICompatible: true,
+    });
+  });
+
+  it('preserves an explicit text-only override for a custom model', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'acme/text-only',
+      apiKey: 'sk-custom-text-only-xxxxxxxx',
+      supportsVision: false,
+    });
+
+    expect(await a.pickChatEntryGroup()).toEqual([
+      expect.objectContaining({
+        entryId: added.entryId,
+        customConfig: expect.objectContaining({ supportsVision: false }),
+      }),
+    ]);
+  });
+
+  it('assigns provider-local labels when the optional label is blank', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const first = await a.addCustomModelEntry({
+      baseUrl: 'https://first.example.test/v1',
+      model: 'first-model',
+      apiKey: 'sk-custom-first-xxxxxxxx',
+    });
+    const second = await a.addCustomModelEntry({
+      label: '   ',
+      baseUrl: 'https://second.example.test/v1',
+      model: 'second-model',
+      apiKey: 'sk-custom-second-xxxxxxxx',
+    });
+
+    expect(first.profileId).toBe('custom:default');
+    expect(second.profileId).toBe('custom:account2');
+  });
+
+  it('normalizes full chat URLs and rejects impossible limits without a partial credential', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const base = {
+      label: 'full-endpoint',
+      model: 'acme/reasoner-v2',
+      apiKey: 'sk-custom-invalid-xxxxxxxx',
+    };
+
+    await expect(a.addApiKeyEntry(
+      'custom',
+      base.model,
+      base.apiKey,
+      'generic-bypass',
+    )).rejects.toMatchObject({ code: 'CUSTOM_CONFIG_REQUIRED' });
+    const normalized = await a.addCustomModelEntry({
+      ...base,
+      baseUrl: 'https://gateway.example.test/v1/chat/completions/stream',
+    });
+    expect((await a.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: normalized.entryId,
+      customConfig: {
+        baseUrl: 'https://gateway.example.test/v1',
+        contextWindow: 131_072,
+        maxTokens: 32_768,
+      },
+    });
+    await expect(a.addCustomModelEntry({
+      ...base,
+      label: 'invalid-limits',
+      baseUrl: 'https://gateway.example.test/v1',
+      contextWindow: 4_096,
+      maxTokens: 8_192,
+    })).rejects.toMatchObject({ code: 'CUSTOM_TOKEN_LIMIT_INVALID' });
+
+    expect((await a.listEntries()).entries).toHaveLength(1);
+    expect(
+      (await a.listProviders()).providers.find((provider) => provider.id === 'custom')?.profiles,
+    ).toEqual([
+      expect.objectContaining({ profileId: 'custom:full-endpoint' }),
+    ]);
+  });
+
+  it('rejects API keys that cannot be sent in an Authorization header without a partial credential', async () => {
+    const a = await import('../../../src/main/features/auth');
+
+    await expect(a.addCustomModelEntry({
+      label: 'invalid-header',
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'acme/reasoner-v2',
+      apiKey: 'щ-custom-key',
+    })).rejects.toMatchObject({ code: 'CUSTOM_API_KEY_INVALID' });
+
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect(
+      (await a.listProviders()).providers.find((provider) => provider.id === 'custom')?.profiles,
+    ).toEqual([]);
+  });
+
+  it('uses the 32K runtime default without persisting an omitted maxTokens field', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addCustomModelEntry({
+      label: 'local',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'local-model',
+      apiKey: 'local-development-key',
+      contextWindow: '',
+      maxTokens: '   ',
+    });
+
+    expect((await a.pickChatEntryGroup())[0]?.customConfig).toEqual({
+      protocol: 'openai',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      contextWindow: 131_072,
+      maxTokens: 32_768,
+    });
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(persisted.profiles['custom:local']).not.toHaveProperty('maxTokens');
+  });
+
+  it('removes the legacy generated 8K custom cap during the v6 profile migration', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 5,
+      profiles: {
+        'custom:legacy': {
+          type: 'api_key',
+          provider: 'custom',
+          label: 'legacy',
+          key: 'sk-legacy-custom-xxxxxxxx',
+          baseUrl: 'https://legacy.example.test/v1',
+          contextWindow: 131_072,
+          maxTokens: 8_192,
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [{
+        entryId: 'legacy-entry',
+        provider: 'custom',
+        model: 'legacy-model',
+        profileId: 'custom:legacy',
+        createdAt: 1,
+        lastUsed: 0,
+      }],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    expect((await a.pickChatEntryGroup())[0]?.customConfig?.maxTokens).toBe(32_768);
+
+    const rewritten = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(rewritten.version).toBe(6);
+    expect(rewritten.profiles['custom:legacy']).not.toHaveProperty('maxTokens');
+  });
+
+  it('keeps same-model custom endpoints as ordered fallbacks instead of rotating them as keys', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const fallback = await a.addCustomModelEntry({
+      label: 'fallback',
+      baseUrl: 'https://fallback.example.test/v1',
+      model: 'shared-model-id',
+      apiKey: 'sk-fallback-xxxxxxxx',
+    });
+    const primary = await a.addCustomModelEntry({
+      label: 'primary',
+      baseUrl: 'https://primary.example.test/v1',
+      model: 'shared-model-id',
+      apiKey: 'sk-primary-xxxxxxxx',
+    });
+
+    a.bumpEntryLastUsed(primary.entryId);
+    expect((await a.pickChatEntryGroup()).map((choice) => choice.entryId)).toEqual([
+      primary.entryId,
+      fallback.entryId,
+    ]);
+  });
+
+  it('does not expose custom credentials or endpoint metadata in connection-test errors', async () => {
+    vi.doMock('#core-agent', () => ({}));
+    vi.doMock('../../../src/main/model/core-agent/external-providers', () => ({
+      createCustomOpenAICompatibleProvider: vi.fn(async (config: {
+        apiKey: string;
+        baseUrl: string;
+      }) => ({
+        complete: vi.fn(async () => {
+          throw new Error(
+            `API key ${config.apiKey} rejected by ${config.baseUrl}`
+            + '?signature=provider-secret for admin@example.test at /Users/test/private',
+          );
+        }),
+      })),
+    }));
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      label: 'private-gateway',
+      baseUrl: 'https://gateway.internal.example/v1',
+      model: 'private-model',
+      apiKey: 'opaque-connection-secret-xxxxxxxx',
+    });
+
+    const result = await a.testConnection('custom', 'private-model', added.profileId);
+
+    expect(result).toMatchObject({ ok: false, profileId: added.profileId });
+    expect(result.error).toContain('rejected');
+    expect(result.error).not.toContain('opaque-connection-secret-xxxxxxxx');
+    expect(result.error).not.toContain('gateway.internal.example');
+    expect(result.error).not.toContain('provider-secret');
+    expect(result.error).not.toContain('admin@example.test');
+    expect(result.error).not.toContain('/Users/test/private');
+  });
+});
+
+describe('auth › pickRotationKey', () => {
+  it('returns null when no profile is configured', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(await a.pickRotationKey('anthropic')).toBeNull();
+  });
+
+  it('picks the profile with oldest lastUsed and bumps it', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('anthropic', 'key-one-xxxxxxxx', 'one');
+    await a.addApiKey('anthropic', 'key-two-xxxxxxxx', 'two');
+
+    // First pick: deterministic tie-break by insertion order (both lastUsed=0)
+    const first = await a.pickRotationKey('anthropic');
+    expect(first).not.toBeNull();
+    // Second pick: must be the other profile (its lastUsed is still 0,
+    // while the one just used now has a non-zero lastUsed).
+    const second = await a.pickRotationKey('anthropic');
+    expect(second).not.toBeNull();
+    expect(second!.profileId).not.toBe(first!.profileId);
+
+    // Third pick: first is now older again → rotates back.
+    const third = await a.pickRotationKey('anthropic');
+    expect(third).not.toBeNull();
+    expect(third!.profileId).toBe(first!.profileId);
+  });
+});
+
+describe('auth › entries (priority list)', () => {
+  it('listEntries is empty on a fresh store', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { entries } = await a.listEntries();
+    expect(entries).toEqual([]);
+  });
+
+  it('addEntry prepends new entries so the latest is the default', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p1 = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'one');
+    const p2 = await a.addApiKey('openai', 'sk-xxxxxxxxxxxx', 'one');
+    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
+    const r2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: p2.profileId });
+    expect(r1.entryId).toBeTruthy();
+    expect(r2.entryId).not.toBe(r1.entryId);
+
+    const { entries } = await a.listEntries();
+    expect(entries.map((e) => `${e.provider}:${e.model}`)).toEqual([
+      'openai:gpt-5.6-sol',
+      'anthropic:claude-opus-5',
+    ]);
+  });
+
+  it('addEntry is idempotent for the same (provider, model, profileId)', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    const r2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    expect(r2.entryId).toBe(r1.entryId);
+    const { entries } = await a.listEntries();
+    expect(entries).toHaveLength(1);
+  });
+
+  it('upgrades removed saved model ids when adding an entry', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('kimi-coding', 'k-xxxxxxxxxxxx');
+    await a.addEntry({ provider: 'kimi-coding', model: 'k2p6', profileId: p.profileId });
+    const { entries } = await a.listEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe('k2p7');
+  });
+
+  it('addEntry rejects a profileId belonging to a different provider', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    await expect(
+      a.addEntry({ provider: 'openai', model: 'gpt-5.5', profileId: p.profileId }),
+    ).rejects.toThrow();
+  });
+
+  it('removeEntry drops the tuple', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    const r = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    const out = await a.removeEntry(r.entryId);
+    expect(out.removed).toBe(true);
+    expect((await a.listEntries()).entries).toEqual([]);
+  });
+
+  it('removeCredential cascades — entries pointing at the dropped profile go away', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    await a.removeCredential(p.profileId);
+    expect((await a.listEntries()).entries).toEqual([]);
+  });
+
+  it('reorderEntries permutes the list in the order given', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    const q = await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: q.profileId });
+
+    const res = await a.reorderEntries([e2.entryId, e1.entryId]);
+    expect(res.entries.map((e) => e.entryId)).toEqual([e2.entryId, e1.entryId]);
+  });
+
+  it('pickChatEntry returns null when entries list is empty', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx'); // credential but no entry
+    expect(await a.pickChatEntry()).toBeNull();
+  });
+
+  it('pickChatEntry prefers the first entry and rotates within a same-(provider, model) group', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p1 = await a.addApiKey('anthropic', 'k-one-xxxxxxxx', 'one');
+    const p2 = await a.addApiKey('anthropic', 'k-two-xxxxxxxx', 'two');
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p2.profileId });
+
+    const first  = await a.pickChatEntry();
+    const second = await a.pickChatEntry();
+    const third  = await a.pickChatEntry();
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(third).not.toBeNull();
+    // Both entry ids must show up — round-robin within the top group.
+    const ids = new Set([first!.entryId, second!.entryId]);
+    expect(ids).toEqual(new Set([e1.entryId, e2.entryId]));
+  });
+
+  it('pickChatEntry falls back to the next group when top group has no usable credential', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p1 = await a.addApiKey('openai', 'k-openai-xxxxxxx');
+    const p2 = await a.addApiKey('anthropic', 'k-anthropic-xxxx');
+    // Priority: anthropic(bad)/openai(good) — we simulate "bad" by deleting
+    // the credential after adding the entry (leaves a dangling entry, which
+    // should be skipped, not returned).
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p2.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: p1.profileId });
+    // Remove credential p2 directly via removeCredential; since that cascades,
+    // it also drops e1. To simulate a dangling entry without cascade, reach
+    // into the json file.
+    const pathMod = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const storePath = pathMod.userAuthProfilesFile(TEST_UID);
+    const raw = fs.readFileSync(storePath, 'utf-8');
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const store = JSON.parse(localSecrets.decryptLocalSecret(ctx, raw, { legacySeeds: [TEST_UID] }));
+    delete store.profiles[p2.profileId];
+    fs.writeFileSync(storePath, localSecrets.encryptLocalSecret(ctx, JSON.stringify(store)));
+
+    const pick = await a.pickChatEntry();
+    expect(pick).not.toBeNull();
+    expect(pick!.entryId).toBe(e2.entryId);
+    expect(pick!.provider).toBe('openai');
+    // The normal runtime list excludes the dangling entry, while Settings'
+    // explicit remediation query retains it so the user can repair/delete it.
+    expect((await a.listEntries()).entries.map((e) => e.entryId)).not.toContain(e1.entryId);
+    const { entries } = await a.listEntries({ includeUnavailable: true });
+    expect(entries.map((e) => e.entryId)).toContain(e1.entryId);
+  });
+
+});
+
+describe('auth › pickChatEntryGroup + 冷却联动', () => {
+  it('单把 key → group 只有 1 个候选', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('anthropic', 'k-only-xxxxxxxx');
+    const e = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+
+    const group = await a.pickChatEntryGroup();
+    expect(group.length).toBe(1);
+    expect(group[0].entryId).toBe(e.entryId);
+  });
+
+  it('同 (provider, model) 两把 key → 组内按 lastUsed 升序返候选', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p1 = await a.addApiKey('anthropic', 'k-1-xxxxxxxxxxx', 'one');
+    const p2 = await a.addApiKey('anthropic', 'k-2-xxxxxxxxxxx', 'two');
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p2.profileId });
+
+    // Bump e1 first → e2 应该成为 oldest，排在前
+    a.bumpEntryLastUsed(e1.entryId);
+
+    const group = await a.pickChatEntryGroup();
+    expect(group.map((c) => c.entryId)).toEqual([e2.entryId, e1.entryId]);
+  });
+
+  it('冷却中的 profile 在 pickChatEntryGroup 被跳过', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const cd = await import('../../../src/main/model/core-agent/profile-cooldown');
+    cd._clearAll();
+
+    const p1 = await a.addApiKey('anthropic', 'k-cold-xxxxxxx', 'cold');
+    const p2 = await a.addApiKey('anthropic', 'k-warm-xxxxxxx', 'warm');
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p2.profileId });
+
+    // 冷却 p1 —— 组内候选应该只剩 p2
+    cd.markCooldown(p1.profileId, 'auth', 'mocked 401');
+    const group = await a.pickChatEntryGroup();
+    expect(group.length).toBe(1);
+    expect(group[0].entryId).toBe(e2.entryId);
+
+    cd._clearAll();
+    // 清冷却后 p1 应该重新进入候选
+    const group2 = await a.pickChatEntryGroup();
+    expect(group2.map((c) => c.entryId).sort()).toEqual([e1.entryId, e2.entryId].sort());
+  });
+
+  it('组内全部冷却 → 回落下一组', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const cd = await import('../../../src/main/model/core-agent/profile-cooldown');
+    cd._clearAll();
+
+    const p1 = await a.addApiKey('anthropic', 'k-top-xxxxxxxx');
+    const p2 = await a.addApiKey('openai',    'k-fallback-xxx');
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5', profileId: p2.profileId });
+
+    cd.markCooldown(p1.profileId, 'auth', 'cold');
+    const group = await a.pickChatEntryGroup();
+    expect(group.length).toBe(1);
+    expect(group[0].entryId).toBe(e2.entryId);
+
+    cd._clearAll();
+  });
+
+  it('addApiKey 成功路径自动清冷却', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const cd = await import('../../../src/main/model/core-agent/profile-cooldown');
+    cd._clearAll();
+
+    const p1 = await a.addApiKey('anthropic', 'k-old-xxxxxxxx', 'rotate-me');
+    cd.markCooldown(p1.profileId, 'auth', 'pretend this 401ed');
+    expect(cd.isCooledDown(p1.profileId)).toBe(true);
+
+    // 再次 addApiKey（同 provider + label）更新 key → 应当清冷却
+    await a.addApiKey('anthropic', 'k-new-xxxxxxxx', 'rotate-me');
+    expect(cd.isCooledDown(p1.profileId)).toBe(false);
+
+    cd._clearAll();
+  });
+
+  it('bumpEntryLastUsed 对不存在的 entryId 安全无操作', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(() => a.bumpEntryLastUsed('nonexistent')).not.toThrow();
+  });
+});
+
+describe('auth › hasConfiguredModel', () => {
+  it('reports not-configured on a fresh store', async () => {
+    const a = await import('../../../src/main/features/auth');
+    delete process.env.ANTHROPIC_API_KEY;
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+  });
+
+  it('reports configured once an entry is added', async () => {
+    const a = await import('../../../src/main/features/auth');
+    delete process.env.ANTHROPIC_API_KEY;
+    const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    // Credential alone is not enough — we require an entry in the priority list.
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
+    expect(a.hasConfiguredModel()).toEqual({ configured: true });
+  });
+
+  it('does not treat a remediation-only entry with a missing credential as runnable', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const profile = await a.addApiKey('anthropic', 'k-dangling-xxxxxxxx');
+    const entry = await a.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-8',
+      profileId: profile.profileId,
+    });
+
+    const storePath = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const store = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(storePath, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    delete store.profiles[profile.profileId];
+    fs.writeFileSync(storePath, localSecrets.encryptLocalSecret(ctx, JSON.stringify(store)), 'utf8');
+
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect((await a.listEntries({ includeUnavailable: true })).entries).toEqual([
+      expect.objectContaining({
+        entryId: entry.entryId,
+        profileId: profile.profileId,
+        profileAvailable: false,
+        profileLabel: 'default',
+      }),
+    ]);
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+    expect(await a.getConfig()).toEqual({ provider: '', model: '' });
+    expect(await a.pickChatEntry()).toBeNull();
+  });
+
+  it('falls back to the ANTHROPIC_API_KEY env var when set', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'k-env-xxxxxxxx';
+    try {
+      expect(a.hasConfiguredModel()).toEqual({ configured: true });
+    } finally {
+      if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+});
+
+describe('auth › listModels', () => {
+  it('returns the hand-curated list for a known provider', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { models } = await a.listModels('anthropic');
+    expect(models.length).toBeGreaterThan(0);
+    for (const m of models) {
+      expect(typeof m.id).toBe('string');
+      expect(typeof m.name).toBe('string');
+    }
+  });
+
+  it('returns empty array for unknown providers', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { models } = await a.listModels('no-such-provider');
+    expect(models).toEqual([]);
+  });
+
+  it('returns the synchronized GPT-6 and GPT-5.6 catalog for OpenAI Codex', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
+      'gpt-6-astra',
+      'gpt-6.1-sol',
+      'gpt-6-sol',
+      'gpt-6-luna',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+    ]);
+  });
+
+  it('exposes and saves only configured models resolvable by this runtime', async () => {
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    const a = await import('../../../src/main/features/auth');
+    const exact = { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' };
+    const templated = {
+      id: 'claude-open-future-999',
+      name: 'Claude Future',
+      template: 'claude-opus-4-8',
+      supportsVision: true,
+    };
+    const unresolved = { id: 'brand-new-open-999', name: 'Brand New' };
+    clientConfig.applyServerPayload({
+      immediate: {
+        model_catalog: {
+          providers: { anthropic: [exact, templated, unresolved] },
+        },
+      },
+      restart: {},
+      config_hash: 'sha256:runtime-model-resolution',
+    }, '"runtime-model-resolution"');
+
+    expect((await a.listModels('anthropic')).models.map((model) => model.id)).toEqual([
+      exact.id,
+      templated.id,
+    ]);
+    await expect(a.addApiKeyEntry(
+      'anthropic',
+      unresolved.id,
+      'sk-unresolved-must-not-save-xxxxxxxx',
+    )).rejects.toMatchObject({ code: 'MODEL_NOT_AVAILABLE' });
+    expect((await a.listProviders()).providers
+      .find((provider) => provider.id === 'anthropic')?.profiles).toEqual([]);
+
+    const added = await a.addApiKeyEntry(
+      'anthropic',
+      templated.id,
+      'sk-templated-model-xxxxxxxx',
+    );
+    expect((await a.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: added.entryId,
+      model: templated.id,
+    });
+  });
+});
+
+describe('auth › DeepSeek policy gate', () => {
+  it('keeps DeepSeek visible by default without Server config', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+    expect(providers.map((p) => p.id)).toContain('deepseek');
+    expect((await a.listModels('deepseek')).models.length).toBeGreaterThan(0);
+  });
+
+  it('hides DeepSeek direct and DeepSeek-backed OpenRouter models when Server config disables it', async () => {
+    await setDeepSeekEnabled(false);
+    const a = await import('../../../src/main/features/auth');
+
+    const { providers } = await a.listProviders();
+    expect(providers.map((p) => p.id)).not.toContain('deepseek');
+    expect(providers.map((p) => p.id)).toContain('openrouter');
+    expect((await a.listModels('deepseek')).models).toEqual([]);
+    expect((await a.listModels('openrouter')).models.some((m) => /deepseek/i.test(m.id))).toBe(false);
+    await expect(a.addApiKey('deepseek', 'sk-deepseek-disabled')).rejects.toThrow(/DeepSeek is disabled/);
+  });
+
+  it('does not use existing DeepSeek entries while disabled', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('deepseek', 'sk-deepseek-existing');
+    await a.addEntry({ provider: 'deepseek', model: 'deepseek-v4-flash', profileId: p.profileId });
+    expect(a.hasConfiguredModel()).toEqual({ configured: true });
+
+    await setDeepSeekEnabled(false);
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect(a.listApiKeyEntries()).toEqual([]);
+    expect(await a.pickChatEntry()).toBeNull();
+    expect(await a.pickRotationKey('deepseek')).toBeNull();
+    const { providers } = await a.listProviders();
+    expect(providers.flatMap((provider) => provider.profiles).some((profile) =>
+      profile.provider === 'deepseek' || profile.profileId.startsWith('deepseek:'),
+    )).toBe(false);
+    await expect(
+      a.addEntry({ provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', profileId: p.profileId }),
+    ).rejects.toThrow(/DeepSeek is disabled/);
+  });
+});
+
+describe('auth › getConfig', () => {
+  it('returns empty pair when no profiles exist', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(await a.getConfig()).toEqual({ provider: '', model: '' });
+  });
+
+  it('returns entries[0] (provider, model) as the effective default', async () => {
+    // getConfig now reads from auth-profiles.json's priority entries list;
+    // legacy config.json fallback is removed — auth-profiles is the single
+    // source of truth for the default (provider, model) pair.
+    const a = await import('../../../src/main/features/auth');
+    const profiles = await a.saveApiKey('anthropic', 'sk-test', 'acc1');
+    expect(profiles.profileId).toBeTruthy();
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profiles.profileId });
+    expect(await a.getConfig()).toEqual({ provider: 'anthropic', model: 'claude-opus-5' });
+  });
+});
+
+describe('auth › durable shared profile contracts', () => {
+  it('keeps a successfully parsed profile available when its migration rewrite fails', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: TEST_UID,
+      recordId: 'auth-profiles.json',
+    }, JSON.stringify({
+      version: 4,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-readable-during-migration-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+    })), 'utf8');
+
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            throw Object.assign(new Error('migration rename denied'), { code: 'EACCES' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+
+    expect(providers.find((provider) => provider.id === 'openai')?.profiles)
+      .toEqual([expect.objectContaining({ masked: 'sk-r…xxxx' })]);
+    expect(localSecrets.isEncryptedSecret(fs.readFileSync(file, 'utf8'))).toBe(true);
+  });
+
+  it('recreates a missing credentials directory before the first profile write', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
+
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('openai', 'sk-created-after-missing-dir-xxxxxxxx');
+
+    expect(fs.statSync(path.dirname(file)).isDirectory()).toBe(true);
+    expect(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')))
+      .toContain('sk-created-after-missing-dir-xxxxxxxx');
+  });
+
+  it('recovers one transient ENOENT while writing the temporary profile file', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    let writeAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        writeFileSync: (target: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+          if (String(target) === `${file}.tmp`) {
+            writeAttempts += 1;
+            if (writeAttempts === 1) {
+              actual.rmSync(path.dirname(file), { recursive: true, force: true });
+              throw Object.assign(new Error('transient missing profile directory'), { code: 'ENOENT' });
+            }
+          }
+          return actual.writeFileSync(target, data, options);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await a.addApiKey('openai', 'sk-new-after-write-retry-xxxxxxxx');
+
+    expect(writeAttempts).toBe(2);
+    expect(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')))
+      .toContain('sk-new-after-write-retry-xxxxxxxx');
+  });
+
+  it('recovers one transient ENOENT while atomically publishing auth profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-existing-must-survive-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+      ttsProfiles: [],
+      disabledManagedProviders: [],
+      disabledManagedModels: [],
+    })), 'utf8');
+
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            if (publishAttempts === 1) {
+              actual.rmSync(from, { force: true });
+              throw Object.assign(new Error('transient missing temp file'), { code: 'ENOENT' });
+            }
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+
+    await a.addApiKey('anthropic', 'sk-new-after-retry-xxxxxxxx');
+
+    expect(publishAttempts).toBe(2);
+    const saved = localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8'));
+    expect(saved).toContain('sk-existing-must-survive-xxxxxxxx');
+    expect(saved).toContain('sk-new-after-retry-xxxxxxxx');
+  });
+
+  it('rethrows repeated ENOENT without replacing the existing auth profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const original = localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-existing-must-remain-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+      ttsProfiles: [],
+      disabledManagedProviders: [],
+      disabledManagedModels: [],
+    }));
+    fs.writeFileSync(file, original, 'utf8');
+
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            actual.rmSync(from, { force: true });
+            throw Object.assign(new Error('persistent missing temp file'), { code: 'ENOENT' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await expect(a.addApiKey('anthropic', 'sk-must-not-persist-xxxxxxxx'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+
+    expect(publishAttempts).toBe(2);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+  });
+
+  it('does not retry a non-ENOENT publish failure or replace existing profiles', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const original = localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 6,
+      profiles: {
+        'openai:default': {
+          type: 'api_key', provider: 'openai', label: 'default',
+          key: 'sk-existing-before-eacces-xxxxxxxx', createdAt: 1, lastUsed: 0,
+        },
+      },
+      entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [],
+      disabledManagedProviders: [], disabledManagedModels: [],
+    }));
+    fs.writeFileSync(file, original, 'utf8');
+    let publishAttempts = 0;
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      return {
+        ...actual,
+        renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+          if (String(from) === `${file}.tmp` && String(to) === file) {
+            publishAttempts += 1;
+            throw Object.assign(new Error('profile publish denied'), { code: 'EACCES' });
+          }
+          return actual.renameSync(from, to);
+        },
+      };
+    });
+
+    const a = await import('../../../src/main/features/auth');
+    await expect(a.addApiKey('anthropic', 'sk-must-not-persist-xxxxxxxx'))
+      .rejects.toMatchObject({ code: 'EACCES' });
+
+    expect(publishAttempts).toBe(1);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+  });
+
+  it.each([
+    ['addApiKeyEntry', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.addApiKeyEntry('openai', 'gpt-5.5', 'sk-must-not-overwrite-xxxxxxxx');
+    }],
+    ['addCustomModelEntry', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.addCustomModelEntry({
+        baseUrl: 'https://example.com/v1',
+        model: 'private-model',
+        apiKey: 'sk-must-not-overwrite-xxxxxxxx',
+      });
+    }],
+    ['reorderEntries', async (a: typeof import('../../../src/main/features/auth')) => {
+      await a.reorderEntries([]);
+    }],
+  ])('refuses %s when the existing credential store is unreadable', async (_name, mutate) => {
+    const paths = await import('../../../src/main/paths');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const corrupt = 'credential-store-must-be-preserved';
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, corrupt, 'utf8');
+    const a = await import('../../../src/main/features/auth');
+
+    await expect(mutate(a)).rejects.toThrow();
+    expect(fs.readFileSync(file, 'utf8')).toBe(corrupt);
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      'failed to load profiles store',
+      expect.objectContaining({
+        error: expect.objectContaining({
+          name: 'SyntaxError',
+          message_hash: expect.any(String),
+          message_chars: expect.any(Number),
+        }),
+      }),
+    );
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain(corrupt);
+  });
+  it('atomically changes a Composer model version and promotes that entry', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const openai = await a.addApiKey('openai', 'sk-composer-version-xxxxxxxx', 'versioned');
+    const target = await a.addEntry({
+      provider: 'openai', model: 'gpt-5.6-sol', profileId: openai.profileId,
+    });
+    const anthropic = await a.addApiKey('anthropic', 'sk-composer-priority-xxxxxxxx', 'priority');
+    const first = await a.addEntry({
+      provider: 'anthropic', model: 'claude-opus-5', profileId: anthropic.profileId,
+    });
+
+    expect((await a.listEntries()).entries.map((entry) => entry.entryId))
+      .toEqual([first.entryId, target.entryId]);
+    const selected = await a.selectEntry(target.entryId, 'gpt-5.6-terra');
+    expect(selected.entries).toMatchObject([{
+      entryId: target.entryId,
+      model: 'gpt-5.6-terra',
+      modelName: 'GPT-5.6 Terra',
+    }, {
+      entryId: first.entryId,
+    }]);
+    expect((await a.listEntries()).entries[0]).toMatchObject({
+      entryId: target.entryId,
+      model: 'gpt-5.6-terra',
+    });
+  });
+
+  it('does not partially change or promote an invalid Composer model version', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const openai = await a.addApiKey('openai', 'sk-composer-invalid-xxxxxxxx', 'versioned');
+    const target = await a.addEntry({
+      provider: 'openai', model: 'gpt-5.6-sol', profileId: openai.profileId,
+    });
+    const anthropic = await a.addApiKey('anthropic', 'sk-composer-first-xxxxxxxx', 'priority');
+    const first = await a.addEntry({
+      provider: 'anthropic', model: 'claude-opus-5', profileId: anthropic.profileId,
+    });
+
+    await expect(a.selectEntry(target.entryId, 'gpt-not-listed'))
+      .rejects.toMatchObject({ code: 'MODEL_NOT_AVAILABLE' });
+    expect((await a.listEntries()).entries.map((entry) => [entry.entryId, entry.model]))
+      .toEqual([
+        [first.entryId, 'claude-opus-5'],
+        [target.entryId, 'gpt-5.6-sol'],
+      ]);
+  });
+
+});

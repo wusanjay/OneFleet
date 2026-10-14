@@ -1,0 +1,232 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  t, setCurrentLang, getCurrentLang,
+  acceptLanguageHeader, detectSystemLang, descriptionLang, getRendererBootTables,
+  fallbackChain, isLang, normalizeLang, LOCALES, _resetCacheForTests,
+} from '../../src/main/i18n';
+
+beforeEach(() => {
+  _resetCacheForTests();
+  setCurrentLang('en');
+});
+
+describe('i18n › detectSystemLang', () => {
+  it.each([
+    ['zh-TW', 'zh-tw'], ['zh_HK', 'zh-tw'], ['zh-MO', 'zh-tw'],
+    ['zh-Hant', 'zh-tw'], ['zh-Hant-CN', 'zh-tw'], ['zh-Hans-TW', 'zh'],
+    ['pt-PT', 'pt-pt'], ['pt_AO', 'pt-pt'], ['pt-BR', 'pt'],
+    ['es-419', 'es-419'], ['es-AR', 'es-419'], ['es-US', 'es-419'], ['es-ES', 'es'],
+    ['ar-SA', 'ar'], ['hi-IN', 'hi'], ['id-ID', 'id'], ['id', 'id'], ['th-TH', 'th'], ['tr-TR', 'tr'], ['vi-VN', 'vi'],
+    ['zh-Hant-TW-u-nu-latn', 'zh-tw'], ['pt-PT-u-hc-h23', 'pt-pt'],
+  ] as const)('selects the intended script/region for %s', (tag, expected) => {
+    expect(detectSystemLang(tag)).toBe(expected);
+    expect(fallbackChain(expected)).toEqual([expected, 'en']);
+  });
+
+  it('honors OS preference order, skipping unsupported entries before English fallback', () => {
+    expect(detectSystemLang(['nl-NL', 'zh-Hant-HK', 'en-US'])).toBe('zh-tw');
+    expect(detectSystemLang(['en-US', 'ar-SA'])).toBe('en');
+    expect(detectSystemLang(['nl', 'sv-SE'])).toBe('en');
+    expect(detectSystemLang([])).toBe('en');
+    for (const malformed of ['constructor', '__proto__', 'pt--PT', 'zh fake', 'es-419<script>']) {
+      expect(normalizeLang(malformed)).toBeNull();
+    }
+  });
+
+  it('keeps regional variants adjacent in English-name order and places Arabic last', () => {
+    expect(LOCALES.map(item => item.code)).toEqual([
+      'zh', 'zh-tw', 'en', 'fr', 'de', 'hi', 'id', 'it', 'ja', 'ko',
+      'pt', 'pt-pt', 'ru', 'es', 'es-419', 'th', 'tr', 'vi', 'ar',
+    ]);
+    expect(LOCALES.find(item => item.code === 'zh-tw')?.label).toBe('繁體中文');
+    expect(LOCALES.find(item => item.code === 'pt-pt')?.label).toBe('Português (Portugal)');
+    expect(LOCALES.find(item => item.code === 'id')?.label).toBe('Bahasa Indonesia');
+    expect(LOCALES.find(item => item.code === 'hi')?.label).toBe('हिन्दी');
+  });
+
+  it.each([
+    ['es-MX', 'es-419'], ['fr-CA', 'fr'], ['ko-KR', 'ko'],
+    ['de-AT', 'de'], ['ru-RU', 'ru'], ['it-CH', 'it'],
+  ] as const)('recognizes %s and negotiates the selected language', (tag, language) => {
+    expect(detectSystemLang(tag)).toBe(language);
+    expect(isLang(language)).toBe(true);
+    expect(fallbackChain(language)).toEqual([language, 'en']);
+    expect(acceptLanguageHeader(language).split(',')[0]).toBe(LOCALES.find(item => item.code === language)?.intlLocale);
+    expect(Object.keys(getRendererBootTables(language)).sort()).toEqual(['en', language].sort());
+  });
+  it('maps Simplified Chinese locales to zh', () => {
+    for (const v of ['zh', 'zh-CN', 'zh-SG', 'ZH-Hans', 'zh-Hans-HK']) {
+      expect(detectSystemLang(v)).toBe('zh');
+    }
+  });
+
+  it('maps ja* locales to ja', () => {
+    for (const v of ['ja', 'ja-JP']) {
+      expect(detectSystemLang(v)).toBe('ja');
+    }
+  });
+
+  it('maps pt* locales to Brazilian Portuguese', () => {
+    for (const v of ['pt', 'pt-BR', 'pt_BR', 'PT-br']) {
+      expect(detectSystemLang(v)).toBe('pt');
+    }
+  });
+
+  it('falls back to en for non-supported / malformed / empty', () => {
+    for (const v of ['en-US', 'nl', '', null, undefined, 42]) {
+      expect(detectSystemLang(v)).toBe('en');
+    }
+  });
+});
+
+describe('i18n › isLang', () => {
+  it('accepts supported language codes', () => {
+    expect(isLang('zh')).toBe(true);
+    expect(isLang('en')).toBe(true);
+    expect(isLang('ja')).toBe(true);
+    expect(isLang('pt')).toBe(true);
+    expect(isLang('ZH')).toBe(false);
+    expect(isLang('ar')).toBe(true);
+    expect(isLang('nl')).toBe(false);
+    expect(isLang('')).toBe(false);
+    expect(isLang(null)).toBe(false);
+  });
+});
+
+describe('i18n › t() lookup', () => {
+  it('returns current-lang string when present', () => {
+    setCurrentLang('zh');
+    expect(t('errors.not_utf8')).toBe('文本类文件必须是 UTF-8 编码');
+    setCurrentLang('en');
+    expect(t('errors.not_utf8')).toBe('Text files must be UTF-8 encoded');
+    setCurrentLang('ja');
+    expect(t('errors.not_utf8')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
+    setCurrentLang('pt');
+    expect(t('errors.not_utf8')).toBe('Os arquivos de texto devem ser codificados em UTF-8');
+  });
+
+  it('uses English as the only fallback for every non-English UI language', () => {
+    expect(fallbackChain('zh')).toEqual(['zh', 'en']);
+    expect(fallbackChain('ja')).toEqual(['ja', 'en']);
+    expect(fallbackChain('pt')).toEqual(['pt', 'en']);
+    expect(fallbackChain('en')).toEqual(['en']);
+  });
+
+  it('returns raw key when missing in both langs', () => {
+    expect(t('definitely.not.present')).toBe('definitely.not.present');
+  });
+
+  it('substitutes {name} placeholders from vars', () => {
+    setCurrentLang('en');
+    // Use raw-key fallback as the template source so this test stays
+    // independent of shipped strings.
+    expect(t('Hello {who}, you have {count} messages', { who: 'Ada', count: 3 }))
+      .toBe('Hello Ada, you have 3 messages');
+  });
+
+  it('resolves main-side disabled skill request message', () => {
+    setCurrentLang('zh');
+    expect(t('component.skill_disabled_request', { name: 'arxiv-reader' }))
+      .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
+  });
+
+  it('localizes the fallback notice in every supported language', () => {
+    const vars = { from: 'Orkas-1.5 Pro', to: 'Orkas-1.5' };
+    expect(t('model.server_model_fallback', vars, 'zh'))
+      .toBe('Orkas-1.5 Pro 暂不可用，已由 Orkas-1.5 处理。');
+    expect(t('model.server_model_fallback', vars, 'en'))
+      .toBe('Orkas-1.5 Pro is temporarily unavailable. Orkas-1.5 handled the request.');
+    expect(t('model.server_model_fallback', vars, 'ja'))
+      .toBe('Orkas-1.5 Pro は一時的に利用できないため、Orkas-1.5 が処理しました。');
+    expect(t('model.server_model_fallback', vars, 'pt'))
+      .toBe('Orkas-1.5 Pro está temporariamente indisponível. Orkas-1.5 processou a solicitação.');
+  });
+
+  it('provides the development-only marker in every supported language', () => {
+    for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
+      expect(t('model.dev_marker', undefined, lang)).toBe('[DEV]');
+    }
+  });
+
+  it('localizes actionable external-agent terminal states', () => {
+    setCurrentLang('zh');
+    expect(t('cli_agent.run_failed_detail', { name: 'Codex', message: 'server error' }))
+      .toContain('server error');
+    expect(t('cli_agent.error_detail_missing'))
+      .toBe('未提供具体错误信息');
+    expect(t('cli_agent.timeout_detail', { name: 'OpenClaw' }))
+      .toContain('长时间没有响应');
+    expect(t('cli_agent.session_expired_detail', { name: 'Claude Code' }))
+      .toContain('外接会话已失效');
+    expect(t('cli_agent.upgrade_required_detail', { name: 'Codex', cli: 'codex' }))
+      .toContain('需要更高版本');
+  });
+
+  it('localizes the 24-hour background timeout recovery in every supported language', () => {
+    const expected = {
+      en: 'The background task reached the 24-hour limit and was stopped. Try again or ask the agent to continue.',
+      zh: '后台任务已达到 24 小时运行上限并停止。请重试，或让智能体继续未完成的工作。',
+      ja: 'バックグラウンドタスクが24時間の実行上限に達したため停止しました。再試行するか、エージェントに未完了の作業の続行を依頼してください。',
+      pt: 'A tarefa em segundo plano atingiu o limite de 24 horas e foi interrompida. Tente novamente ou peça ao agente para continuar o trabalho pendente.',
+    };
+    for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
+      expect(t('cli_agent.background_timeout_detail', undefined, lang)).toBe(expected[lang]);
+    }
+  });
+
+  it('ships privacy-safe task-intervention notification copy in every supported language', () => {
+    const expected = {
+      en: ['Task status updated', 'Open Orkas to view details.'],
+      zh: ['任务状态已更新', '打开 Orkas 查看详情。'],
+      ja: ['タスクのステータスが更新されました', 'Orkas を開いて詳細を確認してください。'],
+      pt: ['Status da tarefa atualizado', 'Abra o Orkas para ver os detalhes.'],
+    } as const;
+    for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
+      expect([
+        t('notification.task.waiting_input.title', undefined, lang),
+        t('notification.task.waiting_input.body', undefined, lang),
+      ]).toEqual(expected[lang]);
+    }
+  });
+
+  it('leaves unknown placeholders untouched', () => {
+    expect(t('Ping {unknown} pong', { other: 'x' })).toBe('Ping {unknown} pong');
+  });
+
+  it('per-call lang override takes precedence over current', () => {
+    setCurrentLang('en');
+    expect(t('errors.not_utf8', undefined, 'zh')).toBe('文本类文件必须是 UTF-8 编码');
+    expect(t('errors.not_utf8', undefined, 'ja')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
+    expect(t('errors.not_utf8', undefined, 'pt')).toBe('Os arquivos de texto devem ser codificados em UTF-8');
+    expect(getCurrentLang()).toBe('en'); // override does not mutate state
+  });
+});
+
+describe('i18n › descriptionLang', () => {
+  it('uses English descriptions for non-Chinese UI languages', () => {
+    expect(descriptionLang('zh')).toBe('zh');
+    expect(descriptionLang('en')).toBe('en');
+    expect(descriptionLang('ja')).toBe('en');
+    expect(descriptionLang('pt')).toBe('en');
+  });
+});
+
+describe('i18n › renderer boot bundle', () => {
+  it('loads only English when English is active', () => {
+    expect(Object.keys(getRendererBootTables('en'))).toEqual(['en']);
+  });
+
+  it('loads the active non-English table plus English fallback', () => {
+    expect(Object.keys(getRendererBootTables('zh')).sort()).toEqual(['en', 'zh']);
+    expect(Object.keys(getRendererBootTables('ja')).sort()).toEqual(['en', 'ja']);
+    expect(Object.keys(getRendererBootTables('pt')).sort()).toEqual(['en', 'pt']);
+  });
+});
+
+describe('i18n › acceptLanguageHeader', () => {
+  it('prefers the active UI locale for HTTP language negotiation', () => {
+    expect(acceptLanguageHeader('ja').startsWith('ja-JP')).toBe(true);
+    expect(acceptLanguageHeader('zh').startsWith('zh-CN')).toBe(true);
+    expect(acceptLanguageHeader('pt').startsWith('pt-BR')).toBe(true);
+  });
+});

@@ -1,0 +1,154 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import vm from 'node:vm';
+import { describe, expect, it, vi } from 'vitest';
+
+const source = readFileSync(
+  resolve(__dirname, '../../src/renderer/modules/kb-picker.js'),
+  'utf8',
+);
+const indexSource = readFileSync(
+  resolve(__dirname, '../../src/renderer/index.html'),
+  'utf8',
+);
+
+function load(
+  initialStorage: Record<string, string> = {},
+  elements: Record<string, unknown> = {},
+) {
+  const values = new Map(Object.entries(initialStorage));
+  const translations: Record<string, string> = {
+    'contexts.root_label': 'Root',
+    'contexts.transfer.global_library': 'Global Library',
+    'contexts.transfer.project_library': 'Project Library',
+    'kb_picker.title_global': 'Save to Global Library',
+    'kb_picker.title_project': 'Save to Project Library',
+    'kb_picker.target': 'Saving to: {library} / {rel}',
+  };
+  const sandbox: Record<string, any> = {
+    currentUserId: 'account-a',
+    createLogger: () => ({ warn: vi.fn() }),
+    t: (key: string, params: Record<string, unknown> = {}) => (
+      (translations[key] || key).replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`))
+    ),
+    escapeHtml: (value: unknown) => String(value ?? ''),
+    apiFetch: vi.fn(),
+    localStorage: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    },
+    document: { getElementById: (id: string) => elements[id] ?? null },
+    setTimeout: vi.fn(),
+    window: {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox, { filename: 'kb-picker.js' });
+  return { sandbox, values };
+}
+
+describe('Library location picker', () => {
+  it('binds the visible cancel and confirm actions without inline global lookups', () => {
+    const cancel = { addEventListener: vi.fn() };
+    const confirm = { addEventListener: vi.fn() };
+    const { sandbox } = load({}, {
+      'kb-picker-cancel': cancel,
+      'kb-picker-confirm': confirm,
+    });
+
+    expect(indexSource).toContain('id="kb-picker-cancel"');
+    expect(indexSource).toContain('id="kb-picker-confirm"');
+    expect(indexSource).not.toContain('onclick="closeKbPicker()"');
+    expect(indexSource).not.toContain('onclick="confirmKbPicker()"');
+    expect(cancel.addEventListener).toHaveBeenCalledWith('click', sandbox.window.closeKbPicker);
+    expect(confirm.addEventListener).toHaveBeenCalledWith('click', sandbox.window.confirmKbPicker);
+  });
+
+  it('identifies the Global or Project Library in both the title and destination', () => {
+    const { sandbox } = load();
+    const target = { textContent: '' };
+    sandbox.document = {
+      getElementById: (id: string) => (id === 'kb-picker-target' ? target : null),
+    };
+
+    expect(sandbox._kbPickerDefaultTitle({ type: 'global' }))
+      .toBe('Save to Global Library');
+    vm.runInContext(
+      "_kbPickerScope = { type: 'global' }; _kbPickerCurrentDir = ''; _kbPickerRenderTarget();",
+      sandbox,
+    );
+    expect(target.textContent).toBe('Saving to: Global Library / Root');
+
+    expect(sandbox._kbPickerDefaultTitle({ type: 'project', projectId: 'project-1' }))
+      .toBe('Save to Project Library');
+    vm.runInContext(
+      "_kbPickerScope = { type: 'project', projectId: 'project-1' }; _kbPickerCurrentDir = 'research'; _kbPickerRenderTarget();",
+      sandbox,
+    );
+    expect(target.textContent).toBe('Saving to: Project Library / research/');
+  });
+
+  it('scopes remembered global and project folders to the active account', () => {
+    const { sandbox } = load();
+
+    const accountAGlobal = sandbox._kbPickerLastDirKey({ type: 'global' });
+    const accountAProject = sandbox._kbPickerLastDirKey({
+      type: 'project',
+      projectId: 'project-1',
+    });
+    sandbox.currentUserId = 'account-b';
+    const accountBGlobal = sandbox._kbPickerLastDirKey({ type: 'global' });
+    const accountBProject = sandbox._kbPickerLastDirKey({
+      type: 'project',
+      projectId: 'project-1',
+    });
+
+    expect(accountAGlobal).not.toBe(accountBGlobal);
+    expect(accountAProject).not.toBe(accountBProject);
+    expect(accountAGlobal).toContain('account-a');
+    expect(accountBGlobal).toContain('account-b');
+  });
+
+  it('migrates the legacy shared folder only to the first account that opens it', () => {
+    const { sandbox, values } = load({
+      'kb-picker.last-dir': 'team/reference',
+    });
+
+    expect(sandbox._kbPickerReadLastDir({ type: 'global' })).toBe('team/reference');
+    expect(values.has('kb-picker.last-dir')).toBe(false);
+    sandbox.currentUserId = 'account-b';
+    expect(sandbox._kbPickerReadLastDir({ type: 'global' })).toBe('');
+  });
+
+  it('rejects traversal names and resolves a valid extensionless name in the selected folder', async () => {
+    const { sandbox, values } = load();
+    const name = { value: '../private' };
+    const message = { textContent: '', className: '' };
+    const removeOpen = vi.fn();
+    sandbox.document = {
+      getElementById: (id: string) => {
+        if (id === 'kb-picker-name') return name;
+        if (id === 'kb-picker-msg') return message;
+        if (id === 'kb-picker-modal') return { classList: { remove: removeOpen } };
+        return null;
+      },
+    };
+    const resolved: unknown[] = [];
+    sandbox.capturePickerResult = (value: unknown) => { resolved.push(value); };
+    vm.runInContext(
+      "_kbPickerScope = { type: 'global' }; _kbPickerCurrentDir = 'notes'; _kbPickerResolve = capturePickerResult;",
+      sandbox,
+    );
+
+    await sandbox.confirmKbPicker();
+    expect(message.textContent).toBe('kb_picker.name_bad_chars');
+    expect(resolved).toEqual([]);
+    expect(removeOpen).not.toHaveBeenCalled();
+
+    name.value = 'meeting notes';
+    await sandbox.confirmKbPicker();
+    expect(resolved).toEqual([{ path: 'notes/meeting notes.md' }]);
+    expect(removeOpen).toHaveBeenCalledOnce();
+    expect(values.get('kb-picker.last-dir:account-a')).toBe('notes');
+  });
+});

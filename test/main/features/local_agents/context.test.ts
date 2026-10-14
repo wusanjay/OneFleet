@@ -1,0 +1,340 @@
+import { describe, expect, it } from 'vitest';
+import { estimateBudgetTokens } from '../../../../src/main/util/token-estimate';
+
+import {
+  CLI_HISTORY_MAX_TURNS,
+  CLI_HISTORY_MAX_TOKENS,
+  buildCliDurableInstructions,
+  buildCliConversationContext,
+  buildCliTurnPrompt,
+  createCliContextPlan,
+  isCliResumeRejectedMessage,
+  materializeCliContext,
+} from '../../../../src/main/features/local_agents/context';
+
+const XML_PROTOCOL = [
+  '## Output protocol — switching project directory',
+  '<agent-input-form>',
+  '{"agent_id":"agent-1","fields":[{"id":"project_dir","type":"directory"}]}',
+  '</agent-input-form>',
+].join('\n');
+
+const INTENT_RULES = [
+  '## User intent and clarification',
+  'Treat explicit requirements as execution constraints.',
+  'Do not silently substitute another choice.',
+].join('\n');
+
+function plan() {
+  return createCliContextPlan({
+    durableInstructions: buildCliDurableInstructions({
+      agentName: 'Orkas Codex',
+      intentRules: INTENT_RULES,
+      workflow: 'Implement and verify changes in the current project.',
+      codingProtocol: XML_PROTOCOL,
+      projectContext: '## Project instructions (user-authored)\n\nKeep public APIs stable.',
+      language: 'zh',
+    }),
+    turnPrompt: buildCliTurnPrompt({ task: '修复登录失败' }),
+    recoveryContext: buildCliConversationContext({
+      mode: 'recovery',
+      turns: [{ id: '1', messages: ['[user → agent-1] 前面已经定位到 auth.ts'] }],
+    }),
+  });
+}
+
+describe('local_agents/context › semantic CLI context', () => {
+  it.each(['recovery', 'incremental'] as const)('marks %s dialogue as a partial execution view without inventing archived facts', (mode) => {
+    expect(buildCliConversationContext({ mode, turns: [] })).toBe('');
+    const context = buildCliConversationContext({ mode, turns: [{ id: 'recent', messages: ['User: Check Cedar', 'Agent: Check completed'] }] });
+    expect(context).toContain('not a full execution transcript');
+    expect(context).toContain('public tool records may be available via chat_history');
+    expect(context).not.toContain('older turns omitted');
+    expect(context).toContain('User: Check Cedar');
+    expect(context).toContain('Agent: Check completed');
+  });
+
+  it('omits inline image/video payloads before CLI clipping while preserving file references', () => {
+    const output = buildCliConversationContext({ mode: 'recovery', turns: [{ id: 'media', messages: [
+      'data:image/png;base64,' + 'AAAA'.repeat(100_000) + ' MIDDLE_FACT /work/chart.png '
+        + 'data:video/mp4;base64,' + 'BBBB'.repeat(100_000) + ' /work/clip.mp4',
+    ] }] });
+    expect(output).toContain('MIDDLE_FACT');
+    expect(output).toContain('/work/chart.png');
+    expect(output).toContain('/work/clip.mp4');
+    expect(output).not.toMatch(/AAAA|BBBB|truncated/);
+  });
+
+  it.each([
+    ['claude', 'native', 'invocation'],
+    ['codex', 'native', 'session'],
+    ['opencode', 'user-message', 'session'],
+    ['openclaw', 'user-message', 'session'],
+    ['hermes', 'user-message', 'invocation'],
+  ] as const)(
+    'materializes fresh and resumed %s context from its %s/%s capability',
+    (cli, channel, scope) => {
+      const contextPlan = plan();
+      const fresh = materializeCliContext(contextPlan, { cli, resumed: false });
+      const resumed = materializeCliContext(contextPlan, { cli, resumed: true });
+
+      expect(fresh.prompt).toContain('## Conversation context recovered by Orkas');
+      expect(fresh.prompt).toContain('auth.ts');
+      expect(fresh.prompt).toContain('修复登录失败');
+      expect(fresh.resumeFallbackPrompt).toContain('Conversation context recovered');
+
+      if (channel === 'native') {
+        expect(fresh.systemPrompt).toContain('You are "Orkas Codex".');
+        expect(fresh.systemPrompt).toContain(INTENT_RULES);
+        expect(fresh.systemPrompt).toContain('## Workflow');
+        expect(fresh.systemPrompt).toContain(XML_PROTOCOL);
+        expect(fresh.systemPrompt).toContain('## Project instructions (user-authored)');
+        expect(fresh.systemPrompt).toContain('## Response language');
+        expect(fresh.prompt).not.toContain('You are "Orkas Codex".');
+        expect(resumed.systemPrompt).toBe(fresh.systemPrompt);
+      } else {
+        expect(fresh.systemPrompt).toBeUndefined();
+        expect(fresh.prompt).toContain('You are "Orkas Codex".');
+        expect(fresh.prompt).toContain(INTENT_RULES);
+        expect(fresh.prompt).toContain(XML_PROTOCOL);
+        expect(resumed.systemPrompt).toBeUndefined();
+      }
+
+      if (scope === 'session') {
+        expect(resumed.prompt).toBe('修复登录失败');
+        expect(resumed.prompt).not.toContain(INTENT_RULES);
+        expect(resumed.prompt).not.toContain('<agent-input-form>');
+        expect(resumed.prompt).not.toContain('Conversation context recovered');
+      } else if (cli === 'claude') {
+        // Claude receives invocation-scoped durable instructions through its
+        // native channel, so the user turn remains current-task-only.
+        expect(resumed.prompt).toBe('修复登录失败');
+        expect(resumed.systemPrompt).toContain(XML_PROTOCOL);
+        expect(resumed.systemPrompt).toContain(INTENT_RULES);
+      } else {
+        // Hermes declares resume=none. Even a stray resumed=true input must
+        // fail closed to a fresh bootstrap with bounded visible recovery.
+        expect(resumed.prompt).toContain('You are "Orkas Codex".');
+        expect(resumed.prompt).toContain(INTENT_RULES);
+        expect(resumed.prompt).toContain('Conversation context recovered');
+        expect(resumed.prompt).toContain('修复登录失败');
+      }
+    },
+  );
+
+  it('places the shared intent core before workflow and static project context', () => {
+    const durable = buildCliDurableInstructions({
+      agentName: 'Orkas Codex',
+      intentRules: INTENT_RULES,
+      workflow: 'WORKFLOW_MARKER',
+      codingProtocol: 'CODING_PROTOCOL_MARKER',
+      projectContext: 'PROJECT_CONTEXT_MARKER',
+      language: 'zh',
+    });
+
+    const markers = [
+      'You are "Orkas Codex".',
+      INTENT_RULES,
+      '## Workflow',
+      'CODING_PROTOCOL_MARKER',
+      'PROJECT_CONTEXT_MARKER',
+      '## Response language',
+    ];
+    const positions = markers.map((marker) => durable.indexOf(marker));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
+    expect(durable).not.toContain('multiselect');
+    expect(durable).not.toContain(':::dashboard');
+  });
+
+  it.each(['claude', 'codex', 'opencode', 'openclaw', 'hermes'] as const)(
+    'keeps static %s instructions ahead of recovery, dynamic project state, runtime data, and the current task',
+    (cli) => {
+      const contextPlan = createCliContextPlan({
+        durableInstructions: buildCliDurableInstructions({
+          agentName: 'STATIC_IDENTITY',
+          intentRules: 'STATIC_INTENT',
+          workflow: 'STATIC_WORKFLOW',
+          codingProtocol: 'STATIC_CODING_PROTOCOL',
+          projectContext: 'STATIC_PROJECT_POLICY\n\nSTATIC_PROJECT_INSTRUCTIONS',
+          language: 'en',
+        }),
+        recoveryContext: 'DYNAMIC_RECOVERY',
+        incrementalContext: 'DYNAMIC_INCREMENTAL',
+        turnPrompt: buildCliTurnPrompt({
+          projectContext: 'DYNAMIC_PROJECT_MEMORY\n\nDYNAMIC_PROJECT_STATUS',
+          runtimeProtocol: 'DYNAMIC_RUNTIME_PROTOCOL',
+          attachmentPaths: ['/tmp/DYNAMIC_ATTACHMENT'],
+          task: 'CURRENT_TASK_LAST',
+        }),
+      });
+      const fresh = materializeCliContext(contextPlan, { cli, resumed: false });
+      const resumed = materializeCliContext(contextPlan, { cli, resumed: true });
+      const expectInOrder = (surface: string, markers: string[]) => {
+        const positions = markers.map((marker) => surface.indexOf(marker));
+        expect(positions.every((position) => position >= 0)).toBe(true);
+        expect(positions).toEqual([...positions].sort((left, right) => left - right));
+      };
+      const durableSurface = fresh.systemPrompt || fresh.prompt;
+      const staticMarkers = [
+        'STATIC_IDENTITY',
+        'STATIC_INTENT',
+        'STATIC_WORKFLOW',
+        'STATIC_CODING_PROTOCOL',
+        'STATIC_PROJECT_POLICY',
+        'STATIC_PROJECT_INSTRUCTIONS',
+        '## Response language',
+      ];
+      expectInOrder(durableSurface, staticMarkers);
+
+      const freshDynamicMarkers = [
+        'DYNAMIC_RECOVERY',
+        'DYNAMIC_PROJECT_MEMORY',
+        'DYNAMIC_PROJECT_STATUS',
+        'DYNAMIC_RUNTIME_PROTOCOL',
+        'DYNAMIC_ATTACHMENT',
+        'CURRENT_TASK_LAST',
+      ];
+      expectInOrder(fresh.prompt, freshDynamicMarkers);
+      expectInOrder(resumed.prompt, [
+        cli === 'hermes' ? 'DYNAMIC_RECOVERY' : 'DYNAMIC_INCREMENTAL',
+        'DYNAMIC_PROJECT_MEMORY',
+        'DYNAMIC_PROJECT_STATUS',
+        'DYNAMIC_RUNTIME_PROTOCOL',
+        'DYNAMIC_ATTACHMENT',
+        'CURRENT_TASK_LAST',
+      ]);
+      if (cli === 'opencode' || cli === 'openclaw') {
+        expect(resumed.prompt).not.toContain('STATIC_PROJECT_POLICY');
+      }
+      expect(contextPlan.durableInstructions).not.toContain('DYNAMIC_PROJECT_MEMORY');
+      expect(contextPlan.durableInstructions).not.toContain('DYNAMIC_PROJECT_STATUS');
+    },
+  );
+
+  it('keeps a recovery payload ready if a resumed user-message session is rejected', () => {
+    const contextPlan = plan();
+    const resumed = materializeCliContext(contextPlan, { cli: 'opencode', resumed: true });
+
+    expect(resumed.prompt).toBe('修复登录失败');
+    expect(resumed.resumeFallbackPrompt).toContain(XML_PROTOCOL);
+    expect(resumed.resumeFallbackPrompt).toContain('Conversation context recovered');
+  });
+
+  it('adds only the canonical delta before the current task on a resume', () => {
+    const contextPlan = createCliContextPlan({
+      durableInstructions: 'durable',
+      recoveryContext: 'FULL_HISTORY_MUST_ONLY_BE_FALLBACK',
+      incrementalContext: buildCliConversationContext({
+        mode: 'incremental',
+        turns: [{ id: '8', messages: ['NEW_CANONICAL_MESSAGE'] }],
+      }),
+      turnPrompt: 'CURRENT_TASK',
+    });
+    const resumed = materializeCliContext(contextPlan, { cli: 'codex', resumed: true });
+
+    expect(resumed.prompt).toContain('Conversation updates since the previous CLI turn');
+    expect(resumed.prompt).toContain('NEW_CANONICAL_MESSAGE');
+    expect(resumed.prompt).toContain('CURRENT_TASK');
+    expect(resumed.prompt).not.toContain('FULL_HISTORY_MUST_ONLY_BE_FALLBACK');
+    expect(resumed.resumeFallbackPrompt).toContain('FULL_HISTORY_MUST_ONLY_BE_FALLBACK');
+  });
+
+  it.each(['recovery', 'incremental'] as const)('keeps five complete turns in %s without cutting long messages', (mode) => {
+    const turns = Array.from({ length: 7 }, (_, i) => ({ id: String(i),
+      messages: [`INPUT_${i} ${'x'.repeat(9000)} MIDDLE_${i} ${'x'.repeat(9000)} END_${i}`] }));
+    const original = JSON.stringify(turns);
+    const context = buildCliConversationContext({ mode, turns });
+    expect(context).not.toContain('INPUT_1');
+    expect(context.match(/^### Turn /gm)).toHaveLength(5);
+    for (let i = 2; i < 7; i++) expect(context).toContain(turns[i].messages[0]);
+    expect(estimateBudgetTokens(context)).toBeLessThanOrEqual(30_000);
+    expect(JSON.stringify(turns)).toBe(original);
+  });
+
+  it('clips the oldest text under the token cap including Chinese text and framing', () => {
+    const context = buildCliConversationContext({ mode: 'recovery',
+      turns: Array.from({ length: 7 }, (_, i) => ({ id: String(i), messages: [`INPUT_${i} ${'界'.repeat(6000)} END_${i}`] })),
+    });
+    expect(estimateBudgetTokens(context)).toBeLessThanOrEqual(30_000);
+    expect(context.match(/^### Turn /gm)).toHaveLength(4);
+    expect(context).not.toContain('INPUT_3');
+    for (let i = 3; i < 7; i++) expect(context).toContain(`END_${i}`);
+    expect(context).toContain('3 older turns omitted');
+    expect(context).toContain('[Earlier history text omitted]');
+  });
+
+  it('clips an oversized newest turn without backfilling old dialogue or cutting current input', () => {
+    const recoveryContext = buildCliConversationContext({ mode: 'recovery', turns: [
+      { id: 'old', messages: ['OLD_SMALL'] }, { id: 'new', messages: ['NEW_BIG ' + '界'.repeat(30_000) + ' NEW_TAIL', 'LATEST_REPLY'] },
+    ] });
+    expect(recoveryContext).not.toMatch(/OLD_SMALL|NEW_BIG/);
+    expect(recoveryContext).toContain('1 older turn omitted');
+    expect(recoveryContext).toContain('NEW_TAIL');
+    expect(recoveryContext).toContain('LATEST_REPLY');
+    expect(estimateBudgetTokens(recoveryContext)).toBeLessThanOrEqual(30_000);
+    const current = 'CURRENT ' + '界'.repeat(35_000);
+    expect(materializeCliContext(createCliContextPlan({ durableInstructions: '', turnPrompt: current, recoveryContext }),
+      { cli: 'codex', resumed: false }).prompt).toContain(current);
+  });
+
+  it('keeps host and core fixed ceilings in agreement', async () => {
+    const { RECENT_HISTORY_MAX_TURNS, RECENT_HISTORY_MAX_TOKENS } = await import('../../../../src/core-agent/src/agent/session');
+    expect(CLI_HISTORY_MAX_TURNS).toBe(5);
+    expect(CLI_HISTORY_MAX_TOKENS).toBe(30_000);
+    expect(CLI_HISTORY_MAX_TURNS).toBe(RECENT_HISTORY_MAX_TURNS);
+    expect(CLI_HISTORY_MAX_TOKENS).toBe(RECENT_HISTORY_MAX_TOKENS);
+  });
+
+  it('keeps a plain turn byte-small when no dynamic protocol or attachment exists', () => {
+    expect(buildCliTurnPrompt({ task: '继续' })).toBe('继续');
+    expect(buildCliTurnPrompt({
+      task: '检查附件',
+      attachmentPaths: ['/tmp/a.txt', '/tmp/a.txt'],
+    })).toBe('## Attachments\n- /tmp/a.txt\n\n## Your task\n\n检查附件');
+  });
+
+  it('carries an Agent-memory compatibility hash without changing prompt materialization', () => {
+    const contextPlan = createCliContextPlan({
+      durableInstructions: 'durable',
+      agentMemoryHash: 'memory-state-hash',
+      turnPrompt: 'CURRENT_TASK',
+    });
+
+    expect(contextPlan.agentMemoryHash).toBe('memory-state-hash');
+    expect(materializeCliContext(contextPlan, { cli: 'codex', resumed: false }).prompt)
+      .toBe('CURRENT_TASK');
+  });
+
+  it('does not add a wrapper around native slash commands', () => {
+    const contextPlan = createCliContextPlan({
+      durableInstructions: 'durable',
+      turnPrompt: '/compact',
+      recoveryContext: 'old context',
+      passthrough: true,
+    });
+    const materialized = materializeCliContext(contextPlan, { cli: 'claude', resumed: true });
+
+    expect(materialized.prompt).toBe('/compact');
+    expect(materialized.systemPrompt).toBe('durable');
+    expect(materialized.resumeFallbackPrompt).toBe('/compact');
+  });
+
+  it('recognizes stale-session failures without matching ordinary task errors', () => {
+    expect(isCliResumeRejectedMessage('No conversation found with session ID abc')).toBe(true);
+    expect(isCliResumeRejectedMessage('session does not exist')).toBe(true);
+    expect(isCliResumeRejectedMessage('unknown session abc')).toBe(true);
+    expect(isCliResumeRejectedMessage('Error: session abc123 not found')).toBe(true);
+    expect(isCliResumeRejectedMessage('session id 0f3a is invalid')).toBe(true);
+    expect(isCliResumeRejectedMessage('resume failed: no such session')).toBe(true);
+    expect(isCliResumeRejectedMessage('tests failed in session-manager.ts')).toBe(false);
+    // Ordinary stderr from a healthy resumed session must not drop its binding:
+    // a compiler, linter, or the task's own output routinely pairs "session"
+    // with "unknown"/"invalid"/"not found" somewhere on the same line.
+    expect(isCliResumeRejectedMessage('src/session-manager.ts(12,3): error TS2339: unknown property')).toBe(false);
+    expect(isCliResumeRejectedMessage('invalid JSON in ~/.config/app/session.json')).toBe(false);
+    expect(isCliResumeRejectedMessage('Unknown flag --session-timeout')).toBe(false);
+    expect(isCliResumeRejectedMessage('404 not found: /api/sessions/list while session was active')).toBe(false);
+    expect(isCliResumeRejectedMessage('expired token; refreshing before the next session call')).toBe(false);
+  });
+});

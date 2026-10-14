@@ -1,0 +1,4280 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const SHELL_SUCCESS_TIMEOUT_MS = process.platform === 'win32' ? 15_000 : 5_000;
+
+// Each spelling runs through the platform-independent gate and real Windows
+// execution. Native filesystem bytes, preserved inputs, and process exit status
+// are independent oracles for quoting, path resolution, and shell compatibility.
+const POWERSHELL_PATH_ASSIGNMENTS = [
+  { label: 'compact double-quoted absolute path', spacing: '=', separator: '; ', quote: '"', relative: false, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'spaced single-quoted absolute path', spacing: ' = ', separator: '\r\n', quote: "'", relative: false, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'right-spaced single-quoted relative path', spacing: '= ', separator: '\n', quote: "'", relative: true, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'left-spaced double-quoted relative path', spacing: ' =', separator: '; ', quote: '"', relative: true, variable: '$script', reference: '$SCRIPT', tool: 'bash' },
+  { label: 'tabbed environment path', spacing: '\t=\t', separator: '\r\n', quote: '"', relative: false, variable: '$ENV:ORKAS_TEST_PATH_TARGET', reference: '$env:orkas_test_path_target', tool: 'bash' },
+  { label: 'compact environment path in a persistent process', spacing: '=', separator: '\n', quote: "'", relative: true, variable: '$env:ORKAS_TEST_PATH_TARGET', reference: '$ENV:orkas_test_path_target', tool: 'process_session' },
+] as const;
+
+function powershellPathLiteral(value: string, quote: string): string {
+  return quote + (quote === "'" ? value.replace(/'/g, "''") : value) + quote;
+}
+
+function testNodeCommand(script: string): string {
+  if (process.platform === 'win32') {
+    const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+    return `& ${quote(TEST_NODE)} -e ${quote(script)}`;
+  }
+  return `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+}
+
+// ── Electron mock (for create_pdf paths) ────────────────────────────────
+
+const printToPDF = vi.fn(async () => Buffer.from('%PDF-1.4 test', 'utf8'));
+const insertCSS = vi.fn(async () => 'pdf-color-css');
+const loadURL = vi.fn(async () => {});
+const once = vi.fn((evt: string, cb: (...args: any[]) => void) => {
+  if (evt === 'did-finish-load') setImmediate(cb);
+});
+const destroy = vi.fn();
+
+class FakeBrowserWindow {
+  webContents = { once, printToPDF, insertCSS, loadURL };
+  constructor(public opts: any) {}
+  async loadURL(url: string) { return loadURL(url); }
+  destroy() { destroy(); }
+}
+
+vi.mock('electron', () => ({
+  BrowserWindow: FakeBrowserWindow,
+}));
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
+let tmpDir: string;
+let prevWs: string | undefined;
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-localtools-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  printToPDF.mockClear();
+  insertCSS.mockClear();
+  loadURL.mockClear();
+  destroy.mockClear();
+  vi.resetModules();
+  // local-tools go through features/permissions which now routes via the
+  // active user's <uid>/local/config/. Activate a deterministic test uid.
+  const users = await import('../../../src/main/features/users');
+  users.activateUser('u1');
+});
+
+afterEach(async () => {
+  try {
+    const sessions = await import('../../../src/main/model/core-agent/interactive-cli-sessions');
+    sessions._resetInteractiveCliSessionsForTest();
+    // Windows taskkill is asynchronous; let the shell/tree release its cwd
+    // before removing the case workspace.
+    if (process.platform === 'win32') await new Promise(resolve => setTimeout(resolve, 150));
+  } catch { /* no interactive module in this case */ }
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch (err) {
+    // Electron's Windows worker can retain the root-directory handle after a
+    // shell-backed interactive child exits. Accept only an otherwise empty
+    // tree; files, databases, or process artifacts must still fail cleanup.
+    if (process.platform !== 'win32' || !fs.existsSync(tmpDir) || fs.readdirSync(tmpDir).length > 0) throw err;
+  }
+});
+
+async function loadModules() {
+  const lt = await import('../../../src/main/model/core-agent/local-tools');
+  const perm = await import('../../../src/main/features/permissions');
+  return { lt, perm };
+}
+
+async function setTmpWorkspace() {
+  const ws = await import('../../../src/main/features/user_workspace');
+  const res = ws.setWorkspacePath('u1', tmpDir);
+  if (!res.ok) throw new Error(`setWorkspacePath failed: ${res.error}`);
+}
+
+function makeCtx(sandboxEnv: Record<string, string> = {}): any {
+  // Production turns always receive buildSkillSandboxEnv(), whose bundled
+  // runtime directory makes bare `node` commands resolvable. The native-host
+  // test runner itself is launched by absolute path, so mirror that contract
+  // explicitly instead of depending on the developer's Windows PATH.
+  return {
+    workingDir: tmpDir,
+    state: {
+      sandboxEnv: {
+        ORKAS_NODE: TEST_NODE,
+        ORKAS_PATH_PREPEND: path.dirname(TEST_NODE),
+        ...sandboxEnv,
+      },
+    },
+  };
+}
+
+function writeFakeCommand(dir: string, name: string, source: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const scriptName = `${name}.js`;
+  fs.writeFileSync(path.join(dir, scriptName), source);
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(dir, `${name}.cmd`), `@echo off\r\n"${TEST_NODE}" "%~dp0${scriptName}" %*\r\n`);
+    return;
+  }
+  const safeNode = TEST_NODE.replace(/'/g, `'\\''`);
+  const launcher = path.join(dir, name);
+  fs.writeFileSync(launcher, `#!/bin/sh\nexec '${safeNode}' "$(dirname "$0")/${scriptName}" "$@"\n`);
+  fs.chmodSync(launcher, 0o755);
+}
+
+// ── Tool identity ─────────────────────────────────────────────────────────
+
+describe('local-tools › identity', () => {
+  it('exposes local shell/file/pdf tools plus persistent and interactive session tools', async () => {
+    const { lt } = await loadModules();
+    const tools = lt.createLocalTools({});
+    expect(tools.map((t) => t.name).sort()).toEqual(
+      [
+        'append_file',
+        'apply_patch',
+        'bash',
+        'create_pdf',
+        'delete_file',
+        'edit_file',
+        'html_preview',
+        'interactive_cli',
+        'process_session',
+        'write_file',
+      ],
+    );
+  });
+
+  it('bash tool description drops the "sandbox" wording', async () => {
+    const { lt } = await loadModules();
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    expect(bash.description.toLowerCase()).not.toContain('sandbox');
+    expect(bash.description).toMatch(/local machine|host/i);
+    expect(bash.description).toMatch(/Built-in Python and Node\.js.*`python` and `node`/i);
+    expect(bash.description).toMatch(/deterministic transformations over many local files or records/i);
+    expect(bash.description).toMatch(/dedicated tool for a targeted operation/i);
+  });
+
+  it('resolves documented POSIX, PowerShell, and cmd environment path forms', async () => {
+    const { lt } = await loadModules();
+    const env = { ORKAS_OUTPUT_DIR: path.join(tmpDir, 'outputs') };
+    const expected = path.join(tmpDir, 'outputs', 'report.json');
+
+    expect(lt.expandKnownShellPathVars('$ORKAS_OUTPUT_DIR/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('$env:orkas_output_dir/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('${env:ORKAS_OUTPUT_DIR}/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('%ORKAS_OUTPUT_DIR%/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('$env:UNKNOWN/report.json', env).dynamic).toBe(true);
+    expect(lt.expandKnownShellPathVars('%UNKNOWN%/report.json', env).dynamic).toBe(true);
+  });
+
+  it('write_file tool description mentions the workspace directory', async () => {
+    const { lt } = await loadModules();
+    const wf = lt.createLocalTools({}).find((t) => t.name === 'write_file')!;
+    expect(wf.description.toLowerCase()).toContain('workspace');
+  });
+
+  it('blocks unmanaged QA runtimes for the built-in studio agents only', async () => {
+    const { lt } = await loadModules();
+    const videoBash = lt.createLocalTools({ agentId: '79df9cc89f5f' }).find((t) => t.name === 'bash')!;
+    const imageBash = lt.createLocalTools({ agentId: '814b61b027f0' }).find((t) => t.name === 'bash')!;
+    const otherBash = lt.createLocalTools({ agentId: 'another-agent' }).find((t) => t.name === 'bash')!;
+
+    const blocked = await videoBash.execute({
+      command: 'python3 -m http.server 8765',
+      timeoutMs: 5000,
+    }, makeCtx());
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
+
+    const imageBlocked = await imageBash.execute({
+      command: 'npx playwright test',
+      timeoutMs: 5000,
+    }, makeCtx());
+    expect(imageBlocked.isError).toBe(true);
+    expect(imageBlocked.content).toContain('E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
+
+    const allowed = await otherBash.execute({
+      command: 'echo safe',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(allowed.isError).toBeFalsy();
+  });
+
+  it('exposes publish_outputs only when the conversation supplies a validator', async () => {
+    const { lt } = await loadModules();
+    expect(lt.createLocalTools({}).some((t) => t.name === 'publish_outputs')).toBe(false);
+    expect(lt.createLocalTools({ onOutputsPublished: (paths) => paths })
+      .some((t) => t.name === 'publish_outputs')).toBe(true);
+  });
+});
+
+describe('local-tools › publish_outputs', () => {
+  it('accepts an explicit empty final-deliverable list', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: [] }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(onOutputsPublished).toHaveBeenCalledWith([]);
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 0 });
+  });
+
+  it('does not treat a malformed non-empty list as an empty declaration', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: ['  ', null] }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BAD_INPUT');
+    expect(onOutputsPublished).not.toHaveBeenCalled();
+  });
+
+  it('normalizes and deduplicates paths before publishing', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({
+      paths: ['out/report.pdf', 'out/report.pdf', path.join(tmpDir, 'deck.pptx')],
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(onOutputsPublished).toHaveBeenCalledWith([
+      path.join(tmpDir, 'out', 'report.pdf'),
+      path.join(tmpDir, 'deck.pptx'),
+    ]);
+    expect(JSON.parse(res.content)).toEqual({ published: 2, requested: 2 });
+  });
+
+  it('reports the filtered selection without turning a zero match into a task error', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(() => []);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: ['not-eligible.xlsx'] }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 1 });
+    expect(onOutputsPublished).toHaveBeenCalledTimes(1);
+    expect(onOutputsPublished).toHaveBeenCalledWith([path.join(tmpDir, 'not-eligible.xlsx')]);
+  });
+});
+
+// ── Local access modes: bash ────────────────────────────────────────────
+
+describe('local-tools › bash access modes', () => {
+  it.each([0, 7])('preserves browser-related output and repeat execution with exit code %s', async (exitCode) => {
+    const { lt, perm } = await loadModules();
+    await setTmpWorkspace();
+    perm.setLocalExecMode('all_files_auto');
+    const script = path.join(tmpDir, 'playwright-report.cjs');
+    const marker = path.join(tmpDir, 'runs.txt');
+    const output = 'Documentation: Cloudflare Ray ID identifies a request. Just a moment... is an example title.';
+    fs.writeFileSync(script, `const fs = require('node:fs'); fs.appendFileSync(${JSON.stringify(marker)}, 'run\\n'); process.stdout.write(${JSON.stringify(output)}); process.exitCode = ${exitCode};`);
+    const command = process.platform === 'win32'
+      ? `& ${powershellPathLiteral(TEST_NODE, "'")} ${powershellPathLiteral(script, "'")}`
+      : `${JSON.stringify(TEST_NODE)} ${JSON.stringify(script)}`;
+    const bash = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === 'bash')!;
+    for (let count = 1; count <= 2; count++) {
+      const result = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(!!result.isError).toBe(exitCode !== 0);
+      expect(result.content).toContain(output);
+      expect(result.content).not.toContain('E_BROWSER_WAF_USER_ACTION_REQUIRED');
+      expect(fs.readFileSync(marker, 'utf8')).toBe('run\n'.repeat(count));
+    }
+  });
+
+  it('blocks an actual disabled Skill script and permits it after explicit re-enablement', async () => {
+    const { lt, perm } = await loadModules();
+    await setTmpWorkspace();
+    perm.setLocalExecMode('all_files_auto');
+    const paths = await import('../../../src/main/paths');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    const root = path.join(paths.userSkillsDir('u1'), 'stateful-skill');
+    const script = path.join(root, 'scripts', 'write-marker.mjs');
+    const marker = path.join(tmpDir, 'skill-executed.txt');
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(script, `import fs from 'node:fs'; export default async function () { fs.writeFileSync(${JSON.stringify(marker)}, 'executed once'); return { ok: true }; }`);
+    const bash = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === 'bash')!;
+    const command = '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stateful-skill write-marker';
+    const ctx = makeCtx({
+      ORKAS_PC_DIR: process.cwd(), ORKAS_UID: 'u1',
+      ORKAS_WORKSPACE_ROOT: tmpDir, ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '0',
+    });
+
+    enabled.setSkillEnabled('u1', 'stateful-skill', false);
+    const blocked = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, ctx);
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_SKILL_DISABLED');
+    expect(fs.existsSync(marker)).toBe(false);
+
+    enabled.setSkillEnabled('u1', 'stateful-skill', true);
+    const restored = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, ctx);
+    expect(restored.isError, restored.content).toBeFalsy();
+    expect(fs.readFileSync(marker, 'utf8')).toBe('executed once');
+  });
+
+  it('delegates to core-agent bash in workspace_approval mode (real shell runs)', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const res = await bash.execute(
+      { command: 'echo orkas-test-sentinel-42', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+      makeCtx(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(res.content).toContain('orkas-test-sentinel-42');
+  });
+
+  it('localizes fixed bash errors with the current UI language', async () => {
+    const { lt, perm } = await loadModules();
+    const i18n = await import('../../../src/main/i18n');
+    perm.setLocalExecMode('all_files_auto');
+    i18n.setCurrentLang('zh');
+    try {
+      const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: 'exit 7', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toBe('退出码：7');
+    } finally {
+      i18n.setCurrentLang('en');
+    }
+  });
+
+  it('blocks auth login flows that require pasting verification codes into chat', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'gcloud auth login --no-launch-browser',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_INTERACTIVE_AUTH_CODE_UNSUPPORTED');
+    expect(res.content).toContain('Do not ask the user to paste verification codes');
+  });
+
+  // all_files_auto exists so routine work stops asking. It cannot also waive
+  // the operations the user has no way to review afterwards — the reported
+  // case was an agent deleting a two-day-old browser profile and force-killing
+  // every Chrome process while this mode was on.
+  it('still asks before an irreversible command in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const asked: any[] = [];
+    bp._setBroadcastForTest((channel: string, payload: any) => {
+      if (channel === 'bash:permission') asked.push(payload);
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'bash')!;
+      const victim = path.join(tmpDir, 'warmed-profile');
+      fs.mkdirSync(victim, { recursive: true });
+      fs.writeFileSync(path.join(victim, 'fingerprint'), 'two days of warmup');
+      const run = bash.execute(
+        { command: `rm -rf ${victim}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+        makeCtx(),
+      );
+      for (let i = 0; i < 200 && !asked.length; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(asked).toHaveLength(1);
+      expect(asked[0].reasons).toContain('destructive');
+      // The dialog needs this to explain why a non-prompting mode is asking.
+      expect(asked[0].irreversible).toEqual(['recursive_delete']);
+
+      expect(bp.respond(asked[0].request_id, 'deny')).toBe(true);
+      const res = await run;
+      expect(res.isError).toBe(true);
+      // Denying has to actually stop it, not just annotate the transcript.
+      expect(fs.existsSync(path.join(victim, 'fingerprint'))).toBe(true);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
+  it('does not ask before a reviewable delete in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const asked: any[] = [];
+    bp._setBroadcastForTest((channel: string, payload: any) => {
+      if (channel === 'bash:permission') asked.push(payload);
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'bash')!;
+      const scratch = path.join(tmpDir, 'scratch.log');
+      fs.writeFileSync(scratch, 'noise');
+      const res = await bash.execute(
+        { command: process.platform === 'win32'
+          ? `Remove-Item -Force -LiteralPath '${scratch.replaceAll("'", "''")}'`
+          : `rm -f '${scratch.replaceAll("'", "'\\''")}'`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
+        makeCtx(),
+      );
+      expect(res.isError).toBeFalsy();
+      // The mode still means what it says for everything else.
+      expect(asked).toEqual([]);
+      expect(fs.existsSync(scratch)).toBe(false);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
+  it('blocks synthesized Google OAuth URLs that reuse the Cloud SDK client for Workspace scopes', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'open "https://accounts.google.com/o/oauth2/auth?client_id=32555940559.apps.googleusercontent.com&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly"',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
+    expect(res.content).toContain('Do not synthesize Google OAuth URLs');
+  });
+
+  it('blocks running scripts that reuse the Cloud SDK client for Workspace scopes', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const scriptPath = path.join(tmpDir, 'bad-oauth.py');
+    fs.writeFileSync(
+      scriptPath,
+      'CLIENT_ID = "32555940559.apps.googleusercontent.com"\nSCOPES = "https://www.googleapis.com/auth/gmail.readonly"\n',
+    );
+    const res = await bash.execute({
+      command: `python3 ${JSON.stringify(scriptPath)}`,
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
+  });
+
+  it('re-checks the local access mode on each call', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const ok = await bash.execute({
+      command: 'echo first',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(ok.isError).toBeFalsy();
+    perm.setLocalExecMode('workspace_approval');
+    const stillAllowed = await bash.execute({
+      command: 'echo second',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(stillAllowed.isError).toBeFalsy();
+    expect(stillAllowed.content).toContain('second');
+  });
+});
+
+describe('local-tools › bash filesystem mutation scope', () => {
+
+  it.each([
+    ["printf '%s\\n' 'use sudo apt install'", 'darwin'],
+    ['rsync -a src/ dst/', 'darwin'],
+    ['cp /etc/hosts ./hosts-copy', 'darwin'],
+    ['git log --grep push', 'darwin'],
+    ['git push --help', 'darwin'],
+    ['chmod u+w notes.txt', 'darwin'],
+    ['Start-Process -FilePath calc.exe -WhatIf', 'win32'],
+  ] as const)('admits an ordinary operation through the full host risk gate: %s', async (command, hostPlatform) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval'); await setTmpWorkspace();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'executed once' });
+    const requests: any[] = [];
+    bp._setBroadcastForTest((channel, info: any) => {
+      if (channel === 'bash:permission') { requests.push(info); bp.respond(info.request_id, 'deny'); }
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform }).find(t => t.name === 'bash')!;
+      const result = await bash.execute({ command }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(requests).toEqual([]); expect(execute).toHaveBeenCalledOnce();
+    } finally { execute.mockRestore(); bp._resetForTest(); bp._setBroadcastForTest(null); }
+  });
+
+  it.each(['-t ', '-t', '--target-directory='])('checks a POSIX copy destination selected by %s', async flag => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval'); await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'accepted' });
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'darwin' }).find(t => t.name === 'bash')!;
+    try {
+      const result = await bash.execute({ command: `cp ${flag}'${path.dirname(tmpDir)}' source.txt` }, makeCtx());
+      expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(execute).not.toHaveBeenCalled();
+    } finally { execute.mockRestore(); }
+  });
+
+  it.each(['bash', 'process_session'] as const)('checks New-Item targets and resolves pure Join-Path before %s execution', async toolName => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval'); await setTmpWorkspace();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const execute = vi.spyOn(toolName === 'bash' ? bashTool : processSessionTool, 'execute').mockResolvedValue({ content: 'accepted' });
+    const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find(t => t.name === toolName)!;
+    const outside = path.join(path.dirname(tmpDir), 'orkas-outside-target.txt');
+    const asks: any[] = [];
+    bp._setBroadcastForTest((channel, info: any) => {
+      if (channel === 'bash:permission') { asks.push(info); bp.respond(info.request_id, 'deny'); }
+    });
+    try {
+      for (const command of [
+        "$base='project'; $out=Join-Path $base 'build'; New-Item -ItemType Directory -Force -Path $out",
+        "$base='project'; $out=Join-Path -ChildPath 'result.txt' -Path $BASE; Set-Content -LiteralPath $out -Value ok",
+        "$out=Join-Path 'root' 'computed.txt'; New-Item -Path $out -ItemType File",
+        "New-Item -Path '.' -Name 'note.txt' -ItemType File -Value ok",
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.isError, result.content).toBeFalsy(); expect(execute).toHaveBeenCalledOnce();
+      }
+      expect(asks).toEqual([]);
+      for (const command of [
+        `New-Item -ItemType File -Path '${outside}' -Value ok`,
+        `$base='${path.dirname(tmpDir)}'; $out=Join-Path $base 'orkas-outside-target.txt'; New-Item -Path $out -ItemType File`,
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE'); expect(execute).not.toHaveBeenCalled();
+      }
+      for (const command of [
+        "$out=Join-Path (Get-Location) 'result.txt'; New-Item -Path $out -ItemType File",
+        "$out=Join-Path $unknown 'result.txt'; Set-Content -LiteralPath $out -Value ok",
+        "$out=Join-Path 'root' 'result.txt' -Resolve; New-Item -Path $out -ItemType File",
+        "$out=Join-Path 'C:' 'result.txt'; New-Item -Path $out -ItemType File",
+        "$out=Join-Path 'C:folder' 'result.txt'; New-Item -Path $out -ItemType File",
+        "New-Item -Path 'HKCU:\\Software\\ReviewFixture'",
+      ]) {
+        execute.mockClear();
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_RISK_DENIED'); expect(execute).not.toHaveBeenCalled();
+        expect(asks.at(-1)).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+        expect(asks.at(-1).key_facts).toContainEqual(expect.objectContaining({ kind: 'write', unresolved: true }));
+      }
+      expect(asks[0].key_facts[0].detail).toContain('Get-Location');
+    } finally { execute.mockRestore(); bp._resetForTest(); bp._setBroadcastForTest(null); }
+  });
+
+  it('allows explicit write targets inside the workspace', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const target = path.join(tmpDir, 'bash-ok.txt');
+    const res = await bash.execute({
+      command: `node -e "require('fs').writeFileSync(process.argv[1], 'ok')" ${JSON.stringify(target)}`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(fs.readFileSync(target, 'utf8')).toBe('ok');
+  });
+
+  it('blocks explicit write targets outside the writable scope in workspace_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `printf nope > ${JSON.stringify(outside)}`,
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows explicit write targets outside the workspace in all_files_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-allow-'));
+    const outside = path.join(outsideDir, 'allowed.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `node -e "require('fs').writeFileSync(process.argv[1], 'ok')" ${JSON.stringify(outside)}`,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(fs.readFileSync(outside, 'utf8')).toBe('ok');
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks explicit read targets outside the readable scope in workspace_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-read-outside-'));
+    const outside = path.join(outsideDir, 'secret.txt');
+    fs.writeFileSync(outside, 'OUTSIDE-SECRET');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `cat ${JSON.stringify(outside)}`,
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(res.content).not.toContain('OUTSIDE-SECRET');
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('admits only the configured session analysis root outside the workspace', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const analysisDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-analysis-input-'));
+    const siblingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-analysis-sibling-'));
+    const analysisFile = path.join(analysisDir, 'result.txt');
+    const siblingFile = path.join(siblingDir, 'secret.txt');
+    fs.writeFileSync(analysisFile, 'ANALYSIS-INPUT');
+    fs.writeFileSync(siblingFile, 'OUTSIDE-SIBLING');
+    try {
+      const bash = lt.createLocalTools({
+        userId: 'u1',
+        cid: 'c1',
+        agentId: 'a1',
+        analysisInputRoots: [analysisDir],
+      }).find((t) => t.name === 'bash')!;
+      const readCommand = process.platform === 'win32'
+        ? `Get-Content -LiteralPath ${JSON.stringify(analysisFile)}`
+        : `cat ${JSON.stringify(analysisFile)}`;
+      const allowed = await bash.execute({
+        command: readCommand,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(allowed.isError, `content=${allowed.content}`).toBeFalsy();
+      expect(allowed.content).toContain('ANALYSIS-INPUT');
+
+      const writeCommand = process.platform === 'win32'
+        ? `Set-Content -LiteralPath ${JSON.stringify(analysisFile)} -Value changed`
+        : `printf changed > ${JSON.stringify(analysisFile)}`;
+      const writeBlocked = await bash.execute({
+        command: writeCommand,
+        timeoutMs: 5_000,
+      }, makeCtx());
+      expect(writeBlocked.isError).toBe(true);
+      expect(writeBlocked.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.readFileSync(analysisFile, 'utf8')).toBe('ANALYSIS-INPUT');
+
+      const siblingCommand = process.platform === 'win32'
+        ? `Get-Content -LiteralPath ${JSON.stringify(siblingFile)}`
+        : `cat ${JSON.stringify(siblingFile)}`;
+      const blocked = await bash.execute({
+        command: siblingCommand,
+        timeoutMs: 5_000,
+      }, makeCtx());
+      expect(blocked.isError).toBe(true);
+      expect(blocked.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(blocked.content).not.toContain('OUTSIDE-SIBLING');
+    } finally {
+      fs.rmSync(analysisDir, { recursive: true, force: true });
+      fs.rmSync(siblingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows explicit read targets outside the workspace in all_files_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-read-allow-'));
+    const outside = path.join(outsideDir, 'note.txt');
+    fs.writeFileSync(outside, 'outside read ok');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `cat ${JSON.stringify(outside)}`,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('outside read ok');
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prompts before reading a sensitive path in all_files_approval mode and blocks on deny', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-read-sensitive-'));
+    const outside = path.join(outsideDir, 'id_rsa');
+    fs.writeFileSync(outside, 'SENSITIVE-BASH-READ');
+    let payload: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      payload = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `cat ${JSON.stringify(outside)}`,
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(res.content).not.toContain('SENSITIVE-BASH-READ');
+      expect(payload.operation).toBe('bash');
+      expect(payload.subject).toBe(outside);
+      expect(payload.reasons).toEqual(['sensitive_path']);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not prompt twice for an allowed sensitive bash path', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-read-sensitive-ok-'));
+    const outside = path.join(outsideDir, 'id_rsa');
+    fs.writeFileSync(outside, 'SENSITIVE-BASH-ALLOW');
+    let prompts = 0;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompts += 1;
+      bashPerms.respond(info.request_id, 'allow_once');
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `cat ${JSON.stringify(outside)}`,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('SENSITIVE-BASH-ALLOW');
+      expect(prompts).toBe(1);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prompts before mutating a sensitive path in all_files_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const readOnlyDir = fs.mkdtempSync(path.join(os.homedir(), '.ssh-test-'));
+    const target = path.join(readOnlyDir, 'id_rsa');
+    fs.writeFileSync(target, 'keep');
+    let prompted = false;
+    bashPerms._setBroadcastForTest((_ch: string, payload: any) => {
+      prompted = true;
+      bashPerms.respond(payload.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: `printf changed > ${JSON.stringify(target)}`,
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(prompted).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe('keep');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+      fs.rmSync(readOnlyDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not execute unresolved writes without an approval in workspace-only mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'printf no > "$UNKNOWN_BASH_TARGET"',
+      timeoutMs: 5000,
+    }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
+  });
+
+  it.each(['bash', 'process_session'])(
+    'rejects a known out-of-scope write mixed with an unresolved path before %s asks or executes',
+    async (toolName) => {
+      const { lt, perm } = await loadModules();
+      const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mixed-targets-'));
+      const outside = path.join(outsideDir, 'keep.txt');
+      fs.writeFileSync(outside, 'original');
+      const requests: unknown[] = [];
+      bp._setBroadcastForTest((_channel: string, info: any) => {
+        requests.push(info);
+        bp.respond(info.request_id, 'allow_once');
+      });
+      try {
+        const command = process.platform === 'win32'
+          ? `$target = Join-Path (Get-Location) "dynamic.txt"; Set-Content -LiteralPath "$target" -Value changed; Set-Content -LiteralPath ${powershellPathLiteral(outside, "'")} -Value changed`
+          : `target="$(pwd)/dynamic.txt"; printf changed > "$target"; printf changed > ${JSON.stringify(outside)}`;
+        const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find(t => t.name === toolName)!;
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+        expect(result.isError).toBe(true);
+        expect(requests).toEqual([]);
+        expect(fs.readFileSync(outside, 'utf8')).toBe('original');
+        expect(fs.existsSync(path.join(tmpDir, 'dynamic.txt'))).toBe(false);
+      } finally {
+        bp._resetForTest();
+        fs.rmSync(outsideDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('invalidates a prior literal when a later assignment becomes dynamic', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? `$TARGET = ${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; $TARGET = Join-Path $env:TEMP 'dynamic.txt'; Get-Content "$TARGET"`
+      : `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; TARGET="$UNKNOWN_BASH_TARGET"; cat "$TARGET"`;
+    const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
+
+    if (process.platform !== 'win32') {
+      const loopCommand = `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; for TARGET in "$UNKNOWN_BASH_TARGET"; do true; done && cat "$TARGET"`;
+      const loopRes = await bash.execute({ command: loopCommand, timeoutMs: 5000 }, makeCtx());
+      expect(loopRes.isError).toBe(true);
+      expect(loopRes.content).toContain('E_BASH_RISK_DENIED');
+    }
+  });
+
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'resolves sandbox-injected shell paths before execution in %s mode',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const report = path.join(tmpDir, 'injected-report.txt');
+      const output = path.join(tmpDir, 'injected-output.txt');
+      fs.writeFileSync(report, 'known environment path\n');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? 'Get-Content -LiteralPath "$env:REPORT_PATH"; Set-Content -LiteralPath "$env:REPORT_OUTPUT_PATH" -Value allowed'
+        : 'cat "$REPORT_PATH"; printf allowed > "$REPORT_OUTPUT_PATH"';
+
+      const res = await bash.execute({
+        command,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx({ REPORT_PATH: report, REPORT_OUTPUT_PATH: output }));
+
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('known environment path');
+      expect(fs.readFileSync(output, 'utf8').trim()).toBe('allowed');
+      expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    },
+  );
+
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'keeps a statically rooted shell glob verifiable in %s mode',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      fs.writeFileSync(path.join(tmpDir, 'glob-1.txt'), 'one\n');
+      fs.writeFileSync(path.join(tmpDir, 'glob-2.txt'), 'two\n');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? 'Get-Content -Path "glob-*.txt"'
+        : 'cat glob-*.txt';
+
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('one');
+      expect(res.content).toContain('two');
+      expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    },
+  );
+
+  it('preserves files when runtime-computed read, write, move, and removal commands are denied', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const readTarget = path.join(tmpDir, 'dynamic-read.txt');
+    const writeTarget = path.join(tmpDir, 'dynamic-write.txt');
+    const moveSource = path.join(tmpDir, 'dynamic-move-source.txt');
+    const moveTarget = path.join(tmpDir, 'dynamic-move-target.txt');
+    const removeTarget = path.join(tmpDir, 'dynamic-remove.txt');
+    fs.writeFileSync(readTarget, 'must not be read');
+    fs.writeFileSync(moveSource, 'must not move');
+    fs.writeFileSync(removeTarget, 'must not remove');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const commands = process.platform === 'win32'
+      ? [
+          '$target = Join-Path (Get-Location) "dynamic-read.txt"; Get-Content -LiteralPath "$target"',
+          '$target = Join-Path (Get-Location) "dynamic-write.txt"; Set-Content -LiteralPath "$target" -Value blocked',
+          '$target = Join-Path (Get-Location) "dynamic-move-target.txt"; Move-Item -LiteralPath "dynamic-move-source.txt" -Destination "$target"',
+          '$target = Join-Path (Get-Location) "dynamic-remove.txt"; Remove-Item -Force -LiteralPath "$target"',
+        ]
+      : [
+          'target="$(pwd)/dynamic-read.txt"; cat "$target"',
+          'target="$(pwd)/dynamic-write.txt"; printf blocked > "$target"',
+          'target="$(pwd)/dynamic-move-target.txt"; mv "dynamic-move-source.txt" "$target"',
+          'target="$(pwd)/dynamic-remove.txt"; rm -f "$target"',
+        ];
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      expect(info.unresolved_paths).toBe(true);
+      expect(info.can_allow_run).toBe(false);
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      for (const command of commands) {
+        const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+        expect(res.isError, `command=${command} content=${res.content}`).toBe(true);
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+      }
+      expect(fs.readFileSync(readTarget, 'utf8')).toBe('must not be read');
+      expect(fs.existsSync(writeTarget)).toBe(false);
+      expect(fs.readFileSync(moveSource, 'utf8')).toBe('must not move');
+      expect(fs.existsSync(moveTarget)).toBe(false);
+      expect(fs.readFileSync(removeTarget, 'utf8')).toBe('must not remove');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+    }
+  });
+
+  it.each(['workspace_approval', 'all_files_approval'] as const)(
+    'executes computed paths, multi-statement loops and pipelines once after approval in %s',
+    async (mode) => {
+      const { lt, perm } = await loadModules();
+      const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      fs.writeFileSync(path.join(tmpDir, 'input.txt'), 'input-bytes\n');
+      let request: any;
+      bp._setBroadcastForTest((_channel: string, info: any) => { request = info; });
+      const command = process.platform === 'win32'
+        ? '$target = $(Add-Content -LiteralPath "count.txt" -Value once; Join-Path (Get-Location) "result.txt"); foreach ($f in (Get-ChildItem -Name "input*.txt")) { Get-Content -LiteralPath "$f" | Out-String | Add-Content -LiteralPath "$target"; Add-Content -LiteralPath "$target" -Value done }'
+        : 'target="$(printf once >> count.txt; pwd)/result.txt"; for f in input*.txt; do cat "$f" | cat >> "$target"; printf done >> "$target"; done';
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find(t => t.name === 'bash')!;
+      try {
+        const execution = bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+        await vi.waitFor(() => expect(request?.unresolved_paths).toBe(true));
+        expect(request.can_allow_run).toBe(false);
+        // Preflight must not evaluate substitutions or partially run the script.
+        expect(fs.existsSync(path.join(tmpDir, 'count.txt'))).toBe(false);
+        expect(fs.existsSync(path.join(tmpDir, 'result.txt'))).toBe(false);
+        bp.respond(request.request_id, 'allow_once');
+        const result = await execution;
+        expect(result.isError, result.content).toBeFalsy();
+        expect(fs.readFileSync(path.join(tmpDir, 'count.txt'), 'utf8').trim()).toBe('once');
+        const output = fs.readFileSync(path.join(tmpDir, 'result.txt'), 'utf8');
+        expect(output).toContain('input-bytes');
+        expect(output).toContain('done');
+        expect(fs.readFileSync(path.join(tmpDir, 'input.txt'), 'utf8')).toBe('input-bytes\n');
+      } finally {
+        bp._resetForTest();
+      }
+    },
+  );
+
+  it('checks PowerShell transfer sources and destinations before starting shell sessions', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    fs.writeFileSync(path.join(tmpDir, 'source.txt'), 'keep source');
+    const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' });
+    const commands = [
+      'Move-Item -LiteralPath "$source" -Destination "target.txt"',
+      'Move-Item "source.txt" -Destination "$target"',
+      'Copy-Item -Destination "target.txt" -Path "$source"',
+      'Copy-Item "source.txt" "$target" -ErrorAction Stop',
+    ];
+    for (const name of ['bash', 'process_session']) {
+      const tool = tools.find((candidate) => candidate.name === name)!;
+      for (const command of commands) {
+        const result = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(result.isError, `${name}: ${command}`).toBe(true);
+        expect(result.content).toContain('E_BASH_RISK_DENIED');
+      }
+    }
+    const interactive = tools.find((tool) => tool.name === 'interactive_cli')!;
+    const result = await interactive.execute({ action: 'start', command: commands[0] }, makeCtx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(fs.readFileSync(path.join(tmpDir, 'source.txt'), 'utf8')).toBe('keep source');
+    expect(fs.existsSync(path.join(tmpDir, 'target.txt'))).toBe(false);
+  });
+
+  it.runIf(process.platform === 'win32').each([
+    ['Copy-Item -LiteralPath "source file.txt" -Destination "target file.txt" -ErrorAction Stop', true],
+    ['Copy-Item -Destination:"target file.txt" "source file.txt" -Force', true],
+    ['Move-Item -PATH "source file.txt" "target file.txt" -ERRORACTION Stop', false],
+    ['Move-Item "source file.txt" -Destination "target file.txt" -Force', false],
+  ] as const)('executes a literal PowerShell transfer without a removal prompt: %s', async (command, keepsSource) => {
+    const { lt, perm } = await loadModules();
+    const bp = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const asked: unknown[] = [];
+    bp._setBroadcastForTest((_channel: string, payload: any) => {
+      asked.push(payload);
+      bp.respond(payload.request_id, 'deny');
+    });
+    try {
+      const source = path.join(tmpDir, 'source file.txt');
+      fs.writeFileSync(source, 'transfer bytes');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(fs.readFileSync(path.join(tmpDir, 'target file.txt'), 'utf8')).toBe('transfer bytes');
+      expect(fs.existsSync(source)).toBe(keepsSource);
+      expect(asked).toEqual([]);
+    } finally {
+      bp._setBroadcastForTest(null);
+      bp._resetForTest();
+    }
+  });
+
+  it('allows runtime-computed shell paths in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    fs.writeFileSync(path.join(tmpDir, 'dynamic-1.txt'), 'one\n');
+    fs.writeFileSync(path.join(tmpDir, 'dynamic-2.txt'), 'two\n');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? '$files = Get-ChildItem -Name "dynamic-*.txt"; foreach ($f in $files) { Get-Content -LiteralPath "$f" }; $target = Join-Path (Get-Location) "dynamic-write.txt"; Set-Content -LiteralPath "$target" -Value allowed'
+      : 'for f in dynamic-*.txt; do cat "$f"; done; target="$(pwd)/dynamic-write.txt"; printf allowed > "$target"';
+
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('one');
+    expect(res.content).toContain('two');
+    expect(fs.readFileSync(path.join(tmpDir, 'dynamic-write.txt'), 'utf8').trim()).toBe('allowed');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('reads workspace files through a finite literal shell loop', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    for (const index of [1, 2, 3]) {
+      fs.writeFileSync(path.join(tmpDir, `perf_batch_B${index}.txt`), `batch-${index}\n`);
+    }
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? 'foreach ($i in 1..3) { Get-Content -LiteralPath "perf_batch_B$i.txt" }'
+      : 'for i in 1 2 3; do\n  cat "perf_batch_B$i.txt"\ndone';
+
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('batch-1');
+    expect(res.content).toContain('batch-2');
+    expect(res.content).toContain('batch-3');
+  });
+
+  it('resolves 256 literal loop values and requires approval beyond the analysis bound', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    for (let index = 1; index <= 256; index += 1) {
+      fs.writeFileSync(path.join(tmpDir, `bounded-${index}.txt`), `${index}\n`);
+    }
+    const posixValues = Array.from({ length: 256 }, (_, index) => String(index + 1)).join(' ');
+    const acceptedCommand = process.platform === 'win32'
+      ? 'foreach ($i in 1..256) { Get-Content -LiteralPath "bounded-$i.txt" }'
+      : `for i in ${posixValues}; do cat "bounded-$i.txt"; done`;
+
+    const accepted = await bash.execute({
+      command: acceptedCommand,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(accepted.isError, `content=${accepted.content}`).toBeFalsy();
+    expect(accepted.content).toMatch(/(?:^|\n)1\r?(?:\n|$)/);
+    expect(accepted.content).toMatch(/(?:^|\n)256\r?(?:\n|$)/);
+
+    const rejectedCommand = process.platform === 'win32'
+      ? 'foreach ($i in 1..257) { Get-Content -LiteralPath "bounded-$i.txt" }'
+      : `for i in ${posixValues} 257; do cat "bounded-$i.txt"; done`;
+    const rejected = await bash.execute({ command: rejectedCommand, timeoutMs: 5000 }, makeCtx());
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content).toContain('E_BASH_RISK_DENIED');
+  });
+
+  it('checks every finite loop expansion against the workspace boundary', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-loop-outside-'));
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? `foreach ($i in 1..2) { Get-Content -LiteralPath "${outsideDir.replace(/`/g, '``')}\\outside-$i.txt" }`
+        : `for i in 1 2; do cat "${outsideDir}/outside-$i.txt"; done`;
+
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+
+      if (process.platform !== 'win32') {
+        const windowsBash = lt.createLocalTools({
+          userId: 'u1',
+          cid: 'c1',
+          hostPlatform: 'win32',
+        }).find((t) => t.name === 'bash')!;
+        const windowsRes = await windowsBash.execute({
+          command: `foreach ($i in 1..2) { Get-Content -LiteralPath "${outsideDir}/outside-$i.txt" }`,
+          timeoutMs: 5000,
+        }, makeCtx());
+        expect(windowsRes.isError).toBe(true);
+        expect(windowsRes.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+        expect(windowsRes.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+      }
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('requires approval for runtime loop values and multi-command loop bodies', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? 'foreach ($i in (Get-ChildItem).Name) { Get-Content -LiteralPath "perf_batch_B$i.txt" }'
+      : 'for i in "$UNKNOWN_BATCH_INDEX"; do cat "perf_batch_B$i.txt"; done';
+
+    const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BASH_RISK_DENIED');
+    expect(res.content).not.toContain('all-files access mode');
+
+    const multiCommandLoop = process.platform === 'win32'
+      ? 'foreach ($i in 1..2) { Write-Output $i; Get-Content -LiteralPath "perf_batch_B$i.txt" }'
+      : 'for i in 1 2; do true; cat "perf_batch_B$i.txt"; done';
+    const multiCommandRes = await bash.execute({ command: multiCommandLoop, timeoutMs: 5000 }, makeCtx());
+    expect(multiCommandRes.isError).toBe(true);
+    expect(multiCommandRes.content).toContain('E_BASH_RISK_DENIED');
+  });
+
+  it('does not parse JavaScript inside a POSIX heredoc as shell redirections', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = `${JSON.stringify(TEST_NODE)} <<'EOF'\nconst stem = s => s.replace(/\\.md$/, '');\nconsole.log(stem('note.md'));\nEOF`;
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('note');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('masks quoted, unquoted, tab-stripped, and multiple POSIX heredoc payloads', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = "cat <<FIRST <<-'SECOND'\nconst one = s => s.replace(/\\.md$/, '');\nFIRST\n\tconst two = s => s.replace(/\\.md$/, '');\n\tSECOND";
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('const two');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it.each(['all_files_approval', 'all_files_auto'] as const)(
+    'resolves literal path assignments completed before a later command in %s mode', async (mode) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const file = path.join(tmpDir, 'assigned-path.txt');
+      fs.writeFileSync(file, 'literal assignment ok');
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? `$ROOT = ${JSON.stringify(tmpDir)}; Get-Content -LiteralPath "$ROOT\\assigned-path.txt"`
+        : `ROOT=${JSON.stringify(tmpDir)}; cat "$ROOT/assigned-path.txt"`;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('literal assignment ok');
+    },
+  );
+
+  it.each(POWERSHELL_PATH_ASSIGNMENTS)('resolves PowerShell literal assignments: $label', async (fixture) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const coreTool = fixture.tool === 'bash' ? bashTool : processSessionTool;
+    const execute = vi.spyOn(coreTool, 'execute').mockResolvedValue({ content: 'shell accepted' });
+    try {
+      const target = path.join(tmpDir, "字体 script's output.txt");
+      const literal = powershellPathLiteral(fixture.relative ? path.relative(tmpDir, target) : target, fixture.quote);
+      const command = `${fixture.variable}${fixture.spacing}${literal}${fixture.separator}Set-Content -LiteralPath ${fixture.reference} -Value ok`;
+      const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find((candidate) => candidate.name === fixture.tool)!;
+      const input = fixture.tool === 'bash' ? { command } : { action: 'start', command };
+      const result = await tool.execute(input, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0][0].command).toBe(command);
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it.each([
+    '$script=$unknown',
+    '$script=Get-Location',
+    '$script="safe.txt" + $unknown',
+    '$script="escaped`npath"',
+    '$script="prefix-$unknown"',
+    '$script+="suffix"',
+    '$script += "suffix"',
+    '$script++',
+    '$script="safe.txt" | Write-Output',
+  ])('invalidates a prior PowerShell path before an unresolved reassignment: %s', async (assignment) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const target = path.join(tmpDir, 'preserved.txt');
+    fs.writeFileSync(target, 'preserve original');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({
+        command: `$script = '${target}'; ${assignment}; Set-Content -LiteralPath $script -Value changed`,
+      }, makeCtx());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_BASH_RISK_DENIED');
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readFileSync(target, 'utf8')).toBe('preserve original');
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it('checks the latest compact PowerShell assignment against workspace scope through both shell tools', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const { processSessionTool } = await import('../../../src/core-agent/src/tools/process-session');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const start = vi.spyOn(processSessionTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ps-assigned-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform: 'win32' });
+      for (const name of ['bash', 'process_session']) {
+        const result = await tools.find((tool) => tool.name === name)!.execute({
+          action: 'start',
+          command: `$script = '${path.join(tmpDir, 'safe.txt')}'; $SCRIPT='${outside}'; Set-Content -LiteralPath $script -Value nope`,
+        }, makeCtx());
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+        expect(fs.existsSync(outside)).toBe(false);
+        expect(fs.existsSync(path.join(tmpDir, 'safe.txt'))).toBe(false);
+      }
+      expect(execute).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+      start.mockRestore();
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['win32', "'$script=\"safe.txt\"'; Set-Content -LiteralPath $script -Value nope"],
+    ['win32', "'$script' = 'safe.txt'; Set-Content -LiteralPath $script -Value nope"],
+    ['darwin', '$script="safe.txt"; cat "$script"'],
+  ] as const)('does not resolve quoted assignment text or foreign shell syntax on %s: %s', async (hostPlatform, command) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+    const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', hostPlatform }).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({ command }, makeCtx());
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_BASH_RISK_DENIED');
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it.runIf(process.platform === 'win32').each(POWERSHELL_PATH_ASSIGNMENTS)('executes native PowerShell path assignment: $label', async (fixture) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const cwd = path.join(tmpDir, '工作区 with spaces');
+    const first = path.join(cwd, 'unchanged.txt');
+    const target = path.join(cwd, '子目录', "字体 script's output.txt");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(first, 'preserve original');
+    const literal = powershellPathLiteral(fixture.relative ? path.relative(cwd, target) : target, fixture.quote);
+    const command = `$ErrorActionPreference = 'Stop'; ${fixture.variable} = ${powershellPathLiteral(first, "'")}${fixture.separator}${fixture.variable}${fixture.spacing}${literal}${fixture.separator}Set-Content -LiteralPath ${fixture.reference} -Value 'literal assignment ok' -Encoding utf8; Get-Content -LiteralPath ${fixture.reference}`;
+    const tool = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((candidate) => candidate.name === fixture.tool)!;
+    const ctx = { ...makeCtx(), workingDir: cwd };
+    let sessionId: string | undefined;
+    try {
+      if (fixture.tool === 'bash') {
+        const result = await tool.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+        expect(result.content).not.toContain('<stderr>');
+        expect(result.content).toContain('literal assignment ok');
+      } else {
+        let result = await tool.execute({ action: 'start', command }, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        let payload = JSON.parse(result.content);
+        sessionId = payload.session_id;
+        expect(sessionId).toBeTruthy();
+        const deadline = Date.now() + SHELL_SUCCESS_TIMEOUT_MS;
+        while (payload.status === 'running' && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          result = await tool.execute({ action: 'read', session_id: sessionId }, ctx);
+          expect(result.isError, result.content).toBeFalsy();
+          payload = JSON.parse(result.content);
+        }
+        expect(payload).toMatchObject({ status: 'exited', exit_code: 0 });
+        expect(payload.output.trim()).toBe('literal assignment ok');
+      }
+      expect(fs.readFileSync(target, 'utf8').replace(/^\uFEFF/, '').trim()).toBe('literal assignment ok');
+      expect(fs.readFileSync(first, 'utf8')).toBe('preserve original');
+      expect(fs.readdirSync(path.dirname(target))).toEqual([path.basename(target)]);
+    } finally {
+      if (sessionId) {
+        try { await tool.execute({ action: 'stop', session_id: sessionId }, ctx); }
+        finally {
+          const sessions = await import('../../../src/core-agent/src/tools/process-session');
+          await sessions._resetProcessSessionsForTest();
+        }
+      }
+    }
+  });
+
+  it.runIf(process.platform === 'win32').each(['computed', 'compound', 'outside'] as const)(
+    'blocks native PowerShell %s reassignment before any command can change files', async (kind) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const workspace = path.join(tmpDir, 'workspace');
+      const sibling = path.join(tmpDir, 'workspace-other');
+      fs.mkdirSync(workspace);
+      fs.mkdirSync(sibling);
+      const ws = await import('../../../src/main/features/user_workspace');
+      expect(ws.setWorkspacePath('u1', workspace).ok).toBe(true);
+      const original = path.join(workspace, 'original.txt');
+      const compound = original + '.other';
+      const outside = path.join(sibling, 'outside.txt');
+      const marker = path.join(workspace, 'must-not-start.txt');
+      for (const file of [original, compound, outside]) fs.writeFileSync(file, 'preserve original');
+      const assignment = kind === 'computed'
+        ? "$script=Join-Path (Get-Location) 'original.txt'"
+        : kind === 'compound'
+          ? "$script+='.other'"
+          : `$SCRIPT=${powershellPathLiteral(path.relative(workspace, outside), "'")}`;
+      const command = `Set-Content -LiteralPath ${powershellPathLiteral(marker, "'")} -Value started; $script=${powershellPathLiteral(original, "'")}; ${assignment}; Set-Content -LiteralPath $script -Value changed`;
+      const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1' });
+      try {
+        for (const name of ['bash', 'process_session']) {
+          const input = name === 'bash' ? { command } : { action: 'start', command };
+          const result = await tools.find((tool) => tool.name === name)!.execute(input, { ...makeCtx(), workingDir: workspace });
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain(kind === 'outside' ? 'E_BASH_PATH_OUT_OF_SCOPE' : 'E_BASH_RISK_DENIED');
+          expect(fs.existsSync(marker)).toBe(false);
+          for (const file of [original, compound, outside]) expect(fs.readFileSync(file, 'utf8')).toBe('preserve original');
+        }
+      } finally {
+        const sessions = await import('../../../src/core-agent/src/tools/process-session');
+        await sessions._resetProcessSessionsForTest();
+      }
+    },
+  );
+
+  it.runIf(process.platform === 'win32')('blocks unapproved computed PowerShell writes and permits explicit workspace targets', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'recovered output.txt');
+    const marker = path.join(tmpDir, 'blocked-command-started.txt');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((tool) => tool.name === 'bash')!;
+    const blocked = await bash.execute({
+      command: `Set-Content -LiteralPath ${powershellPathLiteral(marker, "'")} -Value started; $script=Join-Path (Get-Location) 'recovered output.txt'; Set-Content -LiteralPath $script -Value wrong`,
+    }, makeCtx());
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_BASH_RISK_DENIED');
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(fs.existsSync(target)).toBe(false);
+    const recovered = await bash.execute({
+      command: `$ErrorActionPreference = 'Stop'; Set-Content -LiteralPath ${powershellPathLiteral(target, "'")} -Value recovered -Encoding utf8`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(recovered.isError, recovered.content).toBeFalsy();
+    expect(recovered.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(recovered.content).not.toContain('<stderr>');
+    expect(fs.readFileSync(target, 'utf8').replace(/^\uFEFF/, '').trim()).toBe('recovered');
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('still blocks a literal-assigned path when its resolved target is outside scope', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-assigned-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? `$TARGET = ${JSON.stringify(outside)}; Set-Content -LiteralPath "$TARGET" -Value nope`
+        : `TARGET=${JSON.stringify(outside)}; printf nope > "$TARGET"`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recognizes the PowerShell null sink and known profile environment paths', async () => {
+    if (process.platform !== 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'Write-Output ignored > $null; Get-ChildItem "$env:USERPROFILE" | Out-Null; Write-Output ok',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ USERPROFILE: tmpDir }));
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('ok');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('resolves the Orkas output manifest before the execution wrapper injects it', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'printf "%s\\n" "missing-output.txt" >> "$ORKAS_OUTPUT_MANIFEST"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(fs.existsSync(path.join(tmpDir, '.orkas-output-manifest'))).toBe(false);
+  });
+
+  it('still guards a real redirection attached to a heredoc command', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-heredoc-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = `${JSON.stringify(TEST_NODE)} > ${JSON.stringify(outside)} <<'EOF'\nconsole.log('blocked');\nEOF`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+
+      const shellPayload = `bash <<'EOF'\nprintf nope > ${JSON.stringify(outside)}\nEOF`;
+      const shellRes = await bash.execute({ command: shellPayload, timeoutMs: 5000 }, makeCtx());
+      expect(shellRes.isError).toBe(true);
+      expect(shellRes.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not confuse arithmetic shifts with heredoc openers', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-arithmetic-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = `echo $((1 << 2))\nprintf nope > ${JSON.stringify(outside)}`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks interpreter-internal writes outside the writable scope on macOS', async () => {
+    if (process.platform !== 'darwin' || !fs.existsSync('/usr/bin/sandbox-exec')) return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-internal-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
+      const script = `require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'blocked')`;
+      const commands = [
+        testNodeCommand(script),
+        `${JSON.stringify(TEST_NODE)} <<'EOF'\n${script}\nEOF`,
+      ];
+      for (const command of commands) {
+        const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+        expect(res.isError).toBe(true);
+        expect(fs.existsSync(outside)).toBe(false);
+      }
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('local-tools › interactive_cli lifecycle', () => {
+  function toolByName(tools: any[], name: string): any {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) throw new Error(`${name} tool missing`);
+    return tool;
+  }
+
+  function parseToolJson(res: any): any {
+    if (res.isError) throw new Error(String(res.content || 'tool failed'));
+    return JSON.parse(String(res.content || '{}'));
+  }
+
+  it('rejects an unknown action without starting the supplied command', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const marker = path.join(tmpDir, 'interactive-must-not-run.txt');
+    const command = testNodeCommand(
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`,
+    );
+    const interactive = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
+
+    const result = await interactive.execute({ action: 'unknown', command }, makeCtx());
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('E_BAD_INPUT');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('starts a live session, sends stdin, and reads child output', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const tools = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' });
+    const interactive = toolByName(tools, 'interactive_cli');
+    const script = "process.stdout.write('Enter verification code: '); process.stdin.once('data', d => { process.stdout.write('got:' + d.toString().trim()); process.exit(0); });";
+    const command = testNodeCommand(script);
+
+    const startResult = await interactive.execute({
+      action: 'start',
+      command,
+      max_lifetime_ms: 30000,
+    }, makeCtx());
+    const started = parseToolJson(startResult);
+    expect(started.session_id).toMatch(/[0-9a-f-]{20,}/i);
+    expect(String(started.output)).toContain('verification code');
+    expect(started.prompt_kind).toBe('auth_code');
+    expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
+
+    const waitingRead = await interactive.execute({ action: 'read', session_id: started.session_id }, makeCtx());
+    expect(waitingRead.endTurn).toBe(true);
+    expect(waitingRead.endTurnReason).toBe('waiting_input');
+
+    const sent = parseToolJson(await interactive.execute({
+      action: 'send',
+      session_id: started.session_id,
+      input: 'abc-123',
+    }, makeCtx()));
+    expect(sent.sent).toBe(true);
+
+    let latest: any = null;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      latest = parseToolJson(await interactive.execute({ action: 'read', session_id: started.session_id }, makeCtx()));
+      if (String(latest.output || '').includes('got:abc-123')) break;
+    }
+    expect(String(latest.output)).toContain('got:abc-123');
+    expect(['running', 'exited']).toContain(latest.status);
+
+    await interactive.execute({ action: 'close', session_id: started.session_id, force: true, reason: 'test cleanup' }, makeCtx());
+  }, 10000);
+
+  it('hands the Codex stdin API-key prompt to the user', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const interactive = toolByName(
+      lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }),
+      'interactive_cli',
+    );
+    const command = testNodeCommand(
+      "process.stdout.write('Reading API key from stdin...'); setInterval(() => {}, 1000);",
+    );
+
+    const startResult = await interactive.execute({
+      action: 'start',
+      command,
+      max_lifetime_ms: 30000,
+    }, makeCtx());
+    const started = parseToolJson(startResult);
+
+    expect(started.output).toContain('Reading API key from stdin...');
+    expect(started.prompt_kind).toBe('secret');
+    expect(started.user_action_required).toBe(true);
+    expect(started.agent_should_stop).toBe(true);
+    expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
+
+    await interactive.execute({
+      action: 'close',
+      session_id: started.session_id,
+      force: true,
+      reason: 'test cleanup',
+    }, makeCtx());
+  }, 10000);
+
+  it('keeps interactive CLI available in workspace_approval mode', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const interactive = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
+    const res = await interactive.execute({ action: 'start', command: 'echo ok' }, makeCtx());
+    expect(res.isError).toBeFalsy();
+  });
+
+  it('still asks before an irreversible interactive command in all_files_auto', async () => {
+    const { lt, perm } = await loadModules();
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const victim = path.join(tmpDir, 'interactive-profile');
+    fs.mkdirSync(victim, { recursive: true });
+    fs.writeFileSync(path.join(victim, 'fingerprint'), 'must survive denial');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const interactive = toolByName(
+        lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }),
+        'interactive_cli',
+      );
+      const res = await interactive.execute({
+        action: 'start',
+        command: `rm -rf ${JSON.stringify(victim)}`,
+      }, makeCtx());
+
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('destructive');
+      expect(prompted?.irreversible).toEqual(['recursive_delete']);
+      expect(fs.existsSync(path.join(victim, 'fingerprint'))).toBe(true);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('rejects no-browser OAuth login in interactive sessions by default', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const interactive = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
+
+    const res = await interactive.execute({
+      action: 'start',
+      command: 'gcloud auth login --no-browser',
+      purpose: 'Authorize Google access',
+      max_lifetime_ms: 30000,
+    }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_INTERACTIVE_AUTH_NO_BROWSER_UNSUPPORTED');
+    expect(res.content).toContain('without --no-browser/--no-launch-browser');
+  });
+
+  it('surfaces an error to the agent when an interactive command exits before input', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const interactive = toolByName(tools, 'interactive_cli');
+    const script = "process.stderr.write('Missing provider auth configuration.'); process.exit(2);";
+    const command = testNodeCommand(script);
+
+    const started = JSON.parse(String((await interactive.execute({
+      action: 'start',
+      command,
+      purpose: 'Configure provider access',
+      max_lifetime_ms: 30000,
+    }, makeCtx())).content));
+
+    let parsed = started;
+    for (let i = 0; i < 20 && parsed.status !== 'error'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      parsed = parseToolJson(await interactive.execute({ action: 'read', session_id: started.session_id }, makeCtx()));
+    }
+    expect(parsed.status).toBe('error');
+    expect(parsed.exit_code).toBe(2);
+    expect(parsed.output).toContain('Missing provider auth configuration.');
+    expect(parsed.prompt_kind).toBeUndefined();
+    expect(parsed.next_step).toContain('Explain');
+  }, 10000);
+
+  it('tells the agent to stop when a CLI has already opened browser authorization', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const interactive = toolByName(tools, 'interactive_cli');
+    const authUrl = 'https://accounts.google.com/o/oauth2/auth?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2F&code_challenge=abc';
+    const script = `process.stdout.write('Your browser has been opened to visit:\\n\\n ${authUrl}\\n'); setInterval(() => {}, 1000);`;
+    const command = testNodeCommand(script);
+
+    const startResult = await interactive.execute({
+      action: 'start',
+      command,
+      purpose: 'Authorize in browser',
+      max_lifetime_ms: 30000,
+    }, makeCtx());
+    const started = parseToolJson(startResult);
+
+    let latest = started;
+    for (let i = 0; i < 20 && latest.user_action_required !== true; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      latest = parseToolJson(await interactive.execute({ action: 'read', session_id: started.session_id }, makeCtx()));
+    }
+    expect(latest.user_action_required).toBe(true);
+    expect(latest.agent_should_stop).toBe(true);
+    expect(latest.user_action_reason).toBe('browser_auth');
+    expect(startResult.endTurn).toBe(true);
+    expect(startResult.endTurnReason).toBe('waiting_input');
+    expect(latest.next_step).toContain('Do not call open');
+    expect(latest.next_step).toContain('do not restart or close');
+    expect(latest.next_step).toContain('do not switch to another OAuth method');
+    expect(latest.next_step).toContain('Stop tool use now');
+
+    const blockedClose = await interactive.execute({ action: 'close', session_id: started.session_id }, makeCtx());
+    expect(blockedClose.isError).toBe(true);
+    expect(blockedClose.content).toContain('E_INTERACTIVE_CLI_WAITING_FOR_USER');
+
+    const closed = parseToolJson(await interactive.execute({
+      action: 'close',
+      session_id: started.session_id,
+      force: true,
+      reason: 'test cleanup',
+    }, makeCtx()));
+    expect(closed.status).toBe('closed');
+  }, 10000);
+
+  it('prevents another user from reading or closing a live session', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const owner = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
+    const other = toolByName(lt.createLocalTools({ userId: 'u2' }), 'interactive_cli');
+    const command = testNodeCommand("process.stdout.write('ready\\n');setInterval(()=>{},1000)");
+    const started = parseToolJson(await owner.execute({ action: 'start', command }, makeCtx()));
+
+    const deniedRead = await other.execute({ action: 'read', session_id: started.session_id }, makeCtx());
+    const deniedClose = await other.execute({ action: 'close', session_id: started.session_id }, makeCtx());
+    expect(deniedRead).toMatchObject({ isError: true });
+    expect(deniedClose).toMatchObject({ isError: true });
+
+    const stillRunning = parseToolJson(await owner.execute({
+      action: 'read',
+      session_id: started.session_id,
+    }, makeCtx()));
+    expect(stillRunning.status).toBe('running');
+
+    const closed = parseToolJson(await owner.execute({
+      action: 'close',
+      session_id: started.session_id,
+    }, makeCtx()));
+    expect(closed.status).toBe('closed');
+  }, 10000);
+
+  it('prevents another user from reading or closing a live session', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const owner = toolByName(lt.createLocalTools({ userId: 'u1' }), 'interactive_cli');
+    const other = toolByName(lt.createLocalTools({ userId: 'u2' }), 'interactive_cli');
+    const command = testNodeCommand("process.stdout.write('ready\\n');setInterval(()=>{},1000)");
+    const started = parseToolJson(await owner.execute({ action: 'start', command }, makeCtx()));
+
+    const deniedRead = await other.execute({ action: 'read', session_id: started.session_id }, makeCtx());
+    const deniedClose = await other.execute({ action: 'close', session_id: started.session_id }, makeCtx());
+    expect(deniedRead).toMatchObject({ isError: true });
+    expect(deniedClose).toMatchObject({ isError: true });
+
+    const stillRunning = parseToolJson(await owner.execute({
+      action: 'read',
+      session_id: started.session_id,
+    }, makeCtx()));
+    expect(stillRunning.status).toBe('running');
+
+    const closed = parseToolJson(await owner.execute({
+      action: 'close',
+      session_id: started.session_id,
+    }, makeCtx()));
+    expect(closed.status).toBe('closed');
+  }, 10000);
+
+  it('redacts sensitive UI-provided input if a CLI echoes it', async () => {
+    const mgr = await import('../../../src/main/model/core-agent/interactive-cli-sessions');
+    const script = "process.stdin.once('data', d => { process.stdout.write('echo:' + d.toString().trim()); process.exit(0); });";
+    const command = testNodeCommand(script);
+    const started = mgr.startInteractiveCliSession({
+      uid: 'u1',
+      command,
+      cwd: tmpDir,
+      maxLifetimeMs: 30000,
+    });
+    try {
+      mgr.sendInteractiveCliInput('u1', started.session_id, 'secret-code-42', { sensitive: true });
+      let latest: any = null;
+      const deadline = performance.now() + 10_000;
+      while (performance.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        latest = mgr.readInteractiveCliSession('u1', started.session_id);
+        if (String(latest.output || '').includes('[redacted]')) break;
+      }
+      expect(String(latest.output)).toContain('[redacted]');
+      expect(String(latest.output)).not.toContain('secret-code-42');
+    } finally {
+      mgr.closeInteractiveCliSession('u1', started.session_id);
+    }
+  }, 15000);
+});
+
+describe('local-tools › Orkas CLI direct execution', () => {
+  function writeFakePcScript(name: 'run-skill.cjs' | 'orkas-pkg.cjs', source: string): string {
+    const binDir = path.join(tmpDir, 'fake-pc', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const script = path.join(binDir, name);
+    fs.writeFileSync(script, source, 'utf8');
+    return path.join(tmpDir, 'fake-pc');
+  }
+
+  function makeOrkasCtx(pcDir: string): any {
+    return {
+      workingDir: tmpDir,
+      state: {
+        sandboxEnv: {
+          ORKAS_NODE: TEST_NODE,
+          ORKAS_PC_DIR: pcDir,
+          ELECTRON_RUN_AS_NODE: '1',
+        },
+      },
+    };
+  }
+
+  it.each([
+    { label: 'silent success', source: 'process.exit(0)', error: false, stderr: '' },
+    { label: 'stderr-only success', source: "process.stderr.write('diagnostic')", error: false, stderr: 'diagnostic' },
+    { label: 'silent failure', source: 'process.exit(7)', error: true, stderr: '' },
+  ])('returns an explicit completion result for $label', async ({ source, error, stderr }) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript('run-skill.cjs', source);
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(!!res.isError).toBe(error);
+    expect(res.content).not.toBe('');
+    expect(res.observations?.execution).toMatchObject({
+      status: error ? 'failed' : 'succeeded', exitCode: error ? 7 : 0,
+    });
+    if (!error) {
+      expect(res.content).toContain('<command-result status="succeeded" exit_code="0"');
+      expect(res.content).toContain(stderr ? '<stderr>\ndiagnostic\n</stderr>' : '[no command output]');
+    }
+  });
+
+  it('runs the standard run-skill.cjs command without requiring shell expansion', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), out: process.env.ORKAS_OUTPUT_DIR }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(String(res.content));
+    expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
+    expect(parsed.out).toBe(tmpDir);
+  });
+
+  it('runs the PowerShell form of a standard Orkas CLI command directly', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: '& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(String(res.content)).argv).toEqual(['calculator', 'eval', '--', '1+1']);
+  });
+
+  it.skipIf(process.platform === 'win32').each(['variable', 'braced', 'substitution', 'literal'])(
+    'preserves shell argument semantics for Skill input paths: %s', async (form) => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('all_files_auto');
+      const pcDir = writeFakePcScript('run-skill.cjs',
+        "const fs = require('node:fs'); const input = process.argv.at(-1); process.stdout.write(JSON.stringify({ input, data: fs.readFileSync(input, 'utf8') }));");
+      const literal = form === 'literal';
+      const target = path.join(tmpDir, ...(literal ? ['$PWD'] : []), 'fixture.json');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, '{"close":123}', 'utf8');
+      const argument = form === 'variable' ? '"$PWD/fixture.json"'
+        : form === 'braced' ? '"${PWD}/fixture.json"'
+        : form === 'substitution' ? '"$(pwd)/fixture.json"'
+        : "'$PWD/fixture.json'";
+      const bash = lt.createLocalTools({}).find((tool) => tool.name === 'bash')!;
+      const result = await bash.execute({
+        command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" market-data stock -- --input ${argument}`,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeOrkasCtx(pcDir));
+      expect(result.isError, String(result.content)).toBeFalsy();
+      expect(String(result.content)).toContain(JSON.stringify({
+        input: literal ? '$PWD/fixture.json' : fs.realpathSync(target), data: '{"close":123}',
+      }));
+    },
+  );
+
+  it('contains a synchronous direct CLI spawn failure as a non-executed command result', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript('run-skill.cjs', "process.stdout.write('must-not-run');");
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const context = makeOrkasCtx(pcDir);
+    const invalidNodePath = `invalid\0node`;
+    context.state.sandboxEnv.ORKAS_NODE = invalidNodePath;
+
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, context);
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('Failed to start shell process');
+    expect(res.content).toContain('The command was not executed');
+    expect(res.content).not.toContain(invalidNodePath);
+    expect(res.observations?.execution).toMatchObject({
+      status: 'start_failed',
+      exitCode: null,
+      timedOut: false,
+      outputLimitExceeded: false,
+      stdout: { bytes: 0, truncated: false },
+    });
+  });
+
+  it('streams large direct Orkas CLI stdout to the Result Store handoff file', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const outputBytes = 1024 * 1024 + 257;
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      `process.stdout.write('x'.repeat(${outputBytes}));`,
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const context = makeOrkasCtx(pcDir);
+    context.state.toolResultSpoolDir = path.join(tmpDir, 'tool-results');
+
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, context);
+
+    expect(res.isError).toBeFalsy();
+    expect(res.content).toContain('full output streamed to Result Store');
+    expect(res.streamedOutput).toMatchObject({ size: outputBytes });
+    expect(fs.statSync(res.streamedOutput!.path).size).toBe(outputBytes);
+    expect(fs.readFileSync(res.streamedOutput!.path, 'utf8')).toBe('x'.repeat(outputBytes));
+  });
+
+  it('pipes heredoc stdin into the standard orkas-pkg.cjs command', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript(
+      'orkas-pkg.cjs',
+      "let body=''; process.stdin.on('data', d => body += d); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), body })));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const body = "---\nname: Demo\n---\n\n# Demo";
+
+    const res = await bash.execute({
+      command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(String(res.content));
+    expect(parsed.argv).toEqual(['skill-write', 'demo']);
+    expect(parsed.body.replace(/\n$/, '')).toBe(body);
+  });
+
+  it('lets the host shell handle redirection for standard Orkas CLI commands', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const outPath = path.join(tmpDir, 'run-skill-output.json');
+    const errPath = path.join(tmpDir, 'run-skill-stderr.txt');
+
+    const res = await bash.execute({
+      command: process.platform === 'win32'
+        ? `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`
+        : `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    expect(res.content).toContain('<command-result status="succeeded" exit_code="0"');
+    expect(res.content).toContain('[no command output]');
+    const redirected = fs.readFileSync(outPath, process.platform === 'win32' ? 'utf16le' : 'utf8')
+      .replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(redirected);
+    expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
+    expect(fs.readFileSync(errPath, 'utf8')).toBe('');
+  });
+
+  it('times out direct Orkas CLI commands whose child keeps stdout open', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      [
+        "const { spawn } = require('node:child_process');",
+        "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+        "console.log('parent done');",
+      ].join(''),
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const started = Date.now();
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: 500,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBe(true);
+    expect(String(res.content)).toMatch(/timed out|超时/i);
+    expect(Date.now() - started).toBeLessThan(7000);
+  }, 10000);
+});
+
+// ── End-to-end: approval modes drive the real bash tool ────────────────
+
+describe('local-tools › bash sensitive approval modes (e2e)', () => {
+  async function loadWithBashPerms() {
+    const lt = await import('../../../src/main/model/core-agent/local-tools');
+    const perm = await import('../../../src/main/features/permissions');
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    return { lt, perm, bashPerms };
+  }
+  const OPTS = { userId: 'u1', cid: 'c1', agentId: 'a1' };
+
+  it.runIf(process.platform !== 'win32')('uses the same ordinary cleanup decision through run_program', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    fs.mkdirSync(path.join(tmpDir, 'empty'));
+    let prompted = false;
+    bashPerms._setBroadcastForTest((_channel, info: any) => {
+      prompted = true;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    const bash = lt.createLocalTools(OPTS).find(t => t.name === 'bash')!;
+    const { createRunProgramTool } = await import('../../../src/core-agent/src/tools/run-program');
+    const { createProgrammaticToolPolicy } = await import('../../../src/main/model/core-agent/programmatic-tool-policy');
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+    const program = createRunProgramTool({
+      listToolNames: () => ['bash'].filter(name => policy.isEligible(name)),
+      invokeTool: async (name, input, parentCtx) => {
+        const authorization = await policy.authorize(name, input, parentCtx);
+        if (!authorization.allowed) return { status: 'denied', ...authorization };
+        return { status: 'completed', result: await bash.execute(input, parentCtx) };
+      },
+    });
+    try {
+      const result = await program.execute({ code: 'json(await tools.bash({command: "rmdir empty"}));' }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      expect(fs.existsSync(path.join(tmpDir, 'empty'))).toBe(false);
+      expect(prompted).toBe(false);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it.runIf(process.platform === 'win32').each(['ri', 'rd', 'rmdir', 'del', 'erase', 'rm'])(
+    'executes ordinary native PowerShell cleanup through %s', async (alias) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      fs.mkdirSync(path.join(tmpDir, 'empty'));
+      let prompted = false;
+      bashPerms._setBroadcastForTest((_channel, info: any) => {
+        prompted = true;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      try {
+        const bash = lt.createLocalTools(OPTS).find(t => t.name === 'bash')!;
+        const result = await bash.execute({ command: `${alias} -LiteralPath empty` }, makeCtx());
+        expect(result.isError, result.content).toBeFalsy();
+        expect(fs.existsSync(path.join(tmpDir, 'empty'))).toBe(false);
+        expect(prompted).toBe(false);
+      } finally { bashPerms._setBroadcastForTest(null); }
+    },
+  );
+
+  it.each(['rmdir /s /q target', 'rd -Recurse target', 'ri -Rec target'])(
+    'never exempts recursive Windows deletion: %s', async (command) => {
+      const { lt } = await loadWithBashPerms();
+      expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(command, tmpDir, {}, () => true, 'win32')).toBe(false);
+    },
+  );
+
+  it.each(['process_session', 'interactive_cli'])(
+    '%s performs ordinary empty-directory cleanup through the shared permission gate', async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const dir = path.join(tmpDir, 'empty');
+      fs.mkdirSync(dir);
+      let prompted = false;
+      bashPerms._setBroadcastForTest((_channel, info: any) => {
+        prompted = true;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      const tool = lt.createLocalTools(OPTS).find(t => t.name === toolName)!;
+      let sessionId: string | undefined;
+      try {
+        const command = process.platform === 'win32' ? 'rd -LiteralPath empty' : 'rmdir empty';
+        const started = await tool.execute({ action: 'start', command }, makeCtx());
+        expect(started.isError, started.content).toBeFalsy();
+        sessionId = JSON.parse(started.content).session_id;
+        await vi.waitFor(() => expect(fs.existsSync(dir)).toBe(false));
+        expect(prompted).toBe(false);
+      } finally {
+        if (sessionId) await tool.execute({ action: toolName === 'process_session' ? 'stop' : 'close', session_id: sessionId }, makeCtx());
+        bashPerms._setBroadcastForTest(null);
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32').each(['process_session', 'interactive_cli'])(
+    '%s removes a workspace link without authorizing deletion of its shared target', async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const donor = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-shared-link-target-'));
+      const link = path.join(tmpDir, 'node_modules');
+      fs.writeFileSync(path.join(donor, 'keep.txt'), 'unchanged');
+      fs.symlinkSync(donor, link);
+      let prompted = false;
+      bashPerms._setBroadcastForTest((_channel, info: any) => {
+        prompted = true;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      const tool = lt.createLocalTools(OPTS).find(t => t.name === toolName)!;
+      let sessionId: string | undefined;
+      try {
+        const started = await tool.execute({ action: 'start', command: 'rm node_modules' }, makeCtx());
+        expect(started.isError, started.content).toBeFalsy();
+        sessionId = JSON.parse(started.content).session_id;
+        await vi.waitFor(() => expect(fs.existsSync(link)).toBe(false));
+        expect(prompted).toBe(false);
+        expect(fs.readFileSync(path.join(donor, 'keep.txt'), 'utf8')).toBe('unchanged');
+      } finally {
+        if (sessionId) await tool.execute({ action: toolName === 'process_session' ? 'stop' : 'close', session_id: sessionId }, makeCtx());
+        bashPerms._setBroadcastForTest(null);
+        fs.rmSync(donor, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['interactive_cli', 'process_session'])(
+    'prompts before %s changes a system package even in all_files_auto',
+    async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('all_files_auto');
+      let prompted: any = null;
+      bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+        prompted = info;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      try {
+        const tool = lt.createLocalTools(OPTS).find((item) => item.name === toolName)!;
+        const res = await tool.execute({ action: 'start', command: 'brew install postgresql@17' }, makeCtx());
+        expect(res.isError).toBe(true);
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+        expect(prompted?.reasons).toEqual(['system_package_change']);
+      } finally {
+        bashPerms._setBroadcastForTest(null);
+      }
+    },
+  );
+
+  it.each(['interactive_cli', 'process_session'])(
+    'prompts before %s publishes remote state even in all_files_auto',
+    async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('all_files_auto');
+      let prompted: any = null;
+      bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+        prompted = info;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      try {
+        const tool = lt.createLocalTools(OPTS).find((item) => item.name === toolName)!;
+        const res = await tool.execute({ action: 'start', command: "bash -lc 'git push origin main'" }, makeCtx());
+        expect(res.isError).toBe(true);
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+        // Trusted mode still filters ordinary network approval, but the
+        // invariant external-mutation reason must remain and block startup.
+        expect(prompted?.reasons).toEqual(['external_mutation']);
+      } finally {
+        bashPerms._setBroadcastForTest(null);
+      }
+    },
+  );
+  const deleteCommand = (targets: string[], recursive = false): string => (
+    process.platform === 'win32'
+      ? targets.map((target) => (
+        `Remove-Item ${recursive ? '-Recurse ' : ''}-Force -LiteralPath ${JSON.stringify(target)}`
+      )).join('; ')
+      : `rm ${recursive ? '-rf' : '-f'} ${targets.map((target) => JSON.stringify(target)).join(' ')}`
+  );
+
+  it.each(['interactive_cli', 'process_session'])
+  ('lets %s delete an explicit non-recursive workspace file without prompting', async (toolName) => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, `${toolName}-workspace-cleanup.txt`);
+    fs.writeFileSync(target, 'temporary workspace file');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const tool = lt.createLocalTools(OPTS).find((item) => item.name === toolName)!;
+      const res = await tool.execute({ action: 'start', command: deleteCommand([target]) }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      await vi.waitFor(() => expect(fs.existsSync(target)).toBe(false));
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it.each(['bash', 'process_session', 'interactive_cli', 'run_program'])(
+    'holds %s dynamic removal until approval and preserves files on cancellation',
+    async (toolName) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, 'dynamic-remove.txt');
+      fs.writeFileSync(target, 'preserve until approved');
+      const command = process.platform === 'win32'
+        ? '$target = Join-Path (Get-Location) "dynamic-remove.txt"; Remove-Item -Force -LiteralPath "$target"'
+        : 'target="$(pwd)/dynamic-remove.txt"; rm -f "$target"';
+      const requests: any[] = [];
+      bashPerms._setBroadcastForTest((channel: string, info: any) => {
+        if (channel === 'bash:permission') requests.push(info);
+      });
+      const tool = lt.createLocalTools(OPTS).find(item => item.name === (toolName === 'run_program' ? 'bash' : toolName))!;
+      const execute = async () => {
+        if (toolName !== 'run_program') return tool.execute({ action: 'start', command }, makeCtx());
+        const { createRunProgramTool } = await import('../../../src/core-agent/src/tools/run-program');
+        const { createProgrammaticToolPolicy } = await import('../../../src/main/model/core-agent/programmatic-tool-policy');
+        const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+        const program = createRunProgramTool({
+          listToolNames: () => ['bash'].filter(name => policy.isEligible(name)),
+          invokeTool: async (name, input, parentCtx) => {
+            const authorization = await policy.authorize(name, input, parentCtx);
+            if (!authorization.allowed) return { status: 'denied', ...authorization };
+            return { status: 'completed', result: await tool.execute(input, parentCtx) };
+          },
+        });
+        return program.execute({ code: `json(await tools.bash(${JSON.stringify({ command })}));` }, makeCtx());
+      };
+      try {
+        const cancelled = execute();
+        await vi.waitFor(() => expect(requests).toHaveLength(1));
+        expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+        expect(fs.readFileSync(target, 'utf8')).toBe('preserve until approved');
+        bashPerms.cancelForCid('c1');
+        expect((await cancelled).content).toContain('E_BASH_RISK_DENIED');
+        expect(fs.readFileSync(target, 'utf8')).toBe('preserve until approved');
+
+        const approved = execute();
+        await vi.waitFor(() => expect(requests).toHaveLength(2));
+        expect(fs.existsSync(target)).toBe(true);
+        // A stale approval cannot release the fresh command.
+        bashPerms.respond(requests[0].request_id, 'allow_once');
+        expect(fs.existsSync(target)).toBe(true);
+        bashPerms.respond(requests[1].request_id, 'allow_once');
+        const result = await approved;
+        expect(result.isError, result.content).toBeFalsy();
+        await vi.waitFor(() => expect(fs.existsSync(target)).toBe(false));
+      } finally {
+        bashPerms._resetForTest();
+      }
+    },
+  );
+
+  it('runs a non-risky command without prompting under workspace_approval', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: 'echo safe-run-ok', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(prompted).toBe(false);
+      expect(res.isError).toBeFalsy();
+      expect(res.content).toContain('safe-run-ok');
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it.each([
+    ['all_files_approval', true],
+    ['all_files_auto', false],
+  ] as const)(
+    'applies the unresolved-path boundary before process_session starts in %s',
+    async (mode, shouldReject) => {
+      const { lt, perm } = await loadWithBashPerms();
+      perm.setLocalExecMode(mode);
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, `process-runtime-${mode}.txt`);
+      const command = process.platform === 'win32'
+        ? `$target = Join-Path (Get-Location) ${JSON.stringify(path.basename(target))}; Set-Content -LiteralPath "$target" -Value allowed`
+        : `target="$(pwd)/${path.basename(target)}"; printf allowed > "$target"`;
+      const processTool = lt.createLocalTools(OPTS).find((item) => item.name === 'process_session')!;
+
+      const res = await processTool.execute({ action: 'start', command }, makeCtx());
+
+      if (shouldReject) {
+        expect(res.isError).toBe(true);
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+        expect(fs.existsSync(target)).toBe(false);
+        return;
+      }
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      await vi.waitFor(() => expect(fs.readFileSync(target, 'utf8').trim()).toBe('allowed'));
+    },
+  );
+
+  it('treats a Python heredoc as source code instead of shell commands', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const fakeBin = path.join(tmpDir, 'fake-python-bin');
+    writeFakeCommand(fakeBin, 'python3', [
+      "let source = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => { source += chunk; });",
+      "process.stdin.on('end', () => process.stdout.write(source.includes('open(p)') ? 'OK' : 'BAD'));",
+    ].join('\n'));
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const command = [
+      "python3 - <<'PY'",
+      'import json',
+      `p=${JSON.stringify(path.join(tmpDir, 'composition-manifest.json'))}`,
+      "d=json.load(open(p)); print('OK', d.keys())",
+      'PY',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx({
+        ORKAS_PATH_PREPEND: `${fakeBin}${path.delimiter}${path.dirname(TEST_NODE)}`,
+      }));
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('OK');
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('classifies a heredoc payload that is piped into a shell as shell commands', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    // The receiver (`cat`) only forwards stdin; the payload runs in `bash`.
+    // An in-workspace recursive delete must reach the destructive classifier
+    // (an out-of-scope target would already be rejected by the path guard).
+    const command = [
+      "cat <<'EOF' | bash",
+      'rm -rf ./orkas-e2e-heredoc-dir',
+      'EOF',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('destructive');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('keeps a heredoc that only feeds a non-shell pipeline masked', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const command = [
+      "cat <<'EOF' | wc -l",
+      'rm -rf ./orkas-e2e-heredoc-dir',
+      'EOF',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('still detects an external write inside a non-shell heredoc', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    const command = [
+      "python3 - <<'PY'",
+      'import requests',
+      "requests.post('https://api.example.com/items', json={'active': True})",
+      'PY',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('external_mutation');
+      expect(prompted?.can_allow_run).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  type SensitiveApprovalCase = readonly [
+    string,
+    'workspace_approval' | 'all_files_auto',
+    string,
+    'network_egress' | 'destructive' | 'priv_esc' | 'external_mutation',
+  ];
+  const sensitiveCommands: readonly SensitiveApprovalCase[] = process.platform === 'win32'
+    ? [
+        ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
+        ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
+        ['security-boundary weakening', 'workspace_approval', 'curl.exe --insecure https://example.invalid/orkas-sensitive-case', 'priv_esc'],
+        ['external application launch', 'all_files_auto', 'Start-Process https://example.invalid/orkas-sensitive-case', 'external_mutation'],
+      ]
+    : [
+        ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
+        ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
+        ['security-boundary weakening', 'workspace_approval', 'NODE_TLS_REJECT_UNAUTHORIZED=0 npm view react version', 'priv_esc'],
+        ['external application launch', 'all_files_auto', 'open https://example.com', 'external_mutation'],
+      ];
+
+  it.each(sensitiveCommands)(
+    'denies %s before process start and preserves the execution sentinel',
+    async (_label, mode, sensitiveCommand, expectedReason) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode(mode);
+      const marker = path.join(tmpDir, `${expectedReason}-must-not-run.txt`);
+      const writeMarker = testNodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`);
+      let prompted: any = null;
+      bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+        prompted = info;
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      try {
+        const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+        const res = await bash.execute({
+          command: `${sensitiveCommand} ${process.platform === 'win32' ? ';' : '&&'} ${writeMarker}`,
+          timeoutMs: 5000,
+        }, makeCtx());
+        expect(res.isError).toBe(true);
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+        expect(prompted?.reasons).toContain(expectedReason);
+        expect(fs.existsSync(marker)).toBe(false);
+      } finally {
+        bashPerms._setBroadcastForTest(null);
+      }
+    },
+  );
+
+  it('prompts before running a shell delete command, even for an outside temp path', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const target = path.join(os.tmpdir(), `orkas-rm-prompt-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.writeFileSync(target, 'keep-me');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `rm ${JSON.stringify(target)}`, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.existsSync(target)).toBe(true);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('prompts before terminating a user process and leaves later shell segments unexecuted on denial', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const sentinel = path.join(tmpDir, 'process-termination-command-ran.txt');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const writeSentinel = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${JSON.stringify(sentinel)}`;
+      const command = `taskkill /F /IM orkas-risk-sentinel-process.exe & ${writeSentinel}`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.existsSync(sentinel)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(sentinel, { force: true });
+    }
+  });
+
+  it('prompts before terminating a user process and leaves later shell segments unexecuted on denial', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const sentinel = path.join(tmpDir, 'process-termination-command-ran.txt');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const writeSentinel = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${JSON.stringify(sentinel)}`;
+      const command = `taskkill /F /IM orkas-risk-sentinel-process.exe & ${writeSentinel}`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.existsSync(sentinel)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(sentinel, { force: true });
+    }
+  });
+
+  it('checks the target after force flags and blocks deletion outside workspace scope', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(os.tmpdir(), `orkas-rm-force-scope-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.writeFileSync(target, 'outside workspace');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(prompted).toBe(false);
+      expect(fs.readFileSync(target, 'utf8')).toBe('outside workspace');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('deletes a conversation-produced file without a destructive prompt', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'generated-cleanup.txt');
+    fs.writeFileSync(target, 'temporary output');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const command = deleteCommand([target]);
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(target)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('deletes an explicit non-recursive workspace file without requiring conversation provenance', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'user-owned.txt');
+    fs.writeFileSync(target, 'must remain');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: () => false,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(target)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('deletes mixed produced and pre-existing files when all targets are explicit workspace files', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const produced = path.join(tmpDir, 'generated-mixed.txt');
+    const foreign = path.join(tmpDir, 'user-mixed.txt');
+    fs.writeFileSync(produced, 'generated');
+    fs.writeFileSync(foreign, 'user');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === produced,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({
+        command: deleteCommand([produced, foreign]),
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(produced)).toBe(false);
+      expect(fs.existsSync(foreign)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(produced, { force: true });
+      fs.rmSync(foreign, { force: true });
+    }
+  });
+
+  it('keeps recursive deletion of a produced path behind approval', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'generated-recursive.txt');
+    fs.writeFileSync(target, 'must survive denial');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({
+        command: deleteCommand([target], true),
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('must survive denial');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('keeps sensitive-path approval even when the conversation produced the file', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'id_rsa');
+    fs.writeFileSync(target, 'sensitive generated output');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(prompted?.reasons).toEqual(['sensitive_path']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('sensitive generated output');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it.each([
+    ['literal PowerShell cleanup', (produced: string) => (
+      `Remove-Item -LiteralPath ${JSON.stringify(produced)} -Force`
+    )],
+    ['the production-shaped cleanup followed by output and verification', (produced: string) => (
+      `cd ${JSON.stringify(tmpDir)}; Remove-Item ${JSON.stringify(produced)} -Force; `
+      + `Write-Output "cleanup complete"; node -e "require('fs').existsSync(process.argv[1])" ${JSON.stringify(produced)}`
+    )],
+  ])('recognizes %s as owned-file-only deletion', async (_label, buildCommand) => {
+    const { lt } = await loadWithBashPerms();
+    const produced = path.join(tmpDir, 'generated.png');
+    const owns = (candidate: string) => candidate === produced;
+
+    for (const hostPlatform of new Set([process.platform, 'win32'] as const)) {
+      expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(
+        buildCommand(produced), tmpDir, {}, owns, hostPlatform,
+      )).toBe(true);
+    }
+  });
+
+  it.each([
+    ['a foreign target', (produced: string, foreign: string) => (
+      `Remove-Item -LiteralPath ${JSON.stringify(foreign)} -Force`
+    )],
+    ['mixed produced and foreign targets', (produced: string, foreign: string) => (
+      `rm -f ${JSON.stringify(produced)} ${JSON.stringify(foreign)}`
+    )],
+    ['recursive deletion', (produced: string) => `rm -rf ${JSON.stringify(produced)}`],
+    ['a dynamic environment target', () => 'Remove-Item -Force $env:TEMP_FILE'],
+    ['a wildcard target', () => 'Remove-Item -Force *.png'],
+    ['pipeline-fed PowerShell deletion', () => 'Get-ChildItem *.png | Remove-Item -Force'],
+  ])('rejects owned-file bypass for %s', async (_label, buildCommand) => {
+    const { lt } = await loadWithBashPerms();
+    const produced = path.join(tmpDir, 'generated.png');
+    const foreign = path.join(tmpDir, 'user.png');
+    const owns = (candidate: string) => candidate === produced;
+
+    expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(
+      buildCommand(produced, foreign), tmpDir, {}, owns,
+    )).toBe(false);
+  });
+
+  it('prompts for an opaque PowerShell command before attempting to spawn it', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: 'powershell -EncodedCommand UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwA=',
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(String(res.content)).not.toMatch(/ENOENT|not found|not recognized/i);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+    }
+  });
+
+  // A risky-but-harmless command: reading a file literally named `id_rsa`
+  // trips the sensitive_path category, while the underlying `cat` is allowed
+  // by core-agent's own bash sandbox and its output proves whether it ran.
+  const SECRET = 'SECRET-sentinel-7f3';
+  function makeKeyFile(): string {
+    const p = path.join(tmpDir, 'id_rsa');
+    fs.writeFileSync(p, SECRET);
+    return p;
+  }
+
+  it('blocks a sensitive-path command on deny and does NOT run it', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const key = makeKeyFile();
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => { bashPerms.respond(info.request_id, 'deny'); });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_READ_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(res.content).not.toContain(SECRET); // cat never ran
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('runs a risky command after the user allows it (allow_once)', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const key = makeKeyFile();
+    let prompts = 0;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => { prompts++; bashPerms.respond(info.request_id, 'allow_once'); });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain(SECRET); // cat ran
+      expect(prompts).toBe(1);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('all_files_auto runs a risky command with no prompt at all', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_auto');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const key = makeKeyFile();
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(prompted).toBe(false);
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain(SECRET);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('still requires confirmation for a host package change in all_files_auto', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_auto');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: 'winget install PostgreSQL.PostgreSQL',
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['system_package_change']);
+      expect(String(res.content)).not.toMatch(/ENOENT|not found|not recognized/i);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('inspects a deployment wrapper and denies its concrete database write before execution', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_auto');
+    const marker = path.join(tmpDir, 'deploy-wrapper-ran.txt');
+    const script = path.join(tmpDir, 'deploy_apply.py');
+    fs.writeFileSync(script, [
+      'import paramiko',
+      'sql = """DELETE FROM b_iblock_element_property',
+      'WHERE IBLOCK_PROPERTY_ID=190"""',
+      'ssh = paramiko.SSHClient()',
+      'ssh.exec_command(f\'mysql prod -e "{sql}"\')',
+      `open(${JSON.stringify(marker)}, 'w').write('ran')`,
+    ].join('\n'));
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command: "bash -lc 'python deploy_apply.py'" }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['external_mutation']);
+      expect(prompted?.external_mutations).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'database_write',
+          action: 'delete',
+          target: 'b_iblock_element_property',
+        }),
+      ]));
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it.each(['bash', 'process_session', 'bash-inline', ...(process.platform === 'win32' ? [] : ['bash-heredoc'])])('runs SQLite workspace verification through %s without an external-mutation prompt', async (toolName) => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    const { bundledRuntimeEnv } = await import('../../../src/main/util/bundled-runtime');
+    const python = bundledRuntimeEnv().ORKAS_PYTHON;
+    expect(python, 'the owning runtime supplies Python').toBeTruthy();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const script = path.join(tmpDir, 'verify.py');
+    // Single-quoted Python literals survive legacy Windows PowerShell's native
+    // -c argument marshalling; the SQL and workspace permission checks stay real.
+    fs.writeFileSync(script, [
+      'import sqlite3, pathlib',
+      "p = pathlib.Path('verification.db')",
+      'if p.exists(): p.unlink()',
+      'db = sqlite3.connect(p)',
+      "db.execute('CREATE TABLE results (value INTEGER)')",
+      "db.execute('INSERT INTO results VALUES (?)', (42,))",
+      'db.commit()',
+      "print(db.execute('SELECT value FROM results').fetchone()[0])",
+    ].join('\n'));
+    let prompts = 0;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => { prompts++; bashPerms.respond(info.request_id, 'deny'); });
+    try {
+      const quote = (p: string) => `'${p.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''")}'`;
+      const executable = `${process.platform === 'win32' ? '& ' : ''}${quote(python!)}`;
+      const source = fs.readFileSync(script, 'utf8');
+      const command = toolName === 'bash-inline' ? `${executable} -c ${quote(source)}`
+        : toolName === 'bash-heredoc' ? `${executable} - <<'PY'\n${source}\nPY` : `${executable} ${quote(script)}`;
+      const tool = lt.createLocalTools(OPTS).find(t => t.name === (toolName === 'process_session' ? toolName : 'bash'))!;
+      let result = await tool.execute(toolName !== 'process_session' ? { command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS } : { action: 'start', command }, makeCtx());
+      expect(result.isError, String(result.content)).toBeFalsy();
+      if (toolName === 'process_session') {
+        const session = JSON.parse(result.content).session_id;
+        await vi.waitFor(async () => {
+          result = await tool.execute({ action: 'read', session_id: session }, makeCtx());
+          expect(result.isError, result.content).toBeFalsy();
+          expect(JSON.parse(result.content).status).not.toBe('running');
+        }, { timeout: SHELL_SUCCESS_TIMEOUT_MS });
+      }
+      expect(result.content).toContain('42');
+      expect(fs.existsSync(path.join(tmpDir, 'verification.db'))).toBe(true);
+      expect(prompts).toBe(0);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it.each(['absolute outside', 'parent traversal', 'symlink escape', 'unknown connection', 'mixed connections', 'URI target', 'changed directory', 'shadowed module', ...(process.platform === 'win32' ? [] : ['shell-expanded source'])])(
+    'retains database approval for %s and creates no outside file', async (shape) => {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('all_files_auto');
+      await setTmpWorkspace();
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-sqlite-outside-'));
+      const target = path.join(outside, 'external.db');
+      const script = path.join(tmpDir, 'verify.py');
+      let database = target;
+      if (shape === 'parent traversal') database = path.relative(tmpDir, target);
+      if (shape === 'symlink escape') {
+        fs.symlinkSync(outside, path.join(tmpDir, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+        database = 'linked/external.db';
+      }
+      if (shape === 'URI target') database = 'file:' + target;
+      if (shape === 'changed directory') database = 'external.db';
+      if (shape === 'shell-expanded source') database = '${DB_TARGET}';
+      if (shape === 'shadowed module') {
+        database = ':memory:';
+        fs.writeFileSync(path.join(tmpDir, 'sqlite3.py'), 'from remote_client import connect');
+      }
+      const source = ['import sqlite3', `c = sqlite3.connect(${JSON.stringify(database)})`];
+      if (shape === 'unknown connection') source.push('c = remote_connection');
+      if (shape === 'mixed connections') source.push('local = sqlite3.connect(":memory:")', 'local.execute("CREATE TABLE results (value)")');
+      source.push('c.execute("CREATE TABLE results (value)")');
+      fs.writeFileSync(script, source.join('\n'));
+      const prompts: any[] = [];
+      bashPerms._setBroadcastForTest((_ch: string, info: any) => { prompts.push(info); bashPerms.respond(info.request_id, 'deny'); });
+      try {
+        const { bashTool } = await import('../../../src/core-agent/src/tools/builtin');
+        const execute = vi.spyOn(bashTool, 'execute').mockResolvedValue({ content: 'unexpected execution' });
+        try {
+          const quote = (p: string) => `'${p.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''")}'`;
+          const prefix = shape === 'changed directory' ? `cd ${quote(outside)}${process.platform === 'win32' ? ';' : ' &&'} ` : '';
+          const command = shape === 'shell-expanded source' ? `python - <<PY\n${source.join('\n')}\nPY` : `${prefix}python ${quote(script)}`;
+          const result = await lt.createLocalTools(OPTS).find(t => t.name === 'bash')!.execute({ command }, makeCtx());
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain('E_BASH_RISK_DENIED');
+          expect(prompts.some(p => p.reasons.includes('external_mutation'))).toBe(true);
+          expect(prompts.flatMap(p => p.external_mutations ?? []).every(f => !('resource' in f))).toBe(true);
+          expect(execute).not.toHaveBeenCalled();
+          expect(fs.existsSync(target)).toBe(false);
+        } finally { execute.mockRestore(); }
+      } finally { bashPerms._setBroadcastForTest(null); fs.rmSync(outside, { recursive: true, force: true }); }
+    },
+  );
+});
+
+describe('local-tools › bash produced files', () => {
+  it('fires onFileWritten for files created in the conversation workspace', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command:
+        'node -e "const fs=require(\'fs\');' +
+        'fs.mkdirSync(process.env.ORKAS_OUTPUT_DIR, { recursive: true });' +
+        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/report.docx\', \'doc\');' +
+        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/notes.md\', \'notes\');"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+    expect(produced).toContain(path.join(tmpDir, 'report.docx'));
+    expect(produced).toContain(path.join(tmpDir, 'notes.md'));
+  });
+
+  it('fires onFileWritten for files modified in the conversation workspace', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const target = path.join(tmpDir, 'draft.txt');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, 'v1');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: 'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/draft.txt\', \'v2\')"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(fs.readFileSync(target, 'utf8')).toBe('v2');
+    // The command changed a file that was already there, so the caller may
+    // present it without treating it as something Orkas produced.
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: true });
+  });
+
+  it('does not surface files written outside the conversation workspace as produced chips', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+    const outsideTarget = path.join(os.tmpdir(), `orkas-localtools-outside-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const outsideForSingleQuotedJs = outsideTarget.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+    try {
+      const res = await bash.execute({
+        command:
+          'node -e "const fs=require(\'fs\');' +
+          `fs.writeFileSync('${outsideForSingleQuotedJs}', '{}');` +
+          'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/visible.json\', \'{}\');"',
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+      }, makeCtx());
+
+      expect(res.isError).toBeFalsy();
+      const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+      expect(produced).toContain(path.join(tmpDir, 'visible.json'));
+      expect(produced).not.toContain(outsideTarget);
+    } finally {
+      fs.rmSync(outsideTarget, { force: true });
+    }
+  });
+
+  it('does not surface files from explicit git clone commands, but keeps generated outputs', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+    const fakeBin = path.join(tmpDir, 'fake-git-bin');
+    writeFakeCommand(fakeBin, 'git', `
+const fs = require('node:fs');
+fs.mkdirSync('vendor/src', { recursive: true });
+fs.writeFileSync('vendor/package.json', '{}');
+fs.writeFileSync('vendor/src/index.ts', 'x');
+`);
+
+    const res = await bash.execute({
+      command:
+        'git clone https://example.com/vendor.git\n' +
+        'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/summary.csv\', \'ok\')"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}` }));
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+    expect(produced).toContain(path.join(tmpDir, 'summary.csv'));
+    expect(produced).not.toContain(path.join(tmpDir, 'vendor', 'package.json'));
+    expect(produced).not.toContain(path.join(tmpDir, 'vendor', 'src', 'index.ts'));
+  });
+
+  it('does not surface explicit curl or wget downloads, but keeps generated outputs', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+    const fakeBin = path.join(tmpDir, 'fake-bin');
+    const downloadScript = `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const at = Math.max(args.indexOf('-o'), args.indexOf('-O'));
+if (at < 0 || !args[at + 1]) process.exit(2);
+fs.writeFileSync(args[at + 1], 'downloaded');
+`;
+    writeFakeCommand(fakeBin, 'curl', downloadScript);
+    writeFakeCommand(fakeBin, 'wget', downloadScript);
+
+    const res = await bash.execute({
+      command:
+        'curl -o downloaded.txt https://example.com/downloaded.txt\n' +
+        'wget -O fetched.json https://example.com/fetched.json\n' +
+        'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/generated.md\', \'# ok\')"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}` }));
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+    expect(produced).toContain(path.join(tmpDir, 'generated.md'));
+    expect(produced).not.toContain(path.join(tmpDir, 'downloaded.txt'));
+    expect(produced).not.toContain(path.join(tmpDir, 'fetched.json'));
+  });
+
+  it('tracks explicitly manifested outputs even inside a scan-skipped directory', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten })
+      .find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command:
+        'node -e "const fs=require(\'fs\');' +
+        'fs.mkdirSync(\'.cache\',{recursive:true});' +
+        'fs.writeFileSync(\'.cache/final.pdf\',\'pdf\');' +
+        'fs.appendFileSync(process.env.ORKAS_OUTPUT_MANIFEST,\'.cache/final.pdf\\n\')"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(onFileWritten).toHaveBeenCalledWith(path.join(tmpDir, '.cache', 'final.pdf'), { preExisting: false });
+    expect(fs.existsSync(path.join(tmpDir, '.orkas-output-manifest'))).toBe(false);
+  });
+});
+
+// ── Access mode + onFileWritten: write_file ─────────────────────────────
+
+describe('local-tools › write_file', () => {
+  it('refuses and does NOT create the file when no workspace scope is available', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'write_file')!;
+    const target = 'should-not-exist.txt';
+    const res = await wf.execute({ path: target, content: 'x' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, target))).toBe(false);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('creates the file and fires onFileWritten with the absolute path', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ userId: 'u1', onFileWritten }).find((t) => t.name === 'write_file')!;
+    const res = await wf.execute({ path: 'out/note.txt', content: 'hello' }, makeCtx());
+    expect(res.isError).toBeFalsy();
+    const abs = path.join(tmpDir, 'out', 'note.txt');
+    expect(fs.existsSync(abs)).toBe(true);
+    expect(fs.readFileSync(abs, 'utf8')).toBe('hello');
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+    expect(onFileWritten).toHaveBeenCalledWith(abs, { preExisting: false });
+  });
+
+  it('persists one complete large UTF-8 payload without applying the output-retry budget to storage', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const write = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find((tool) => tool.name === 'write_file')!;
+    const contentSchema = (write.inputSchema.properties as Record<string, any>).content;
+    const body = `<!doctype html>\n${'登录·🙂'.repeat(5_000)}`;
+    const target = path.join(tmpDir, 'out', 'complete-large.html');
+
+    expect(body.length).toBeGreaterThan(12_000);
+    expect(contentSchema.maxLength).toBeUndefined();
+    const result = await write.execute({ path: target, content: body }, makeCtx());
+
+    const expectedBytes = Buffer.byteLength(body, 'utf8');
+    const expectedHash = createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex');
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain(`total_bytes="${expectedBytes}"`);
+    expect(result.content).toContain(`file_hash="sha256:${expectedHash}"`);
+    expect(result.content).toMatch(/revision="file_rev_[A-Za-z0-9_-]{16}"/);
+    expect(result.content.length).toBeLessThan(body.length);
+    expect(result.content).not.toContain(body.slice(0, 256));
+    expect(fs.readFileSync(target, 'utf8')).toBe(body);
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects write_file when no uid or explicit writable roots define a scope', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const wf = lt.createLocalTools({}).find((t) => t.name === 'write_file')!;
+    const res = await wf.execute({ path: 'out/no-scope.txt', content: 'x' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_NO_SCOPE');
+    expect(fs.existsSync(path.join(tmpDir, 'out', 'no-scope.txt'))).toBe(false);
+  });
+
+  it('refuses scripts that reuse the Cloud SDK OAuth client for Workspace scopes', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'write_file')!;
+    const res = await wf.execute({
+      path: 'bad-oauth.py',
+      content: 'CLIENT_ID = "32555940559.apps.googleusercontent.com"\nSCOPES = "https://www.googleapis.com/auth/drive.readonly"\n',
+    }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
+    expect(fs.existsSync(path.join(tmpDir, 'bad-oauth.py'))).toBe(false);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire onFileWritten when the underlying write fails', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ userId: 'u1', onFileWritten }).find((t) => t.name === 'write_file')!;
+    // Writing to a path whose parent is a regular file forces mkdir to fail.
+    const blocker = path.join(tmpDir, 'blocker');
+    fs.writeFileSync(blocker, 'file not dir');
+    const res = await wf.execute({ path: 'blocker/child.txt', content: 'x' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('writes to the model-given path verbatim when no collision exists', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find((t) => t.name === 'write_file')!;
+    const target = path.join(tmpDir, 'note.md');
+    const res = await wf.execute({ path: target, content: 'hi' }, makeCtx());
+    expect(res.isError).toBeFalsy();
+    expect(fs.existsSync(target)).toBe(true);
+    expect(res.content).not.toContain('<file-renamed>');
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: false });
+  });
+
+  it('uniquifies basename and emits <file-renamed> when target exists and is not ours', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'note.md');
+    fs.writeFileSync(target, 'foreign');
+    const onFileWritten = vi.fn();
+    const wf = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find((t) => t.name === 'write_file')!;
+    const res = await wf.execute({ path: target, content: 'mine' }, makeCtx());
+    expect(res.isError).toBeFalsy();
+    const renamed = path.join(tmpDir, 'note-2.md');
+    expect(fs.existsSync(renamed)).toBe(true);
+    expect(fs.readFileSync(renamed, 'utf8')).toBe('mine');
+    expect(fs.readFileSync(target, 'utf8')).toBe('foreign'); // original untouched
+    expect(res.content).toContain('<file-renamed>');
+    expect(res.content).toContain('You requested: note.md');
+    expect(res.content).toContain('Saved as:      note-2.md');
+    // A uniquified path did not exist before this write.
+    expect(onFileWritten).toHaveBeenCalledWith(renamed, { preExisting: false });
+  });
+
+  it('overwrites in place (no rename) when hasProducedPath claims the target', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'draft.md');
+    fs.writeFileSync(target, 'v1');
+    const produced = new Set<string>([target]);
+    const onFileWritten = vi.fn((p: string) => { produced.add(p); });
+    const wf = lt.createLocalTools({
+      userId: 'u1',
+      onFileWritten,
+      hasProducedPath: (p) => produced.has(p),
+    }).find((t) => t.name === 'write_file')!;
+    const res = await wf.execute({ path: target, content: 'v2' }, makeCtx());
+    expect(res.isError).toBeFalsy();
+    expect(fs.readFileSync(target, 'utf8')).toBe('v2'); // overwritten, no -2
+    expect(fs.existsSync(path.join(tmpDir, 'draft-2.md'))).toBe(false);
+    expect(res.content).not.toContain('<file-renamed>');
+    // Overwriting our own earlier output is still production, not a write
+    // over a file the user brought.
+    expect(onFileWritten).toHaveBeenCalledWith(target, { preExisting: false });
+  });
+});
+
+describe('local-tools › append_file', () => {
+  it.each(['edit_file', 'apply_patch'])('appends using the fresh %s receipt across rounds, while rejecting the old revision', async (toolName) => {
+    // A02: read V1 -> edit V2 -> append with V1 failed because edit returned
+    // only a hash. Use actual receipts, with a fresh context for each round.
+    const { lt, perm } = await loadModules();
+    const ft = await import('../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const edit = tools.find((tool) => tool.name === toolName)!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = ft.createFileTools({ userId: 'u1' }).find((tool) => tool.name === 'read_files')!;
+    const runScopedLedger = new Map<string, unknown>();
+    const readFileState = new Map();
+    const round = () => ({ ...makeCtx(), state: { runScopedLedger, readFileState } });
+    const target = path.join(tmpDir, 'target.txt');
+    fs.writeFileSync(target, 'before\r\n');
+    const readBack = await read.execute({ paths: [{ path: target }] }, round());
+    const previous = /revision="([^"]+)"/.exec(readBack.content)![1];
+    const changed = await edit.execute(toolName === 'edit_file'
+      ? { path: target, old_string: 'before', new_string: '更新🙂' }
+      : { patch: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+更新🙂\n*** End Patch` }, round());
+    expect(changed.isError, changed.content).toBeFalsy();
+    const revision = toolName === 'edit_file'
+      ? /revision="([^"]+)"/.exec(changed.content)?.[1]
+      : JSON.parse(changed.content).files[0].revision;
+    expect(revision).toMatch(/^file_rev_[A-Za-z0-9_-]{16}$/);
+    expect(revision).not.toBe(previous);
+    expect(fs.readFileSync(target, 'utf8')).toBe('更新🙂\r\n');
+
+    const input = { path: target, content: 'tail\n', base_revision: revision };
+    const appended = await append.execute(input, round());
+    expect(appended.isError, appended.content).toBeFalsy();
+    const replayed = await append.execute(input, round());
+    expect(replayed.isError, replayed.content).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(target, 'utf8')).toBe('更新🙂\r\ntail\n');
+
+    const stale = await append.execute({ path: target, content: 'tail\n', base_revision: previous }, round());
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(target, 'utf8')).toBe('更新🙂\r\ntail\n');
+
+    const current = /revision="([^"]+)"/.exec(appended.content)![1];
+    fs.appendFileSync(target, 'external\n');
+    const external = await append.execute({ path: target, content: 'unseen\n', base_revision: current }, round());
+    expect(external.isError).toBe(true);
+    expect(external.content).toContain('E_STALE');
+    expect(fs.readFileSync(target, 'utf8')).toBe('更新🙂\r\ntail\nexternal\n');
+  });
+
+  it('binds patch revisions to each created or moved destination and omits deleted files', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const patch = tools.find((tool) => tool.name === 'apply_patch')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const ctx = makeCtx();
+    fs.writeFileSync(path.join(tmpDir, 'old.txt'), 'old\n');
+    fs.writeFileSync(path.join(tmpDir, 'deleted.txt'), 'gone\n');
+    const result = await patch.execute({ patch: [
+      '*** Begin Patch', '*** Add File: created.txt', '+created',
+      '*** Update File: old.txt', '*** Move to: moved.txt', '@@', '-old', '+moved',
+      '*** Delete File: deleted.txt', '*** End Patch',
+    ].join('\n') }, ctx);
+    expect(result.isError, result.content).toBeFalsy();
+    const [created, moved, deleted] = JSON.parse(result.content).files;
+    expect(created.revision).toMatch(/^file_rev_[A-Za-z0-9_-]{16}$/);
+    expect(moved.revision).toMatch(/^file_rev_[A-Za-z0-9_-]{16}$/);
+    expect(deleted).not.toHaveProperty('revision');
+    expect(fs.existsSync(path.join(tmpDir, 'deleted.txt'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, 'old.txt'))).toBe(false);
+    const crossed = await append.execute({ path: created.path, content: 'bad\n', base_revision: moved.revision }, ctx);
+    expect(crossed.isError).toBe(true);
+    expect(crossed.content).toContain('E_REVISION_PATH_MISMATCH');
+    expect(fs.readFileSync(created.path, 'utf8')).toBe('created\n');
+    for (const file of [created, moved]) {
+      const target = file.moved_to ?? file.path;
+      const appended = await append.execute({ path: target, content: 'tail\n', base_revision: file.revision }, ctx);
+      expect(appended.isError, appended.content).toBeFalsy();
+    }
+    expect(fs.readFileSync(created.path, 'utf8')).toBe('created\ntail\n');
+    expect(fs.readFileSync(moved.moved_to, 'utf8')).toBe('moved\ntail\n');
+  });
+
+  it.each(['edit_file', 'apply_patch'])('keeps %s revisions tied to committed bytes when a notification changes the file', async (toolName) => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'target.txt');
+    fs.writeFileSync(target, 'before\n');
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten: (p) => { fs.writeFileSync(p, 'external\n'); } });
+    const edit = tools.find((tool) => tool.name === toolName)!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const ctx = makeCtx();
+    const result = await edit.execute(toolName === 'edit_file'
+      ? { path: target, old_string: 'before', new_string: 'after' }
+      : { patch: `*** Begin Patch\n*** Update File: ${target}\n@@\n-before\n+after\n*** End Patch` }, ctx);
+    expect(result.isError, result.content).toBeFalsy();
+    const revision = toolName === 'edit_file'
+      ? /revision="([^"]+)"/.exec(result.content)?.[1]
+      : JSON.parse(result.content).files[0].revision;
+    expect(revision).toMatch(/^file_rev_[A-Za-z0-9_-]{16}$/);
+    const stale = await append.execute({ path: target, content: 'tail\n', base_revision: revision }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(target, 'utf8')).toBe('external\n');
+  });
+
+  it('carries a read_files revision across the model round that must separate the two calls', async () => {
+    // 2026-08-11 research-resume-durable-ledger: the agent read fetch_ledger.jsonl
+    // and evidence_ledger.jsonl, quoted the revisions the host had issued for
+    // them, and every append came back E_REVISION_UNKNOWN — four times, then the
+    // no-progress nudge. The tokens were genuine; the store was not.
+    // AgentRunner rebuilds ToolContext.state after every model round, and the
+    // model cannot form an append until it has seen the read result, so the two
+    // calls never share a round. Keeping the revisions on `state` made this
+    // handoff impossible in production while passing a test that reused one
+    // context — which is exactly what the previous regression here did.
+    const { lt, perm } = await loadModules();
+    const ft = await import('../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = ft.createFileTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'read_files')!;
+
+    // The runner injects this one map by reference into every round's state.
+    const runScopedLedger = new Map<string, unknown>();
+    const round = () => {
+      const ctx = makeCtx();
+      ctx.state.runScopedLedger = runScopedLedger;
+      return ctx;
+    };
+
+    const absolutePath = path.join(tmpDir, 'fetch_ledger.jsonl');
+    fs.writeFileSync(absolutePath, '{"kind":"fetch","n":1}\n', 'utf8');
+
+    const readBack = await read.execute({ paths: [{ path: absolutePath }] }, round());
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(readBack.content)?.[1];
+    expect(revision, 'read_files must hand back a revision').toBeTruthy();
+
+    // A different round object, as production always gives it.
+    const appended = await append.execute({
+      path: 'fetch_ledger.jsonl',
+      content: '{"kind":"fetch","n":2}\n',
+      base_revision: revision,
+    }, round());
+    expect(appended.isError, appended.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8'))
+      .toBe('{"kind":"fetch","n":1}\n{"kind":"fetch","n":2}\n');
+
+    // The refusal's own revision must survive the next round too: that is the
+    // recovery path the message tells the caller to take.
+    const other = path.join(tmpDir, 'evidence_ledger.jsonl');
+    fs.writeFileSync(other, 'x\n', 'utf8');
+    const refused = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'y\n',
+      base_revision: 'file_rev_neverIssuedAAAA',
+    }, round());
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain('E_REVISION_UNKNOWN');
+    expect(refused.observations?.fileFailure).toMatchObject({ reason: 'revision_unknown', revision_provided: true, revision_found: false });
+    const offered = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(refused.content)?.[1];
+    expect(offered).toBeTruthy();
+    const retried = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'y\n',
+      base_revision: offered,
+    }, round());
+    expect(retried.isError, retried.content).toBeFalsy();
+    expect(fs.readFileSync(other, 'utf8')).toBe('x\ny\n');
+
+    // A token from one run must not resolve in another.
+    const foreign = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'z\n',
+      base_revision: revision,
+    }, makeCtx());
+    expect(foreign.isError).toBe(true);
+    expect(foreign.content).toContain('E_REVISION_UNKNOWN');
+  });
+
+  it('appends to a file this run did not create, using the revision read_files returned', async () => {
+    // 2026-08-09 DeepResearcher E2E: appending to a fixture ledger failed three
+    // times (2x E_REVISION_UNKNOWN, 1x E_BAD_INPUT) and tripped the no-progress
+    // nudge, after which the agent abandoned per-row appends and invented a
+    // batched row shape the skill does not define — losing the acceptance
+    // feature. read_files now issues a revision (fff689156), so the documented
+    // path works; every existing append case starts from write_file, so nothing
+    // covered the read-first shape that actually failed.
+    const { lt, perm } = await loadModules();
+    const ft = await import('../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = ft.createFileTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'read_files')!;
+    const ctx = makeCtx();
+
+    // Pre-existing file: written to disk directly, never through a tool.
+    const relativePath = 'ledger.jsonl';
+    const absolutePath = path.join(tmpDir, relativePath);
+    fs.writeFileSync(absolutePath, '{"kind":"fetch","n":1}\n', 'utf8');
+
+    const readBack = await read.execute({ paths: [{ path: absolutePath }] }, ctx);
+    expect(readBack.isError).toBeFalsy();
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(readBack.content)?.[1];
+    expect(revision, 'read_files must hand back a revision for a text file').toBeTruthy();
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":2}\n',
+      base_revision: revision,
+    }, ctx);
+    expect(appended.isError, appended.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8'))
+      .toBe('{"kind":"fetch","n":1}\n{"kind":"fetch","n":2}\n');
+
+    // A revision read from one file must not authorise appending to another.
+    const otherPath = path.join(tmpDir, 'other.jsonl');
+    fs.writeFileSync(otherPath, 'x\n', 'utf8');
+    const crossed = await append.execute({
+      path: 'other.jsonl',
+      content: 'must not land\n',
+      base_revision: revision,
+    }, ctx);
+    expect(crossed.isError).toBe(true);
+    expect(crossed.content).toContain('E_REVISION_PATH_MISMATCH');
+    expect(crossed.observations?.fileFailure).toMatchObject({ reason: 'revision_path', revision_found: true });
+    expect(fs.readFileSync(otherPath, 'utf8')).toBe('x\n');
+
+    // A revision that predates an outside change is stale and writes nothing.
+    const staleRead = await read.execute({ paths: [{ path: absolutePath }] }, ctx);
+    const staleRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(staleRead.content)?.[1];
+    fs.appendFileSync(absolutePath, '{"kind":"fetch","n":3}\n', 'utf8');
+    const before = fs.readFileSync(absolutePath, 'utf8');
+    const stale = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":4}\n',
+      base_revision: staleRevision,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.observations?.fileFailure).toMatchObject({ reason: 'revision_changed', revision_matches: false });
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(before);
+    // The refusal hands back the current revision so the next attempt succeeds.
+    const recovered = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(stale.content)?.[1];
+    expect(recovered).toBeTruthy();
+    const retry = await append.execute({
+      path: relativePath,
+      content: '{"kind":"fetch","n":4}\n',
+      base_revision: recovered,
+    }, ctx);
+    expect(retry.isError, retry.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(`${before}{"kind":"fetch","n":4}\n`);
+  });
+
+  it('rejects empty content or a missing concurrency baseline without changing the file', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const relativePath = 'out/invalid-append.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const ctx = makeCtx();
+    const initial = await write.execute({ path: relativePath, content: 'kept' }, ctx);
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(initial.content)?.[1];
+    expect(revision).toBeTruthy();
+
+    const empty = await append.execute({
+      path: relativePath,
+      content: '',
+      base_revision: revision,
+    }, ctx);
+    expect(empty.isError).toBe(true);
+    expect(empty.content).toContain('E_BAD_INPUT');
+
+    const missingBaseline = await append.execute({
+      path: relativePath,
+      content: 'must not be appended',
+    }, ctx);
+    expect(missingBaseline.isError).toBe(true);
+    expect(missingBaseline.content).toContain('E_BAD_INPUT');
+    expect(missingBaseline.observations?.fileFailure).toMatchObject({ reason: 'append_precondition', revision_provided: false, size_provided: false, size_valid: false });
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe('kept');
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+  });
+
+  it('appends exact UTF-8 bytes once, accepts an identical replay, and rejects a stale different chunk', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const produced = new Set<string>();
+    const onFileWritten = vi.fn((p: string) => { produced.add(p); });
+    const tools = lt.createLocalTools({
+      userId: 'u1',
+      onFileWritten,
+      hasProducedPath: (p) => produced.has(p),
+    });
+    const write = tools.find((t) => t.name === 'write_file')!;
+    const append = tools.find((t) => t.name === 'append_file')!;
+    const abs = path.join(tmpDir, 'out', 'large.md');
+    const first = 'alpha\n';
+    const next = '第二块\n';
+
+    const written = await write.execute({ path: 'out/large.md', content: first }, makeCtx());
+    expect(written.isError).toBeFalsy();
+    const sizeMatch = written.content.match(/total_bytes="(\d+)"/);
+    expect(sizeMatch).not.toBeNull();
+    const expectedSize = Number(sizeMatch?.[1]);
+    const appended = await append.execute({
+      path: 'out/large.md',
+      content: next,
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    expect(appended.content).toContain(`total_bytes="${Buffer.byteLength(first + next, 'utf8')}"`);
+
+    const replayed = await append.execute({
+      path: 'out/large.md',
+      content: next,
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(abs, 'utf8')).toBe(first + next);
+
+    const stale = await append.execute({
+      path: 'out/large.md',
+      content: 'different',
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(abs, 'utf8')).toBe(first + next);
+    expect(onFileWritten).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses opaque revisions across read/write/append for multibyte text, replays safely, and returns a fresh revision after an external change', async () => {
+    const { lt, perm } = await loadModules();
+    const fileTools = await import('../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const produced = new Set<string>();
+    const onFileWritten = vi.fn((p: string) => { produced.add(p); });
+    const tools = lt.createLocalTools({
+      userId: 'u1',
+      onFileWritten,
+      hasProducedPath: (p) => produced.has(p),
+    });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = fileTools.createFileTools({ userId: 'u1' })
+      .find((tool) => tool.name === 'read_files')!;
+    const ctx = makeCtx();
+    const relativePath = 'out/revision-handoff.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const firstChunk = '登录与注册\n';
+    const secondChunk = '找回密码🙂\n';
+
+    const written = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    expect(written.isError).toBeFalsy();
+    const writtenRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(written.content)?.[1];
+    expect(writtenRevision).toBeTruthy();
+
+    const inspected = await read.execute({ paths: [{ path: relativePath }] }, ctx);
+    expect(inspected.isError).toBeFalsy();
+    expect(inspected.content).toContain(`revision="${writtenRevision}"`);
+    expect(inspected.content).toContain(`total_chars="${firstChunk.length}"`);
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: secondChunk,
+      base_revision: writtenRevision,
+      // Deliberately repeat the case bug: this is a UTF-16 character count,
+      // not the UTF-8 byte size. The opaque revision must be authoritative.
+      expected_size: firstChunk.length,
+    }, ctx);
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    const appendedRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(appended.content)?.[1];
+    expect(appendedRevision).toBeTruthy();
+    expect(appendedRevision).not.toBe(writtenRevision);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(firstChunk + secondChunk);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: secondChunk,
+      base_revision: writtenRevision,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(replayed.content).toContain(`revision="${appendedRevision}"`);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(firstChunk + secondChunk);
+
+    fs.appendFileSync(absolutePath, '外部修改\n', 'utf8');
+    const beforeRejectedAppend = fs.readFileSync(absolutePath, 'utf8');
+    const stale = await append.execute({
+      path: relativePath,
+      content: '不应写入\n',
+      base_revision: appendedRevision,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    const currentRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(stale.content)?.[1];
+    expect(currentRevision).toBeTruthy();
+    expect(currentRevision).not.toBe(appendedRevision);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(beforeRejectedAppend);
+
+    const recovered = await append.execute({
+      path: relativePath,
+      content: '确认后的追加\n',
+      base_revision: currentRevision,
+    }, ctx);
+    expect(recovered.isError).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(beforeRejectedAppend + '确认后的追加\n');
+    expect(onFileWritten).toHaveBeenCalledTimes(3);
+  });
+
+  it('binds revisions to one path and reports the current revision for unknown run-scoped tokens', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const ctx = makeCtx();
+    const first = await write.execute({ path: 'out/first.txt', content: 'first' }, ctx);
+    const second = await write.execute({ path: 'out/second.txt', content: 'second' }, ctx);
+    const firstRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(first.content)?.[1];
+    expect(firstRevision).toBeTruthy();
+    expect(second.isError).toBeFalsy();
+
+    const wrongPath = await append.execute({
+      path: 'out/second.txt',
+      content: 'nope',
+      base_revision: firstRevision,
+    }, ctx);
+    expect(wrongPath.isError).toBe(true);
+    expect(wrongPath.content).toContain('E_REVISION_PATH_MISMATCH');
+    expect(fs.readFileSync(path.join(tmpDir, 'out/second.txt'), 'utf8')).toBe('second');
+
+    const unknown = await append.execute({
+      path: 'out/first.txt',
+      content: 'nope',
+      base_revision: 'file_rev_AAAAAAAAAAAAAAAA',
+    }, makeCtx());
+    expect(unknown.isError).toBe(true);
+    expect(unknown.content).toContain('E_REVISION_UNKNOWN');
+    expect(unknown.content).toMatch(/revision="file_rev_[A-Za-z0-9_-]{16}"/);
+    expect(fs.readFileSync(path.join(tmpDir, 'out/first.txt'), 'utf8')).toBe('first');
+  });
+
+  it('persists complete UTF-8 appends across the former boundary with exact, compact receipts', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const contentSchema = (append.inputSchema.properties as Record<string, any>).content;
+    expect(contentSchema.maxLength).toBeUndefined();
+    expect((append.inputSchema.properties as Record<string, any>).base_revision).toMatchObject({
+      type: 'string',
+      pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
+    });
+    expect(append.inputSchema.required).toEqual(['path', 'content']);
+
+    const firstChunk = 'header\n';
+    const appendCases = [
+      { name: 'former boundary', content: 'A'.repeat(12_000) },
+      { name: 'one over former boundary', content: 'B'.repeat(12_001) },
+      // Exact size from the historical failed tool call.
+      { name: 'historical complete call', content: 'C'.repeat(13_395) },
+      { name: 'larger multibyte call', content: '界🙂'.repeat(10_000) },
+    ];
+    const expectedBody = firstChunk + appendCases.map((entry) => entry.content).join('');
+    const relativePath = 'out/super-large.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const ctx = makeCtx();
+
+    const first = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    expect(first.isError).toBeFalsy();
+    let expectedBytes = Buffer.byteLength(firstChunk, 'utf8');
+    expect(first.content).toContain(`total_bytes="${expectedBytes}"`);
+    let revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(first.content)?.[1];
+    expect(revision).toBeTruthy();
+    const originalRevision = revision;
+
+    for (const [index, appendCase] of appendCases.entries()) {
+      const { content: chunk } = appendCase;
+      expect(chunk.length, appendCase.name).toBeGreaterThanOrEqual(12_000);
+      const result = await append.execute({
+        path: relativePath,
+        content: chunk,
+        base_revision: revision,
+        // base_revision is authoritative even when a caller repeats the old
+        // character-count/byte-count mistake from the historical case.
+        ...(index === 2 ? { expected_size: 1 } : {}),
+      }, ctx);
+      expect(result.isError, appendCase.name).toBeFalsy();
+      expectedBytes += Buffer.byteLength(chunk, 'utf8');
+      expect(result.content).toContain(`total_bytes="${expectedBytes}"`);
+      expect(result.content).toContain('replayed="false"');
+      expect(result.content.length).toBeLessThan(chunk.length);
+      expect(result.content).not.toContain(chunk.slice(0, 256));
+      revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(result.content)?.[1];
+      expect(revision).toBeTruthy();
+    }
+
+    const expectedHash = createHash('sha256').update(Buffer.from(expectedBody, 'utf8')).digest('hex');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(fs.statSync(absolutePath).size).toBe(expectedBytes);
+    expect(createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex')).toBe(expectedHash);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: appendCases[0].content,
+      base_revision: originalRevision,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+
+    const staleLargeChunk = 'different'.repeat(2_000);
+    const stale = await append.execute({
+      path: relativePath,
+      content: staleLargeChunk,
+      base_revision: originalRevision,
+    }, ctx);
+    expect(staleLargeChunk.length).toBeGreaterThan(12_000);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex')).toBe(expectedHash);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+  });
+
+  it('keeps legacy expected_size compatible for large appends, including replay and stale recovery', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const relativePath = 'out/legacy-large.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const firstChunk = '初始\n';
+    const largeChunk = '界🙂'.repeat(5_000);
+    const ctx = makeCtx();
+
+    const first = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    const expectedSize = Buffer.byteLength(firstChunk, 'utf8');
+    expect(first.isError).toBeFalsy();
+    expect(largeChunk.length).toBeGreaterThan(12_000);
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: largeChunk,
+      expected_size: expectedSize,
+    }, ctx);
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    const expectedBody = firstChunk + largeChunk;
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: largeChunk,
+      expected_size: expectedSize,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+
+    const stale = await append.execute({
+      path: relativePath,
+      content: 'stale'.repeat(3_000),
+      expected_size: expectedSize,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(onFileWritten).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── Local access modes + PDF tools ──────────────────────────────────────
+
+describe('local-tools › create_pdf markdown', () => {
+  it('rejects an unknown source type without rendering or creating a file', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const output = path.join(tmpDir, 'unknown-source.pdf');
+    const createPdf = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'create_pdf')!;
+
+    const result = await createPdf.execute({
+      path: output,
+      source_type: 'text',
+      content: '# must not render',
+    }, makeCtx());
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('E_BAD_INPUT');
+    expect(printToPDF).not.toHaveBeenCalled();
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('preserves an existing target and reports the collision-safe saved path', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const requested = path.join(tmpDir, 'existing.pdf');
+    const saved = path.join(tmpDir, 'existing-2.pdf');
+    fs.writeFileSync(requested, 'user-owned-original');
+    const onFileWritten = vi.fn();
+    const createPdf = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find((t) => t.name === 'create_pdf')!;
+
+    const result = await createPdf.execute({
+      path: requested,
+      source_type: 'markdown',
+      content: '# Replacement',
+    }, makeCtx());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.readFileSync(requested, 'utf8')).toBe('user-owned-original');
+    expect(fs.existsSync(saved)).toBe(true);
+    expect(result.content).toContain('<file-renamed>');
+    expect(result.content).toContain('Saved as:      existing-2.pdf');
+    expect(onFileWritten).toHaveBeenCalledWith(saved);
+  });
+
+  it('refuses when no workspace scope is available', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const onFileWritten = vi.fn();
+    const mdpdf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'create_pdf')!;
+    const res = await mdpdf.execute({ path: 'x.pdf', source_type: 'markdown', content: '# hi' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(printToPDF).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('renders, writes to disk, and fires onFileWritten', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const mdpdf = lt.createLocalTools({ userId: 'u1', onFileWritten }).find((t) => t.name === 'create_pdf')!;
+    const rel = 'reports/weekly.pdf';
+    const res = await mdpdf.execute(
+      { path: rel, source_type: 'markdown', content: '# Title\n\nbody', title: 'Weekly' },
+      makeCtx(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(printToPDF).toHaveBeenCalledTimes(1);
+    const abs = path.join(tmpDir, rel);
+    expect(fs.existsSync(abs)).toBe(true);
+    expect(onFileWritten).toHaveBeenCalledWith(abs);
+    expect(res.content).toContain(abs);
+  });
+
+  it('passes pageSize and landscape through to printToPDF', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const mdpdf = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'create_pdf')!;
+    await mdpdf.execute(
+      { path: 'x.pdf', source_type: 'markdown', content: '# x', pageSize: 'Letter', landscape: true },
+      makeCtx(),
+    );
+    const args = printToPDF.mock.calls[0][0];
+    expect(args).toMatchObject({ pageSize: 'Letter', landscape: true });
+  });
+
+  it('returns isError when the underlying renderer throws', async () => {
+    printToPDF.mockRejectedValueOnce(new Error('kapow'));
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const mdpdf = lt.createLocalTools({ userId: 'u1', onFileWritten }).find((t) => t.name === 'create_pdf')!;
+    const res = await mdpdf.execute({ path: 'bad.pdf', source_type: 'markdown', content: '# x' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('kapow');
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('rejects output paths outside the writable scope before rendering', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-pdf-outside-'));
+    const outside = path.join(outsideDir, 'outside.pdf');
+    try {
+      const mdpdf = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'create_pdf')!;
+      const res = await mdpdf.execute({ path: outside, source_type: 'markdown', content: '# nope' }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(printToPDF).not.toHaveBeenCalled();
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('local-tools › create_pdf html', () => {
+  it('refuses when no workspace scope is available', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    const hp = lt.createLocalTools({}).find((t) => t.name === 'create_pdf')!;
+    const res = await hp.execute({ path: 'x.pdf', source_type: 'html', content: '<html></html>' }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(printToPDF).not.toHaveBeenCalled();
+  });
+
+  it('loads the HTML verbatim as a data: URL', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const hp = lt.createLocalTools({ userId: 'u1' }).find((t) => t.name === 'create_pdf')!;
+    const html = '<!DOCTYPE html><html><body><table><tr><td>X</td></tr></table></body></html>';
+    await hp.execute({ path: 'table.pdf', source_type: 'html', content: html }, makeCtx());
+    const url = loadURL.mock.calls[0][0];
+    const b64 = url.split('base64,')[1];
+    const decoded = Buffer.from(b64, 'base64').toString('utf8');
+    expect(decoded).toBe(html);
+  });
+
+  it('rejects output paths outside the writable scope before rendering', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-htmlpdf-outside-'));
+    const outside = path.join(outsideDir, 'outside.pdf');
+    try {
+      const hp = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'create_pdf')!;
+      const res = await hp.execute({ path: outside, source_type: 'html', content: '<html></html>' }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(printToPDF).not.toHaveBeenCalled();
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('bashCommandIsProvablyReadOnly (concurrency admission)', () => {
+  const load = async () => (await import('../../../src/main/model/core-agent/local-tools')).bashCommandIsProvablyReadOnly;
+
+  it('admits commands whose every segment reads only', async () => {
+    const ro = await load();
+    for (const command of [
+      'cat README.md',
+      'head -c 4096 data.bin',
+      'grep -rn "TODO" src | head -20',
+      'ls -la && pwd',
+      'find . -name "*.ts" -type f',
+      'test -f package.json && cat package.json',
+      'wc -l < notes.txt',
+      'FOO=1 grep foo a.txt',
+      // Commands with no filesystem operand (2026-09-18 extension).
+      'sleep 1',
+      'sleep 0.2 && date +%s',
+      'uname -a',
+      'whoami',
+      'hostname',
+      'id -u',
+      'which node',
+    ]) {
+      expect(ro(command, 'darwin'), command).toBe(true);
+    }
+    expect(ro('start-sleep -Seconds 1', 'win32')).toBe(true);
+    expect(ro('get-content a.txt > $null', 'win32')).toBe(true);
+  });
+
+  it('admits a null redirection only when the POSIX target is a real character device', async () => {
+    const ro = await load();
+    const mutableFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const stat = vi.spyOn(mutableFs, 'lstatSync');
+    syncBuiltinESMExports();
+    try {
+      stat.mockReturnValue({ isCharacterDevice: () => true } as fs.Stats);
+      expect(ro('rg --files src 2>/dev/null', 'darwin')).toBe(true);
+      expect(stat).toHaveBeenCalledWith('/dev/null');
+      stat.mockReturnValue({ isCharacterDevice: () => false } as fs.Stats);
+      expect(ro('rg --files src 2>/dev/null', 'darwin')).toBe(false);
+      stat.mockImplementation(() => { throw Object.assign(new Error('Missing device'), { code: 'ENOENT' }); });
+      expect(ro('rg --files src 2>/dev/null', 'darwin')).toBe(false);
+    } finally { stat.mockRestore(); syncBuiltinESMExports(); }
+  });
+
+  it('rejects look-alikes that write, run an interpreter, move, or hide a command', async () => {
+    const ro = await load();
+    for (const command of [
+      '',
+      '   ',
+      'echo hi > out.txt',
+      'cat a.log >> all.log',
+      'printf x > f',
+      "sed -i 's/a/b/' f.txt",
+      'ls | tee listing.txt',
+      'npm test',
+      'node -e "1"',
+      'python3 script.py',
+      'cd src && ls',
+      'cat a.txt; rm a.txt',
+      'ls $(pwd)',
+      'cat `ls`',
+      'cat <(ls)',
+      'find . -name "*.tmp" -delete',
+      'find . -name "*.tmp" -exec rm {} \\;',
+      'rg --pre cat needle .',
+      'cat a.txt > /dev/null/notreally',
+      // The extension does not loosen the structural rules.
+      'sleep 1 > marker',
+      'which node | tee which.txt',
+      'date +%s && npm test',
+      'sleep $(cat delay)',
+      'date --set=2030-01-01',
+      'date 091912002026',
+      'hostname changed-host',
+      'hostname -F names.txt',
+      'file -C -m magic',
+    ]) {
+      expect(ro(command, 'darwin'), command).toBe(false);
+    }
+    // A Windows null sink is the only accepted output redirection there too.
+    expect(ro('get-content a.txt > out.txt', 'win32')).toBe(false);
+    expect(ro('cat a.txt > $null', 'darwin')).toBe(false);
+  });
+});

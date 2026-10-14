@@ -1,0 +1,245 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
+
+vi.mock('electron', () => ({
+  app: { isPackaged: false },
+  ipcMain: { handle: vi.fn(), on: vi.fn() },
+  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
+  BrowserWindow: { getAllWindows: vi.fn(() => []), getFocusedWindow: vi.fn(() => null) },
+  shell: { showItemInFolder: vi.fn(), openPath: vi.fn(async () => '') },
+  systemPreferences: {
+    getMediaAccessStatus: vi.fn(() => 'granted'),
+    askForMediaAccess: vi.fn(async () => true),
+  },
+}));
+
+vi.mock('../../../src/main/features/kb_indexer', () => ({
+  enqueue: vi.fn(),
+  kbEvents: { on: vi.fn(), off: vi.fn(), emit: vi.fn() },
+}));
+
+vi.mock('../../../src/main/features/search', () => ({
+  upsertContext: vi.fn(),
+  dropContext: vi.fn(),
+}));
+
+vi.mock('../../../src/main/features/kb_vector', () => ({
+  findBySha1: vi.fn(() => null),
+  setFileStatus: vi.fn(async () => {}),
+}));
+
+let tmpDir: string;
+let prevWs: string | undefined;
+let closeLogWorkers: () => Promise<void>;
+const TEST_UID = 'uContextPickUpload';
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-context-pick-upload-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.resetModules();
+  closeLogWorkers = await captureMainLogWorkers();
+  vi.clearAllMocks();
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(TEST_UID);
+});
+
+afterEach(async () => {
+  await closeLogWorkers();
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function contextsRoot(): string {
+  return path.join(tmpDir, TEST_UID, 'cloud', 'contexts');
+}
+
+async function invoke(channel: string, payload: any): Promise<any> {
+  const electron = await import('electron') as any;
+  const { register } = await import('../../../src/main/ipc/index');
+  register();
+  const call = electron.ipcMain.handle.mock.calls.find(([name]: [string]) => name === 'orkas.invoke');
+  expect(call).toBeTruthy();
+  const handler = call[1];
+  return handler({ sender: trustedIpcSender() }, { channel, payload });
+}
+
+describe('contexts.pickAndUpload', () => {
+  it('offers XLS in the native Library picker and imports it without modifying bytes', async () => {
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    const source = path.join(tmpDir, 'inventory.xls');
+    fs.writeFileSync(source, bytes);
+    const electron = await import('electron') as any;
+    electron.dialog.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [source] });
+    const result = await invoke('contexts.pickAndUpload', {});
+    expect(result.ok).toBe(true);
+    const options = electron.dialog.showOpenDialog.mock.calls[0][0];
+    expect(options.filters[0].extensions).toContain('xls');
+    expect(fs.readFileSync(path.join(contextsRoot(), 'inventory.xls'))).toEqual(bytes);
+  });
+
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('contexts.pickAndUpload', {});
+
+    expect(res).toMatchObject({ ok: true, cancelled: true, files: [] });
+  });
+
+  it('rejects dot-prefixed and unsupported files returned by the native picker', async () => {
+    const sourceDir = path.join(tmpDir, 'source');
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const hidden = path.join(sourceDir, '.orkas-native-deps-verified.json');
+    const unsupported = path.join(sourceDir, 'tool.exe');
+    const visible = path.join(sourceDir, 'note.md');
+    fs.writeFileSync(hidden, '{}', 'utf8');
+    fs.writeFileSync(unsupported, 'MZ', 'utf8');
+    fs.writeFileSync(visible, '# note', 'utf8');
+
+    const electron = await import('electron') as any;
+    electron.dialog.showOpenDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [hidden, unsupported, visible],
+    });
+
+    const res = await invoke('contexts.pickAndUpload', {});
+    const opts = electron.dialog.showOpenDialog.mock.calls[0]?.[0];
+    const defaultPath = String(opts?.defaultPath || '');
+    expect(path.isAbsolute(defaultPath)).toBe(true);
+    expect([
+      path.resolve(tmpDir),
+      path.resolve(path.join(tmpDir, '..', 'userWorkSpace')),
+    ]).toContain(path.resolve(defaultPath));
+    expect(res.ok).toBe(true);
+    expect(res.cancelled).toBe(false);
+    expect(res.files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ok: false, name: '.orkas-native-deps-verified.json', reason: 'hidden' }),
+      expect.objectContaining({ ok: false, name: 'tool.exe', reason: 'ext' }),
+      expect.objectContaining({ ok: true, name: 'note.md', path: 'note.md' }),
+    ]));
+    expect(fs.existsSync(path.join(contextsRoot(), '.orkas-native-deps-verified.json'))).toBe(false);
+    expect(fs.existsSync(path.join(contextsRoot(), 'tool.exe'))).toBe(false);
+    expect(fs.readFileSync(path.join(contextsRoot(), 'note.md'), 'utf8')).toBe('# note');
+    const kb = await import('../../../src/main/features/kb_vector');
+    expect(kb.setFileStatus).toHaveBeenCalledExactlyOnceWith(TEST_UID, 'note.md', 'pending',
+      expect.objectContaining({ bytes: Buffer.byteLength('# note') }));
+  });
+
+  it.runIf(process.platform === 'darwin')('does not seed the native picker with a macOS media-library workspace', async () => {
+    const prevHome = process.env.HOME;
+    const prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
+    try {
+      process.env.ORKAS_TCC_GUARD_FORCE = '1';
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      const pictures = path.join(fakeHome, 'Pictures');
+      fs.mkdirSync(pictures, { recursive: true });
+      process.env.HOME = fakeHome;
+
+      const paths = await import('../../../src/main/paths');
+      const cfgFile = paths.userWorkspaceConfigFile(TEST_UID);
+      fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+      fs.writeFileSync(cfgFile, JSON.stringify({
+        selectedPath: pictures,
+        updatedAt: '2026-07-03T00:00:00.000Z',
+        recentPaths: [],
+      }), 'utf8');
+
+      const electron = await import('electron') as any;
+      electron.dialog.showOpenDialog.mockResolvedValueOnce({
+        canceled: true,
+        filePaths: [],
+      });
+
+      const res = await invoke('contexts.pickAndUpload', {});
+      const opts = electron.dialog.showOpenDialog.mock.calls[0]?.[0];
+      const defaultPath = String(opts?.defaultPath || '');
+      expect(res.ok).toBe(true);
+      expect(path.resolve(defaultPath)).not.toBe(path.resolve(pictures));
+      expect(defaultPath).not.toContain(`${path.sep}Pictures`);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
+      else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
+    }
+  });
+});
+
+describe('projects.files.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(TEST_UID, 'Picker cancellation project');
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error('project setup failed');
+
+    const res = await invoke('projects.files.pickAndUpload', {
+      projectId: created.project.project_id,
+      targetDir: '',
+    });
+
+    expect(res).toMatchObject({ ok: true, cancelled: true, files: [] });
+  });
+});
+
+describe('autoTasks.attachments.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('autoTasks.attachments.pickAndUpload', {
+      taskId: 'at_picker_cancel',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: true,
+      items: [],
+      failed: [],
+    });
+  });
+});
+
+describe('conversations.attachments.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('conversations.attachments.pickAndUpload', {
+      cid: 'chat_picker_cancel',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: true,
+      items: [],
+      failed: [],
+    });
+  });
+
+  it('imports a text file above 5 MiB through the native picker', async () => {
+    const source = path.join(tmpDir, 'large-events.csv');
+    const bytes = 6 * 1024 * 1024;
+    fs.writeFileSync(source, Buffer.alloc(bytes, 0x61));
+    const electron = await import('electron') as any;
+    electron.dialog.showOpenDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [source],
+    });
+
+    const res = await invoke('conversations.attachments.pickAndUpload', {
+      cid: 'chat_picker_large_text',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: false,
+      failed: [],
+      items: [
+        expect.objectContaining({
+          displayName: 'large-events.csv',
+          info: expect.objectContaining({
+            name: 'large-events.csv',
+            kind: 'text',
+            bytes,
+          }),
+        }),
+      ],
+    });
+  });
+});

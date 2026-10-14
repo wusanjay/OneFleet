@@ -1,0 +1,147 @@
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+
+export interface LocalImportSource {
+  absPath: string;
+  bytes: number;
+  mtimeMs: number;
+  sha1: string;
+}
+
+const _importLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serialize the small check-name/copy/publish critical section for one Library.
+ * Hashing stays outside the lock, while duplicate checks and unique-name
+ * allocation cannot race with another renderer window or native picker.
+ */
+export async function withLocalImportLock<T>(key: string, worker: () => Promise<T>): Promise<T> {
+  const previous = _importLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => current);
+  _importLocks.set(key, tail);
+  await previous.catch(() => {});
+  try {
+    return await worker();
+  } finally {
+    release();
+    if (_importLocks.get(key) === tail) _importLocks.delete(key);
+  }
+}
+
+export async function inspectLocalImportSource(absPath: string, maxBytes: number): Promise<LocalImportSource> {
+  if (!path.isAbsolute(absPath)) throw Object.assign(new Error('source path must be absolute'), { code: 'E_IMPORT_SOURCE' });
+  const lst = await fsp.lstat(absPath);
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    throw Object.assign(new Error('source must be a regular file'), { code: 'E_IMPORT_SOURCE' });
+  }
+  if (lst.size > maxBytes) {
+    throw Object.assign(new Error(`file exceeds ${Math.round(maxBytes / 1024 / 1024)}MB limit`), {
+      code: 'E_FILE_TOO_LARGE',
+      bytes: lst.size,
+    });
+  }
+  const hash = crypto.createHash('sha1');
+  const stream = fs.createReadStream(absPath);
+  for await (const chunk of stream) hash.update(chunk as Buffer);
+  return { absPath, bytes: lst.size, mtimeMs: lst.mtimeMs, sha1: hash.digest('hex') };
+}
+
+/** Reject an existing symlink anywhere below an owned Library root. */
+export async function assertLocalImportTarget(root: string, target: string): Promise<void> {
+  const base = path.resolve(root);
+  const absolute = path.resolve(target);
+  const relative = path.relative(base, absolute);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw Object.assign(new Error('invalid import target'), { code: 'E_IMPORT_TARGET' });
+  }
+  let current = base;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    try {
+      const stat = await fsp.lstat(current);
+      if (stat.isSymbolicLink()) {
+        throw Object.assign(new Error('symbolic links are not supported for Library imports'), {
+          code: 'E_IMPORT_TARGET_SYMLINK',
+        });
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw err;
+    }
+  }
+}
+
+/** Copy without loading file bytes into the Electron main-process heap. */
+export async function copyLocalFileAtomic(
+  source: string,
+  target: string,
+  expected?: Pick<LocalImportSource, 'bytes' | 'mtimeMs'>,
+): Promise<void> {
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  const temp = path.join(
+    path.dirname(target),
+    `.orkas-import-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`,
+  );
+  try {
+    await fsp.copyFile(source, temp);
+    if (expected) {
+      const [sourceAfter, tempAfter] = await Promise.all([fsp.stat(source), fsp.stat(temp)]);
+      if (
+        !sourceAfter.isFile()
+        || tempAfter.size !== expected.bytes
+        || sourceAfter.size !== expected.bytes
+        || Math.abs(sourceAfter.mtimeMs - expected.mtimeMs) > 1
+      ) {
+        throw Object.assign(new Error('source file changed during import; retry the upload'), {
+          code: 'E_IMPORT_SOURCE_CHANGED',
+        });
+      }
+    }
+    try {
+      // Publish the completed inode without replacing a path that appeared
+      // after the caller allocated the name. `rename` overwrites silently on
+      // POSIX and the old Windows fallback explicitly deleted the winner.
+      await fsp.link(temp, target);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw Object.assign(new Error('import target already exists'), {
+          code: 'E_IMPORT_TARGET_EXISTS',
+        });
+      }
+      throw err;
+    }
+  } finally {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+  }
+}
+
+export async function isUtf8File(absPath: string): Promise<boolean> {
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  const stream = fs.createReadStream(absPath);
+  try {
+    for await (const chunk of stream) {
+      decoder.decode(chunk as Buffer, { stream: true });
+    }
+    decoder.decode();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      return false;
+    }
+    throw err;
+  } finally {
+    // An invalid chunk ends iteration before the asynchronous handle close.
+    // Callers must be able to remove or replace the rejected source at once.
+    if (!stream.closed) {
+      await new Promise<void>((resolve) => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
+  }
+}

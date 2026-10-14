@@ -1,0 +1,3355 @@
+import { randomInt, randomUUID } from 'node:crypto';
+import { createServer, type Server } from 'node:http';
+import {
+  appendFileSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { AddressInfo } from 'node:net';
+import AdmZip from 'adm-zip';
+import { BackgroundServices } from './background-services';
+import { closeElectronFixture, requestElectronQuit } from './electron-cleanup';
+import { ownFixtureServer } from './server-cleanup';
+import {
+  _electron as electron,
+  expect,
+  test as base,
+  type ElectronApplication,
+  type Page,
+  type TestInfo,
+} from '@playwright/test';
+
+const PC_ROOT = path.resolve(__dirname, '../../..');
+// Shared E2E scenarios address this local registry identity directly. The
+// value is a fixture UID; it does not create an official account or session.
+const LOCAL_USER_ID = 'account-e2e';
+const { collectLogFiles } = require('./electron-log-files.cjs') as { collectLogFiles: (root: string) => string };
+/** Evidence files read per model round in the context-compaction scenario.
+ *  Four ~11.2K-token results stay well under the per-round inline allowance,
+ *  so the batch builds context instead of spilling to disk. */
+const CONTEXT_SOURCE_READS_PER_ROUND = 4;
+const E2E_PNG_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+const E2E_MP4_BYTES = Buffer.from([
+  0x00, 0x00, 0x00, 0x18,
+  0x66, 0x74, 0x79, 0x70,
+  0x69, 0x73, 0x6f, 0x6d,
+  0x00, 0x00, 0x02, 0x00,
+  0x69, 0x73, 0x6f, 0x6d,
+  0x69, 0x73, 0x6f, 0x32,
+]);
+
+type OrkasOptions = {
+  /** Exercise native capture on machines/evaluators without GPU compositing. */
+  softwareRendering?: boolean;
+  captureRendererErrorWindows?: boolean;
+  /** Keep storage-location probes isolated while allowing a non-temporary parent. */
+  rootParent?: string;
+  configuredModel?: boolean;
+  setDefaultViewport?: boolean;
+  modelStub?: boolean;
+  marketplaceStub?: boolean;
+  cliStub?: boolean;
+  updateStub?: boolean;
+  metacognitionEnabled?: boolean;
+  enableSystemProxy?: boolean;
+  /** Language persisted before launch. `null` deliberately leaves the
+   * preference absent so boot must detect Electron's system locale. */
+  seedLanguage?: 'en' | 'zh' | 'ja' | 'pt' | null;
+  /** Process-local system language override for deterministic first-boot E2E. */
+  appLocale?: string;
+};
+
+export type CliStubInvocation = {
+  cli: 'opencode' | 'hermes' | 'codex' | 'claude';
+  args: string[];
+  prompt: string;
+  resumeSessionId: string | null;
+  sessionId: string;
+  cwd?: string;
+  pwd?: string | null;
+  model?: string;
+  effort?: string;
+  toolExecuted?: boolean;
+  steers?: Array<{ id: string | null; text: string; localImages: string[] }>;
+};
+
+export type CliStubState = {
+  nextSession: number;
+  attempts: Record<string, number>;
+  toolExecutions: number;
+  invocations: CliStubInvocation[];
+  modelListCalls: number;
+  modelListResponses: number;
+};
+
+type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
+type SystemIdleState = 'active' | 'idle' | 'locked' | 'unknown';
+type AgentFanoutTarget = {
+  agentId: string;
+  task: string;
+  finalText: string;
+};
+type ModelToolScenario =
+  | {
+    kind: 'chat-commentary';
+    reads: Array<{ path: string; commentary: string }>;
+    finalText: string;
+  }
+  | { kind: 'connector'; connectorId: string }
+  | { kind: 'agent-authoring'; finalText: string }
+  | {
+    kind: 'create-pdf';
+    sourceType: 'markdown' | 'html';
+    content: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'bash-sequence';
+    commands: string[];
+    finalText: string;
+    nextCommandIndex: number;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'produced-file-cleanup';
+    filePath: string;
+    content: string;
+    deleteCommand: string;
+    finalText: string;
+    bashArgumentDelayMs: number;
+    writeIssued: boolean;
+    bashIssued: boolean;
+    writeToolLoadRequested: boolean;
+    bashToolLoadRequested: boolean;
+  }
+  | {
+    kind: 'interactive-cli';
+    command: string;
+    purpose: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'write-file';
+    filePath: string;
+    content: string;
+    finalText: string;
+    toolArgumentDelayMs?: number;
+    writeIssued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'generate-speech';
+    text: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'generate-image';
+    prompt: string;
+    outputPath: string;
+    finalText: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'generate-video';
+    prompt: string;
+    outputPath: string;
+    finalText: string;
+    referenceImagePath?: string;
+    issued: boolean;
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'agent-handoff';
+    agentId: string;
+    task: string;
+    finalText: string;
+    commanderNarration?: string;
+    holdAgentReply?: boolean;
+  }
+  | {
+    kind: 'interactive-agent-resume';
+    agentId: string;
+    task: string;
+    resume: string;
+    formText: string;
+    handbackText: string;
+    commanderFinalText: string;
+  }
+  | {
+    kind: 'agent-handoff-retry';
+    agentId: string;
+    task: string;
+    recoveryText: string;
+    recoveryEnabled: boolean;
+  }
+  | {
+    kind: 'agent-fanout';
+    targets: AgentFanoutTarget[];
+    commanderFinalText: string;
+  }
+  | {
+    kind: 'commander-segments';
+    narration: string;
+    agentId: string;
+    task: string;
+    agentFinalText: string;
+    synthesis: string;
+  }
+  | {
+    kind: 'project-history';
+    query: string;
+    sourceCid: string;
+    finalText: string;
+  }
+  | {
+    kind: 'project-instructions';
+    instructions: string;
+    finalText: string;
+    beforeTool?: Promise<void>;
+  }
+  | {
+    kind: 'knowledge-base';
+    query: string;
+    filePath: string;
+    expectedFact: string;
+    finalText: string;
+    nextAction: 'search' | 'read' | 'final';
+    toolLoadRequested: boolean;
+  }
+  | {
+    kind: 'context-compaction';
+    sources: Array<{ path: string; fact: string; charEnd: number }>;
+    nextSourceIndex: number;
+    finalText: string;
+    stallCompaction: boolean;
+  };
+
+function writeJson(filePath: string, value: unknown): void {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
+function writeNodeExecutable(directory: string, name: string, source: string): string {
+  mkdirSync(directory, { recursive: true });
+  const scriptName = `${name}.js`;
+  writeFileSync(path.join(directory, scriptName), source, 'utf8');
+  if (process.platform === 'win32') {
+    const launcher = path.join(directory, `${name}.cmd`);
+    const powershellLauncher = path.join(directory, `${name}.ps1`);
+    const safeNode = TEST_NODE.replace(/'/g, "''");
+    writeFileSync(launcher, [
+      '@echo off',
+      `"${TEST_NODE}" "%~dp0${scriptName}" %*`,
+      '',
+    ].join('\r\n'), 'utf8');
+    writeFileSync(powershellLauncher, [
+      '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
+      `& '${safeNode}' "$basedir/${scriptName}" $args`,
+      'exit $LASTEXITCODE',
+      '',
+    ].join('\r\n'), 'utf8');
+    return launcher;
+  }
+  const launcher = path.join(directory, name);
+  const safeNode = TEST_NODE.replace(/'/g, `'\\''`);
+  writeFileSync(launcher, [
+    '#!/bin/sh',
+    'case "$1" in',
+    "  --version|version) printf '%s\\n' '99.0.0'; exit 0 ;;",
+    'esac',
+    `exec '${safeNode}' "$(dirname "$0")/${scriptName}" "$@"`,
+    '',
+  ].join('\n'), 'utf8');
+  chmodSync(launcher, 0o755);
+  return launcher;
+}
+
+function fakeOpenCodeSource(): string {
+  return String.raw`
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('--version') || args[0] === 'version') {
+  process.stdout.write('99.0.0\n');
+  process.exit(0);
+}
+if (args[0] === 'models') {
+  process.stdout.write('openai/gpt-e2e\n');
+  process.exit(0);
+}
+if (args[0] === 'run' && args.includes('--help')) {
+  process.stdout.write('Usage: opencode run --model <id> --variant <name>\n');
+  process.exit(0);
+}
+const statePath = process.env.ORKAS_E2E_CLI_STATE;
+const blank = () => ({ nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [] });
+const readState = () => {
+  try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return blank(); }
+};
+const writeState = value => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.renameSync(tmp, statePath);
+};
+const state = readState();
+const sessionIndex = args.indexOf('--session');
+const resumeSessionId = sessionIndex >= 0 ? String(args[sessionIndex + 1] || '') : '';
+// The OpenCode backend supplies the prompt on stdin, not as the final argv.
+const prompt = fs.readFileSync(0, 'utf8');
+let marker = 'default';
+for (const candidate of [
+  'E2E_CLI_ESTABLISH_SESSION',
+  'E2E_CLI_RESUME_AFTER_RELAUNCH',
+  'E2E_CLI_RESTART_STALE_BINDING',
+  'E2E_CLI_SEND_NOW_ACTIVE',
+  'E2E_CLI_SEND_NOW_FOLLOWUP',
+  'E2E_OPENCODE_CUSTOM_PROJECT_DIR',
+]) {
+  if (prompt.includes(candidate)) marker = candidate;
+}
+const attempt = Number(state.attempts[marker] || 0) + 1;
+state.attempts[marker] = attempt;
+let sessionId = resumeSessionId;
+if (!sessionId) sessionId = 'opencode-e2e-' + String(++state.nextSession);
+const invocation = {
+  cli: 'opencode', args, prompt,
+  resumeSessionId: resumeSessionId || null,
+  sessionId,
+  cwd: process.cwd(),
+  pwd: process.env.PWD || null,
+};
+const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
+
+if (marker === 'E2E_CLI_SEND_NOW_ACTIVE') {
+  state.invocations.push(invocation);
+  writeState(state);
+  setTimeout(() => {
+    emit({ type: 'text', sessionID: sessionId, part: { text: 'E2E_CLI_SEND_NOW_ACTIVE_OK' } });
+  }, 4000);
+} else if (marker === 'E2E_CLI_RESUME_AFTER_RELAUNCH' && attempt === 1) {
+  invocation.toolExecuted = true;
+  state.toolExecutions += 1;
+  state.invocations.push(invocation);
+  writeState(state);
+  emit({ type: 'tool_use', sessionID: sessionId, part: { tool: 'exec_command', callID: 'e2e-tool-1', state: { status: 'running', input: { command: 'e2e-side-effect' } } } });
+  emit({ type: 'tool_use', sessionID: sessionId, part: { tool: 'exec_command', callID: 'e2e-tool-1', state: { status: 'completed', output: 'side-effect-complete' } } });
+  process.stderr.write('deterministic failure after tool execution\n');
+  process.exitCode = 7;
+} else if (marker === 'E2E_CLI_RESTART_STALE_BINDING' && attempt === 1) {
+  state.invocations.push(invocation);
+  writeState(state);
+  process.stderr.write('deterministic failure before a new session is observed\n');
+  process.exitCode = 7;
+} else if (marker === 'E2E_OPENCODE_CUSTOM_PROJECT_DIR') {
+  state.invocations.push(invocation);
+  writeState(state);
+  fs.writeFileSync('snake.html', '<main>deterministic snake</main>');
+  for (let index = 0; index < 4; index += 1) {
+    emit({ type: 'step_start', sessionID: sessionId, part: { id: 'step-' + index } });
+  }
+  emit({
+    type: 'tool_use', sessionID: sessionId,
+    part: {
+      tool: 'bash', callID: 'e2e-result-command',
+      state: {
+        status: 'completed',
+        input: { command: 'head -60 ' + process.cwd().replace(/ /g, '\\ ') + '/CLAUDE.md' },
+        output: 'deterministic command output',
+        time: { start: 100, end: 105 },
+      },
+    },
+  });
+  emit({
+    type: 'tool_use', sessionID: sessionId,
+    part: {
+      tool: 'write', callID: 'e2e-result-write',
+      state: {
+        status: 'completed',
+        input: {
+          filePath: process.cwd() + '/snake.html',
+          content: '<main>private event body</main>',
+        },
+        output: 'created snake.html',
+        time: { start: 200, end: 225 },
+      },
+    },
+  });
+  emit({ type: 'text', sessionID: sessionId, part: { text: 'E2E_CLI_DEFAULT_OK' } });
+} else {
+  state.invocations.push(invocation);
+  writeState(state);
+  let text = 'E2E_CLI_DEFAULT_OK';
+  if (marker === 'E2E_CLI_RESUME_AFTER_RELAUNCH') text = 'E2E_CLI_RESUMED_WITHOUT_DUPLICATE_TOOL';
+  if (marker === 'E2E_CLI_RESTART_STALE_BINDING') text = 'E2E_CLI_FRESH_RESTART_OK';
+  if (marker === 'E2E_CLI_ESTABLISH_SESSION') text = 'E2E_CLI_SESSION_ESTABLISHED';
+  if (marker === 'E2E_CLI_SEND_NOW_FOLLOWUP') text = 'E2E_CLI_SEND_NOW_FOLLOWUP_OK';
+  emit({ type: 'text', sessionID: sessionId, part: { text } });
+}
+`;
+}
+
+function fakeHermesSource(): string {
+  return String.raw`
+const fs = require('node:fs');
+const readline = require('node:readline');
+const args = process.argv.slice(2);
+if (args.includes('--version') || args[0] === 'version') {
+  process.stdout.write('Hermes Agent v99.0.0\n');
+  process.exit(0);
+}
+
+const statePath = process.env.ORKAS_E2E_CLI_STATE;
+const blank = () => ({ nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [] });
+const readState = () => {
+  try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return blank(); }
+};
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+let sessionId = '';
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', line => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.id === 1) {
+    send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
+    return;
+  }
+  if (message.id === 2) {
+    const state = readState();
+    sessionId = 'hermes-e2e-' + String(++state.nextSession);
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    send({ jsonrpc: '2.0', id: 2, result: { sessionId } });
+    return;
+  }
+  if (message.id === 100) {
+    const prompt = String(message.params?.prompt?.[0]?.text || '');
+    const state = readState();
+    state.invocations.push({
+      cli: 'hermes', args, prompt, resumeSessionId: null, sessionId,
+    });
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    let text = 'E2E_HERMES_FIRST_OK';
+    if (prompt.includes('E2E_HERMES_CONTINUE') && prompt.includes('E2E_HERMES_PRIOR_FACT')) {
+      text = 'E2E_HERMES_HISTORY_BRIDGED';
+    } else if (prompt.includes('E2E_HERMES_CONTINUE')) {
+      text = 'E2E_HERMES_HISTORY_MISSING';
+    } else if (prompt.includes('E2E_HERMES_LIMITS_CURRENT_TASK')) {
+      text = 'E2E_HERMES_LIMITS_OK';
+    }
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+    } });
+    send({ jsonrpc: '2.0', id: 100, result: { stopReason: 'end_turn' } });
+  }
+});
+`;
+}
+
+function fakeClaudeSource(): string {
+  return String.raw`
+const fs = require('node:fs');
+const readline = require('node:readline');
+const args = process.argv.slice(2);
+if (args.includes('--version') || args[0] === 'version') {
+  process.stdout.write('2.1.148 (Claude Code)\n');
+  process.exit(0);
+}
+if (args.includes('--help')) {
+  process.stdout.write('Usage: claude --model <model> --effort <level>\n');
+  process.exit(0);
+}
+const statePath = process.env.ORKAS_E2E_CLI_STATE;
+const blank = () => ({
+  nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [],
+  modelListCalls: 0, modelListResponses: 0,
+});
+const readState = () => {
+  try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return blank(); }
+};
+const writeState = state => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+const argValue = name => {
+  const index = args.indexOf(name);
+  return index >= 0 ? String(args[index + 1] || '') : '';
+};
+const requestedModel = argValue('--model');
+const effort = argValue('--effort');
+const resumeSessionId = argValue('--resume');
+const concreteModels = {
+  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-6',
+  haiku: 'claude-haiku-4-5',
+};
+const concreteModel = concreteModels[requestedModel] || requestedModel || 'claude-sonnet-4-6';
+const input = readline.createInterface({ input: process.stdin });
+let handled = false;
+input.on('line', line => {
+  if (handled) return;
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.type === 'control_request' && message.request?.subtype === 'list_models') {
+    send({ type: 'control_response', response: {
+      subtype: 'success',
+      request_id: message.request_id,
+      response: { models: [
+        { value: 'default', resolvedModel: concreteModels.sonnet, displayName: 'Default (recommended)' },
+        {
+          value: 'sonnet', resolvedModel: concreteModels.sonnet, displayName: 'Sonnet',
+          supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        },
+        {
+          value: 'opus', resolvedModel: concreteModels.opus, displayName: 'Opus',
+          supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        },
+        { value: 'haiku', resolvedModel: concreteModels.haiku, displayName: 'Haiku' },
+      ] },
+    } });
+    return;
+  }
+  if (message.type !== 'user') return;
+  handled = true;
+  const prompt = String(message.message?.content?.[0]?.text || '');
+  const state = readState();
+  const sessionId = resumeSessionId || 'claude-e2e-' + String(++state.nextSession);
+  state.invocations.push({
+    cli: 'claude', args, prompt,
+    resumeSessionId: resumeSessionId || null,
+    sessionId,
+    model: requestedModel || undefined,
+    effort: effort || undefined,
+  });
+  writeState(state);
+  send({ type: 'system', subtype: 'init', session_id: sessionId });
+  send({
+    type: 'assistant', session_id: sessionId,
+    message: {
+      model: concreteModel,
+      usage: { input_tokens: 12, output_tokens: 8 },
+      content: [{ type: 'text', text: 'E2E_CLAUDE_MODEL_RESOLVED' }],
+    },
+  });
+  send({
+    type: 'result', subtype: 'success', session_id: sessionId,
+    result: 'E2E_CLAUDE_MODEL_RESOLVED',
+    usage: { input_tokens: 12, output_tokens: 8 },
+    message: { model: concreteModel },
+  });
+});
+`;
+}
+
+function fakeCodexSource(): string {
+  return String.raw`
+const fs = require('node:fs');
+const readline = require('node:readline');
+const args = process.argv.slice(2);
+if (args.includes('--version') || args[0] === 'version') {
+  process.stdout.write('codex-cli 99.0.0\n');
+  process.exit(0);
+}
+const statePath = process.env.ORKAS_E2E_CLI_STATE;
+const blank = () => ({
+  nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [],
+  modelListCalls: 0, modelListResponses: 0,
+});
+const readState = () => {
+  try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return blank(); }
+};
+const writeState = state => fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+let threadId = '';
+let turnId = '';
+let invocationIndex = -1;
+let resumedThreadId = '';
+const finish = text => {
+  send({ method: 'item/started', params: {
+    threadId, turnId,
+    item: { id: 'answer-steer', type: 'agentMessage', phase: 'final_answer' },
+  } });
+  send({ method: 'item/agentMessage/delta', params: {
+    threadId, turnId, itemId: 'answer-steer', delta: text,
+  } });
+  send({ method: 'item/completed', params: {
+    threadId, turnId,
+    item: { id: 'answer-steer', type: 'agentMessage', phase: 'final_answer', text },
+  } });
+  send({ method: 'turn/completed', params: {
+    threadId, turn: { id: turnId, status: 'completed' },
+  } });
+};
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', line => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'orkas-e2e-codex' } });
+    return;
+  }
+  if (message.method === 'model/list') {
+    const state = readState();
+    state.modelListCalls += 1;
+    writeState(state);
+    const data = state.modelListCalls === 3 ? [] : [
+        {
+          id: 'gpt-e2e-default',
+          model: 'gpt-e2e-default',
+          displayName: 'GPT E2E Default',
+          isDefault: true,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'low', description: 'Fast' },
+            { reasoningEffort: 'high', description: 'Deep' },
+          ],
+        },
+        {
+          id: 'gpt-e2e-deep',
+          model: 'gpt-e2e-deep',
+          displayName: 'GPT E2E Deep',
+          isDefault: false,
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'low', description: 'Fast' },
+            { reasoningEffort: 'high', description: 'Deep' },
+          ],
+        },
+      ];
+    if (state.modelListCalls >= 2 && state.modelListCalls !== 3) {
+      data.push({
+        id: 'gpt-e2e-fresh',
+        model: 'gpt-e2e-fresh',
+        displayName: 'GPT E2E Fresh',
+        isDefault: false,
+        defaultReasoningEffort: 'low',
+        supportedReasoningEfforts: [
+          { reasoningEffort: 'low', description: 'Fast' },
+          { reasoningEffort: 'high', description: 'Deep' },
+        ],
+      });
+    }
+    const respond = () => {
+      const latest = readState();
+      latest.modelListResponses += 1;
+      writeState(latest);
+      send({ id: message.id, result: { data, nextCursor: null } });
+    };
+    if (state.modelListCalls === 2) setTimeout(respond, 5000);
+    else respond();
+    return;
+  }
+  if (message.method === 'thread/start' || message.method === 'thread/resume') {
+    const state = readState();
+    resumedThreadId = message.method === 'thread/resume'
+      ? String(message.params?.threadId || '')
+      : '';
+    threadId = resumedThreadId || 'codex-e2e-' + String(++state.nextSession);
+    writeState(state);
+    send({ id: message.id, result: { threadId } });
+    return;
+  }
+  if (message.method === 'turn/start') {
+    turnId = 'turn-e2e-1';
+    const prompt = String(message.params?.input?.find(part => part.type === 'text')?.text || '');
+    const state = readState();
+    invocationIndex = state.invocations.length;
+    state.invocations.push({
+      cli: 'codex', args, prompt,
+      resumeSessionId: resumedThreadId || null,
+      sessionId: threadId,
+      model: message.params?.model,
+      effort: message.params?.effort,
+      steers: [],
+    });
+    writeState(state);
+    send({ id: message.id, result: { turn: { id: turnId } } });
+    send({ method: 'turn/started', params: {
+      threadId, turn: { id: turnId, status: 'inProgress' },
+    } });
+    if (prompt.includes('E2E_CODEX_ASYNC_QUESTION')) {
+      send({ method: 'item/completed', params: { threadId, turnId, item: {
+        id: 'async-question', type: 'agentMessage', delivery: 'async', text: 'Which scope?',
+        questions: [{ title: 'Which scope?', options: ['Current', 'All'] }],
+      } } });
+    }
+    if (!prompt.includes('E2E_CODEX_SEND_NOW_ACTIVE')) finish('E2E_CODEX_DEFAULT_OK');
+    return;
+  }
+  if (message.method === 'turn/steer') {
+    const state = readState();
+    const richInput = Array.isArray(message.params?.input) ? message.params.input : [];
+    const text = richInput.filter(part => part.type === 'text').map(part => String(part.text || '')).join('\n');
+    const localImages = richInput.filter(part => part.type === 'localImage').map(part => String(part.path || ''));
+    const invocation = state.invocations[invocationIndex];
+    if (invocation) {
+      invocation.steers.push({
+        id: message.params?.clientUserMessageId || null,
+        text,
+        localImages,
+      });
+    }
+    writeState(state);
+    send({ id: message.id, result: { turnId } });
+    finish(text.includes('E2E_CODEX_SEND_NOW_UPDATE')
+      ? 'E2E_CODEX_STEER_APPLIED'
+      : 'E2E_CODEX_STEER_MISSING');
+  }
+});
+`;
+}
+function seedUserWorkspace(workspaceRoot: string, userId: string, seedLanguage: OrkasOptions['seedLanguage'] = 'en'): void {
+  writeJson(path.join(workspaceRoot, userId, 'cloud', 'config', 'preferences.json'), {
+    ...(seedLanguage ? { language: seedLanguage } : {}), task_notifications_enabled: true,
+    metacognition_enabled: false, global_skill_roots_enabled: false,
+  });
+}
+
+function seedWorkspace(workspaceRoot: string, seedLanguage: OrkasOptions['seedLanguage'] = 'en'): void {
+  const userId = LOCAL_USER_ID;
+  writeJson(path.join(workspaceRoot, 'open-users.json'), {
+    open_current_user_id: userId,
+    users: [{ user_id: userId, created_at: '2026-01-01T00:00:00.000Z' }],
+  });
+  seedUserWorkspace(workspaceRoot, userId, seedLanguage);
+}
+
+
+export class OrkasTestApp {
+  readonly root: string;
+  readonly workspaceRoot: string;
+  readonly userWorkspaceRoot: string;
+  readonly userDataRoot: string;
+  readonly authRoot: string;
+  readonly configuredModel: boolean;
+  readonly setDefaultViewport: boolean;
+  readonly modelStub: boolean;
+  readonly marketplaceStub: boolean;
+  readonly cliStub: boolean;
+  readonly updateStub: boolean;
+  readonly metacognitionEnabled: boolean;
+  readonly enableSystemProxy: boolean;
+  readonly appLocale: string;
+  readonly cliStatePath: string;
+  readonly fakeOpenCodePath: string | null;
+  readonly fakeHermesPath: string | null;
+  readonly fakeCodexPath: string | null;
+  readonly fakeClaudePath: string | null;
+  readonly modelRequests: Array<Record<string, unknown>> = [];
+  readonly imageGenerationRequests: Array<Record<string, unknown>> = [];
+  readonly videoEstimateRequests: Array<Record<string, unknown>> = [];
+  readonly videoGenerationRequests: Array<Record<string, unknown>> = [];
+  readonly generationReferenceUploads: Array<{
+    bytes: number;
+    contentType: string;
+    contentMd5: string;
+    acl: string;
+    encryption: string;
+    body: string;
+  }> = [];
+  readonly marketplaceRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
+  readonly apiRequests: Array<{ method: string; path: string; channel: string }> = [];
+  compactionRequestAborts = 0;
+  imageTaskPolls = 0;
+  videoTaskPolls = 0;
+
+  electronApp: ElectronApplication | null = null;
+  page: Page | null = null;
+  async openPreview(action: () => Promise<unknown>): Promise<Page> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    const opened = this.electronApp.waitForEvent('window');
+    await action();
+    const preview = await opened;
+    await preview.waitForLoadState('domcontentloaded');
+    return preview;
+  }
+  async closePreview(preview: Page): Promise<void> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    const native = await this.electronApp.browserWindow(preview);
+    await native.evaluate(win => win.close());
+    await expect.poll(() => preview.isClosed()).toBe(true);
+  }
+  lastLaunchReadyMs: number | null = null;
+
+  private apiServer: Server | null = null;
+  private disposeApiServer: (() => Promise<void>) | null = null;
+  private apiBaseUrl = 'http://127.0.0.1:9/api';
+  private modelStubMode: ModelStubMode = 'success';
+  private clientConfigGeneration = 0;
+  private clientConfigImmediate: Record<string, unknown> = {
+    'feature.e2e_published': 'generation-a',
+  };
+  private readonly modelTimers = new Set<ReturnType<typeof setTimeout>>();
+  private controlledModelStream: {
+    chunkReady: Promise<void>;
+    finishReady: Promise<void>;
+    releaseChunk: () => void;
+    releaseFinish: () => void;
+  } | null = null;
+  private readonly testInfo: TestInfo;
+  private readonly diagnostics: string[] = [];
+  private readonly rendererPageErrors: Array<{ diagnosticIndex: number; detail: string }> = [];
+  private readonly rendererErrors: Array<{ diagnosticIndex: number; type: string; windowId: Promise<number | null> }> = [];
+  private readonly recoveredRendererErrors = new Set<number>();
+  private readonly tracePaths: string[] = [];
+  private traceNumber = 0;
+  private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
+  private activeUserId: string;
+  private readonly configuredModelSeededUsers = new Set<string>();
+  private modelToolScenario: ModelToolScenario | null = null;
+  private generatedImageBytes = Buffer.from(E2E_PNG_B64, 'base64');
+  private generatedVideoBytes = E2E_MP4_BYTES;
+  private modelToolScenarioRequestStart = 0;
+  private pendingAgentHandoffReply: (() => void) | null = null;
+  private pendingCommentaryReply: (() => void) | null = null;
+  commentaryStage = 0;
+  private modelTextReplies: string[] = [];
+  private libraryImageDescriptionReplies: string[] = [];
+
+  constructor(testInfo: TestInfo, private readonly options: OrkasOptions = {}) {
+    this.testInfo = testInfo;
+    this.configuredModel = options.configuredModel !== false;
+    this.setDefaultViewport = options.setDefaultViewport !== false;
+    this.modelStub = options.modelStub === true;
+    this.marketplaceStub = options.marketplaceStub === true;
+    this.cliStub = options.cliStub === true;
+    this.updateStub = options.updateStub === true;
+    this.metacognitionEnabled = options.metacognitionEnabled === true;
+    this.enableSystemProxy = options.enableSystemProxy === true;
+    this.appLocale = options.appLocale || '';
+    this.root = mkdtempSync(path.join(options.rootParent ?? tmpdir(), 'orkas-e2e-'));
+    this.workspaceRoot = path.join(this.root, 'workspace');
+    this.userWorkspaceRoot = path.join(this.root, 'userWorkSpace');
+    this.userDataRoot = path.join(this.root, 'electron-user-data');
+    this.authRoot = path.join(this.root, 'core-agent-auth');
+    this.activeUserId = LOCAL_USER_ID;
+    this.cliStatePath = path.join(this.root, 'cli-stub-state.json');
+    // Match the layout of npm-installed Windows CLI shims. The production
+    // launcher deliberately applies a second metacharacter-escaping pass for
+    // node_modules/.bin/*.cmd because those shims forward argv through `%*`.
+    const cliBinRoot = path.join(this.root, 'cli-bin', 'node_modules', '.bin');
+    this.fakeOpenCodePath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'opencode-e2e', fakeOpenCodeSource())
+      : null;
+    this.fakeHermesPath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'hermes-e2e', fakeHermesSource())
+      : null;
+    this.fakeCodexPath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'codex-e2e', fakeCodexSource())
+      : null;
+    this.fakeClaudePath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'claude-e2e', fakeClaudeSource())
+      : null;
+    if (this.cliStub) {
+      writeJson(this.cliStatePath, {
+        nextSession: 0,
+        attempts: {},
+        toolExecutions: 0,
+        invocations: [],
+        modelListCalls: 0,
+        modelListResponses: 0,
+      } satisfies CliStubState);
+    }
+    seedWorkspace(this.workspaceRoot, options.seedLanguage);
+    if (this.updateStub) {
+      writeJson(
+        path.join(this.workspaceRoot, this.activeUserId, 'local', 'config', 'remote-config.json'),
+        {
+          version: 1,
+          etag: `"sha256:e2e-client-config-generation"`,
+          config_hash: 'sha256:e2e-client-config-generation',
+          last_request_at_ms: Date.now(),
+          active: {
+            immediate: { 'feature.e2e_published': 'generation-a' },
+            restart: {},
+          },
+          fetched_at_ms: Date.now(),
+        },
+      );
+    }
+    mkdirSync(this.userDataRoot, { recursive: true });
+    mkdirSync(this.authRoot, { recursive: true });
+    mkdirSync(this.userWorkspaceRoot, { recursive: true });
+  }
+
+  async launch(): Promise<void> {
+    if (this.electronApp) throw new Error('Orkas Electron app is already running');
+    this.lastLaunchReadyMs = null;
+    if (this.modelStub || this.marketplaceStub || this.updateStub) await this.ensureStubServer();
+    const launchStartedAt = Date.now();
+
+    const environment: NodeJS.ProcessEnv = {
+      ...process.env,
+      ORKAS_WORKSPACE_ROOT: this.workspaceRoot,
+      ORKAS_E2E_USER_DATA_DIR: this.userDataRoot,
+      ORKAS_E2E_HIDE_WINDOW: process.env.PWDEBUG === '1' || process.env.ORKAS_E2E_SHOW_WINDOW === '1' ? '0' : '1',
+      CORE_AGENT_AUTH_DIR: this.authRoot,
+      ORKAS_API_BASE_URL: this.apiBaseUrl,
+      ORKAS_E2E_MARKETPLACE_API_BASE: this.marketplaceStub ? this.apiBaseUrl : '',
+      ORKAS_METACOGNITION: this.metacognitionEnabled ? '1' : '0',
+      ORKAS_NO_AUTO_PROXY: this.enableSystemProxy ? '0' : '1',
+      ORKAS_PROFILE: 'global',
+      NO_PROXY: 'localhost,127.0.0.1,::1',
+      no_proxy: 'localhost,127.0.0.1,::1',
+      TZ: 'UTC',
+    };
+    // Automation shells can use Electron as their Node runtime and leak this
+    // switch into child processes. Playwright must launch Electron in app mode.
+    delete environment.ELECTRON_RUN_AS_NODE;
+    // Preserve no-color output without leaking contradictory runner settings
+    // into Electron's stderr (which the app records as console errors).
+    // Playwright forces worker color. Restore the caller's plain-output intent
+    // at the Electron boundary without reintroducing conflicting controls.
+    if (environment.NO_COLOR !== undefined || environment.ORKAS_E2E_NO_COLOR === '1') {
+      environment.NO_COLOR = '1';
+      delete environment.FORCE_COLOR;
+    }
+    delete environment.ORKAS_E2E_NO_COLOR;
+    if (this.cliStub) {
+      environment.ORKAS_E2E_CLI_STATE = this.cliStatePath;
+      environment.ORKAS_OPENCODE_PATH = this.fakeOpenCodePath || '';
+      environment.ORKAS_HERMES_PATH = this.fakeHermesPath || '';
+      environment.ORKAS_CODEX_PATH = this.fakeCodexPath || '';
+      environment.ORKAS_CLAUDE_PATH = this.fakeClaudePath || '';
+      environment.ORKAS_TEST_NODE = TEST_NODE;
+    }
+    for (const proxyName of [
+      'HTTP_PROXY',
+      'HTTPS_PROXY',
+      'ALL_PROXY',
+      'http_proxy',
+      'https_proxy',
+      'all_proxy',
+    ]) {
+      delete environment[proxyName];
+    }
+    // Source E2E must exercise Electron's own dev-channel resolution. A parent
+    // release shell may carry either override and would otherwise make the
+    // observed request metadata depend on the developer's terminal.
+    delete environment.ORKAS_CLIENT_CHANNEL;
+    delete environment.ORKAS_CHANNEL;
+    // Chromium's --lang does not change getPreferredSystemLanguages() on macOS.
+    // Override this process's AppleLanguages too, without changing host defaults.
+    const localeArgs = this.appLocale ? [
+      `--lang=${this.appLocale}`,
+      ...(process.platform === 'darwin' ? ['-AppleLanguages', `(${this.appLocale})`] : []),
+    ] : [];
+    const app = await electron.launch({
+      args: [...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), '.', ...localeArgs],
+      cwd: PC_ROOT,
+      env: environment,
+      timeout: 30_000,
+    });
+    this.electronApp = app;
+
+    app.process().stdout?.on('data', (data) => {
+      this.diagnostics.push(`[main:stdout] ${String(data).trimEnd()}`);
+    });
+    app.process().stderr?.on('data', (data) => {
+      this.diagnostics.push(`[main:stderr] ${String(data).trimEnd()}`);
+    });
+
+    await app.context().tracing.start({
+      screenshots: true,
+      snapshots: true,
+      sources: true,
+    });
+
+    const observed = new WeakSet<Page>();
+    const observePage = (surface: Page) => {
+      if (observed.has(surface)) return;
+      observed.add(surface);
+      const windowId = this.options.captureRendererErrorWindows
+        ? app.browserWindow(surface).then(async win => {
+          try { return await win.evaluate(value => value.id); } finally { await win.dispose(); }
+        }).catch(() => null)
+        : Promise.resolve(null);
+      surface.on('console', message => {
+        const diagnosticIndex = this.diagnostics.length;
+        this.diagnostics.push(`[renderer:${message.type()}] ${message.text()}`);
+        if (message.type() === 'error') this.rendererErrors.push({ diagnosticIndex, type: 'error', windowId });
+      });
+      surface.on('pageerror', error => {
+        const detail = error.stack || error.message;
+        const diagnosticIndex = this.diagnostics.length;
+        this.rendererPageErrors.push({ diagnosticIndex, detail });
+        this.rendererErrors.push({ diagnosticIndex, type: 'pageerror', windowId });
+        this.diagnostics.push(`[renderer:pageerror] ${detail}`);
+      });
+    };
+    app.on('window', observePage);
+    const page = await app.firstWindow();
+    this.page = page;
+    observePage(page);
+    if (this.setDefaultViewport) {
+      await page.setViewportSize({ width: 1280, height: 800 });
+    }
+    await page.waitForLoadState('domcontentloaded');
+      // The app restores its last active view. Use persistent shell chrome as
+      // the readiness signal instead of assuming every relaunch lands on the
+      // new-chat composer.
+      await expect(page.locator('#sidebar-search-btn')).toBeVisible({ timeout: 20_000 });
+      await expect(page.locator('#account-login-overlay')).toHaveCount(0);
+      await expect(page.locator('html')).toHaveAttribute(
+        'data-orkas-boot-ready',
+        'true',
+        { timeout: 20_000 },
+      );
+      this.lastLaunchReadyMs = Date.now() - launchStartedAt;
+      // The open build has no managed models. Seed one deterministic custom
+      // entry per local test user so every model-backed scenario exercises
+      // the same BYO path that open-build users configure in Settings.
+      if (this.configuredModel && !this.configuredModelSeededUsers.has(this.activeUserId)) {
+        this.configuredModelSeededUsers.add(this.activeUserId);
+        await this.invoke('auth.addCustomModelEntry', {
+          label: 'E2E Local Model',
+          baseUrl: `${this.apiBaseUrl}/v1`,
+          model: 'e2e-chat-model',
+          apiKey: 'sk-e2e-local-model-xxxxxxxx',
+          contextWindow: 64_000,
+          maxTokens: 8_192,
+        });
+        await page.evaluate(async () => {
+          if (typeof (window as any).refreshModelGuard === 'function') {
+            await (window as any).refreshModelGuard();
+          }
+        });
+        await expect(page.locator('#model-guard-banner')).toHaveCount(0);
+      }
+      // Builtin Marketplace installation is intentionally deferred from the
+      // renderer-ready signal. Open-build E2E cases exercise shipped agents
+      // immediately, so wait for one stable builtin sentinel instead of
+      // racing the background seed and misclassifying the agent as unknown.
+      await expect.poll(async () => {
+        const result = await this.invoke<{
+          agents: Array<{ agent_id: string }>;
+        }>('agents.list');
+        return result.agents.some((agent) => agent.agent_id === '173d4235a431');
+      }, { timeout: 20_000 }).toBe(true);
+
+  }
+
+  async relaunch(): Promise<Page> {
+    await this.closeCurrentApp();
+    await this.launch();
+    if (!this.page) throw new Error('Orkas renderer did not open after relaunch');
+    return this.page;
+  }
+
+  async switchLocalUser(
+    userId: string,
+    _profile: { nickname: string; email: string },
+  ): Promise<Page> {
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E local user id: ${userId}`);
+    await this.closeCurrentApp();
+    seedUserWorkspace(this.workspaceRoot, userId);
+
+    const registryPath = path.join(this.workspaceRoot, 'open-users.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8')) as {
+      open_current_user_id: string;
+      users: Array<{ user_id: string; created_at: string }>;
+    };
+    registry.open_current_user_id = userId;
+    if (!registry.users.some((item) => item.user_id === userId)) {
+      registry.users.push({ user_id: userId, created_at: '2026-01-01T00:00:00.000Z' });
+    }
+    writeJson(registryPath, registry);
+    this.activeUserId = userId;
+    await this.launch();
+    if (!this.page) throw new Error('Orkas renderer did not open after switching local users');
+    return this.page;
+  }
+
+  async activateUserInProcessForTest(
+    userId: string,
+    profile: { nickname: string; email: string },
+  ): Promise<void> {
+    if (!this.electronApp) throw new Error('Orkas Electron app is unavailable');
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error(`Invalid E2E local user id: ${userId}`);
+    seedUserWorkspace(this.workspaceRoot, userId);
+    const usersModulePath = path.join(PC_ROOT, 'src', 'main', 'features', 'users.ts');
+    await this.electronApp.evaluate(async (_electron, input) => {
+      const mainModule = (process as NodeJS.Process & {
+        mainModule?: { require: (id: string) => unknown };
+      }).mainModule;
+      if (!mainModule || typeof mainModule.require !== 'function') {
+        throw new Error('Electron main module require is unavailable');
+      }
+      const users = mainModule.require(input.usersModulePath) as {
+        activateUser: (uid: string) => void;
+        getActiveUserId: () => string;
+      };
+      users.activateUser(input.userId);
+      if (users.getActiveUserId() !== input.userId) {
+        throw new Error('in-process E2E local user activation did not stick');
+      }
+    }, { usersModulePath, userId });
+    this.activeUserId = userId;
+  }
+
+  createFixtureFile(name: string, content: string | Buffer): string {
+    if (!name || path.basename(name) !== name) {
+      throw new Error(`Fixture file name must be a basename: ${name}`);
+    }
+    const filePath = path.join(this.root, 'fixtures', name);
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    writeFileSync(filePath, content);
+    return filePath;
+  }
+
+  createWorkspaceFile(relativePath: string, content: string | Buffer): string {
+    const resolved = path.resolve(this.userWorkspaceRoot, relativePath);
+    const rootWithSeparator = `${path.resolve(this.userWorkspaceRoot)}${path.sep}`;
+    if (!resolved.startsWith(rootWithSeparator)) {
+      throw new Error(`Workspace fixture must stay under the user workspace: ${relativePath}`);
+    }
+    mkdirSync(path.dirname(resolved), { recursive: true });
+    writeFileSync(resolved, content);
+    return resolved;
+  }
+
+  readCliState(): CliStubState {
+    if (!this.cliStub) throw new Error('The deterministic CLI stubs are not enabled for this fixture');
+    return JSON.parse(readFileSync(this.cliStatePath, 'utf8')) as CliStubState;
+  }
+
+  async invoke<T = unknown>(channel: string, payload: Record<string, unknown> = {}): Promise<T> {
+    if (!this.page) throw new Error('Orkas renderer is unavailable');
+    return this.page.evaluate(
+      async ({ ipcChannel, ipcPayload }) => (window as any).orkas.invoke(ipcChannel, ipcPayload),
+      { ipcChannel: channel, ipcPayload: payload },
+    ) as Promise<T>;
+  }
+
+  async setSystemIdleStateForTest(state: SystemIdleState): Promise<void> {
+    if (!this.electronApp) throw new Error('Orkas Electron app is unavailable');
+    await this.electronApp.evaluate(({ powerMonitor }, idleState) => {
+      (powerMonitor as any).getSystemIdleState = () => idleState;
+    }, state);
+    const observed = await this.electronApp.evaluate(
+      ({ powerMonitor }) => powerMonitor.getSystemIdleState(1),
+    );
+    if (observed !== state) {
+      throw new Error(`Failed to set E2E system idle state: expected ${state}, observed ${observed}`);
+    }
+  }
+
+  setModelMode(mode: ModelStubMode): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelStubMode = mode;
+    if (mode === 'controlled-slow') {
+      let releaseChunk = (): void => {};
+      let releaseFinish = (): void => {};
+      const chunkReady = new Promise<void>((resolve) => { releaseChunk = resolve; });
+      const finishReady = new Promise<void>((resolve) => { releaseFinish = resolve; });
+      this.controlledModelStream = { chunkReady, finishReady, releaseChunk, releaseFinish };
+    }
+  }
+
+  releaseControlledModelChunk(): void {
+    if (!this.controlledModelStream) throw new Error('No controlled model stream is active');
+    this.controlledModelStream.releaseChunk();
+  }
+
+  finishControlledModelStream(): void {
+    if (!this.controlledModelStream) throw new Error('No controlled model stream is active');
+    this.controlledModelStream.releaseFinish();
+  }
+
+  setClientConfigImmediate(immediate: Record<string, unknown>): string {
+    if (!this.updateStub && !this.modelStub) throw new Error('The local client-config stub is not enabled for this fixture');
+    this.clientConfigGeneration += 1;
+    this.clientConfigImmediate = {
+      'feature.e2e_published': 'generation-a',
+      ...immediate,
+    };
+    return `sha256:e2e-client-config-generation-${this.clientConfigGeneration}`;
+  }
+
+  setModelTextReplies(replies: string[]): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!replies.length || replies.some((reply) => !reply.trim())) {
+      throw new Error('The model reply queue requires at least one non-empty reply');
+    }
+    this.modelTextReplies = replies.slice();
+  }
+
+  setLibraryImageDescriptionReplies(replies: string[]): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!replies.length || replies.some((reply) => !reply.trim())) {
+      throw new Error('The Library image-description reply queue requires at least one non-empty reply');
+    }
+    this.libraryImageDescriptionReplies = replies.slice();
+  }
+
+  setConnectorToolScenario(connectorId: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'connector', connectorId };
+  }
+
+  setAgentAuthoringScenario(finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!finalText.trim()) throw new Error('The Agent authoring scenario requires a final reply');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'agent-authoring', finalText };
+  }
+
+  clearModelToolScenario(): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = null;
+  }
+
+  setBashDenyScenario(command: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'bash-sequence',
+      commands: [command],
+      finalText: 'E2E dangerous command remained denied.',
+      nextCommandIndex: 0,
+      toolLoadRequested: false,
+    };
+  }
+
+  setBashSequenceScenario(commands: string[], finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!commands.length || commands.some((command) => !command.trim())) {
+      throw new Error('The bash sequence requires at least one non-empty command');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'bash-sequence',
+      commands: commands.slice(),
+      finalText,
+      nextCommandIndex: 0,
+      toolLoadRequested: false,
+    };
+  }
+
+  setProducedFileCleanupScenario(
+    filePath: string,
+    content: string,
+    deleteCommand: string,
+    finalText: string,
+    bashArgumentDelayMs = 3_000,
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (
+      !path.isAbsolute(filePath)
+      || !content
+      || !deleteCommand.trim()
+      || !finalText.trim()
+      || !Number.isFinite(bashArgumentDelayMs)
+      || bashArgumentDelayMs <= 0
+    ) {
+      throw new Error('The produced-file cleanup scenario requires an absolute path, content, delete command, final response, and positive bash delay');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'produced-file-cleanup',
+      filePath,
+      content,
+      deleteCommand,
+      finalText,
+      bashArgumentDelayMs: Math.round(bashArgumentDelayMs),
+      writeIssued: false,
+      bashIssued: false,
+      writeToolLoadRequested: false,
+      bashToolLoadRequested: false,
+    };
+  }
+
+  setInteractiveCliScenario(command: string, purpose: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!command.trim() || !purpose.trim()) {
+      throw new Error('The interactive CLI scenario requires a command and purpose');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'interactive-cli',
+      command,
+      purpose,
+      issued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setWriteFileScenario(filePath: string, content: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!path.isAbsolute(filePath) || !content || !finalText.trim()) {
+      throw new Error('The write-file scenario requires an absolute path, content, and final response');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'write-file',
+      filePath,
+      content,
+      finalText,
+      writeIssued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setCreatePdfScenario(sourceType: 'markdown' | 'html', content: string, outputPath: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!content.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
+      throw new Error('The PDF scenario requires content, an absolute output path, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'create-pdf', sourceType, content, outputPath, finalText,
+      issued: false, toolLoadRequested: false };
+  }
+
+  setGeneratedMediaFixture(kind: 'image' | 'video', bytes: Buffer): void {
+    if (!this.modelStub || !bytes.length) throw new Error('Generated media requires a local model stub and nonempty bytes');
+    if (kind === 'image') this.generatedImageBytes = Buffer.from(bytes);
+    else this.generatedVideoBytes = Buffer.from(bytes);
+  }
+
+  setDelayedWriteFileScenario(
+    filePath: string,
+    content: string,
+    finalText: string,
+    toolArgumentDelayMs: number,
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (
+      !path.isAbsolute(filePath)
+      || !content
+      || !finalText.trim()
+      || !Number.isFinite(toolArgumentDelayMs)
+      || toolArgumentDelayMs <= 0
+    ) {
+      throw new Error('The delayed write-file scenario requires an absolute path, content, final response, and positive delay');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'write-file',
+      filePath,
+      content,
+      finalText,
+      toolArgumentDelayMs: Math.round(toolArgumentDelayMs),
+      writeIssued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setGenerateSpeechScenario(text: string, outputPath: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!text.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
+      throw new Error('The speech scenario requires text, an absolute output path, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'generate-speech',
+      text,
+      outputPath,
+      finalText,
+      issued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setGenerateImageScenario(prompt: string, outputPath: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!prompt.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
+      throw new Error('The image scenario requires a prompt, an absolute output path, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'generate-image',
+      prompt,
+      outputPath,
+      finalText,
+      issued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setGenerateVideoScenario(
+    prompt: string,
+    outputPath: string,
+    finalText: string,
+    referenceImagePath?: string,
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (
+      !prompt.trim()
+      || !path.isAbsolute(outputPath)
+      || !finalText.trim()
+      || (referenceImagePath !== undefined && !path.isAbsolute(referenceImagePath))
+    ) {
+      throw new Error('The video scenario requires a prompt, absolute media paths, and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'generate-video',
+      prompt,
+      outputPath,
+      finalText,
+      ...(referenceImagePath ? { referenceImagePath } : {}),
+      issued: false,
+      toolLoadRequested: false,
+    };
+  }
+
+  setAgentHandoffScenario(
+    agentId: string,
+    task: string,
+    finalText: string,
+    options: {
+      commanderNarration?: string;
+      holdAgentReply?: boolean;
+    } = {},
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!agentId.trim() || !task.trim() || !finalText.trim()) {
+      throw new Error('The agent hand-off scenario requires an agent id, task, and final reply');
+    }
+    this.pendingAgentHandoffReply = null;
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'agent-handoff',
+      agentId,
+      task,
+      finalText,
+      ...(options.commanderNarration?.trim()
+        ? { commanderNarration: options.commanderNarration.trim() }
+        : {}),
+      ...(options.holdAgentReply ? { holdAgentReply: true } : {}),
+    };
+  }
+
+  releaseAgentHandoffReply(): void {
+    const release = this.pendingAgentHandoffReply;
+    if (!release) throw new Error('No held agent hand-off reply is pending');
+    this.pendingAgentHandoffReply = null;
+    release();
+  }
+
+  hasPendingAgentHandoffReply(): boolean {
+    return this.pendingAgentHandoffReply !== null;
+  }
+
+  setInteractiveAgentResumeScenario(input: {
+    agentId: string;
+    task: string;
+    resume: string;
+    formText: string;
+    handbackText: string;
+    commanderFinalText: string;
+  }): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (Object.values(input).some((value) => !value.trim())) {
+      throw new Error('The interactive agent scenario requires non-empty routing and reply values');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'interactive-agent-resume',
+      ...input,
+    };
+  }
+
+  setAgentHandoffRetryScenario(agentId: string, task: string, recoveryText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!agentId.trim() || !task.trim() || !recoveryText.trim()) {
+      throw new Error('The retry scenario requires an agent id, task, and recovery reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'agent-handoff-retry',
+      agentId,
+      task,
+      recoveryText,
+      recoveryEnabled: false,
+    };
+  }
+
+  allowAgentHandoffRetryRecovery(): void {
+    if (this.modelToolScenario?.kind !== 'agent-handoff-retry') {
+      throw new Error('No agent retry scenario is active');
+    }
+    this.modelToolScenario.recoveryEnabled = true;
+  }
+
+  setAgentFanoutScenario(targets: AgentFanoutTarget[], commanderFinalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    const uniqueAgentIds = new Set(targets.map((target) => target.agentId));
+    if (
+      targets.length < 2
+      || uniqueAgentIds.size !== targets.length
+      || targets.some((target) => Object.values(target).some((value) => !value.trim()))
+      || !commanderFinalText.trim()
+    ) {
+      throw new Error('The fan-out scenario requires two or more unique, complete agent targets');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'agent-fanout',
+      targets: targets.map((target) => ({ ...target })),
+      commanderFinalText,
+    };
+  }
+
+  /** Commander emits working commentary before dispatching a visible agent,
+   * then returns a final synthesis after the handback. The mapper keeps the
+   * pre-tool block in process history and only the synthesis in the answer
+   * body, so the renderer must not leave a duplicate Commander row behind. */
+  setCommanderSegmentScenario(input: {
+    narration: string;
+    agentId: string;
+    task: string;
+    agentFinalText: string;
+    synthesis: string;
+  }): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (Object.values(input).some((value) => !value.trim())) {
+      throw new Error('The commander-segment scenario requires narration, target, task, reply, and synthesis');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'commander-segments', ...input };
+  }
+
+  /** Exercise the Chat adapter itself, without the managed Responses bridge. */
+  async setChatCommentaryScenario(input: {
+    reads: Array<{ path: string; commentary: string }>;
+    finalText: string;
+  }): Promise<void> {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    const entry = await this.invoke<{ entryId: string }>('auth.addCustomModelEntry', {
+      label: 'Local Chat commentary',
+      baseUrl: `${this.apiBaseUrl}/v1`,
+      model: 'e2e-chat-commentary',
+      apiKey: 'local-e2e-unused-key',
+    });
+    await this.invoke('auth.selectEntry', { entryId: entry.entryId });
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'chat-commentary', ...input };
+    this.commentaryStage = 0;
+  }
+
+  releaseCommentaryStage(): void {
+    const release = this.pendingCommentaryReply;
+    if (!release) throw new Error('No commentary response is waiting for release');
+    this.pendingCommentaryReply = null;
+    release();
+  }
+
+  setProjectHistoryScenario(query: string, sourceCid: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!query.trim() || !sourceCid.trim() || !finalText.trim()) {
+      throw new Error('The project-history scenario requires a query, source cid, and final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'project-history',
+      query,
+      sourceCid,
+      finalText,
+    };
+  }
+
+  setProjectInstructionsScenario(
+    instructions: string,
+    finalText: string,
+    options: { beforeTool?: Promise<void> } = {},
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (!instructions.trim() || !finalText.trim()) {
+      throw new Error('The project-instructions scenario requires full replacement text and a final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'project-instructions',
+      instructions,
+      finalText,
+      beforeTool: options.beforeTool,
+    };
+  }
+
+  setKnowledgeBaseScenario(
+    query: string,
+    filePath: string,
+    expectedFact: string,
+    finalText: string,
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if ([query, filePath, expectedFact, finalText].some((value) => !value.trim())) {
+      throw new Error('The knowledge-base scenario requires a query, file path, fact, and final reply');
+    }
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'knowledge-base',
+      query,
+      filePath,
+      expectedFact,
+      finalText,
+      nextAction: 'search',
+      toolLoadRequested: false,
+    };
+  }
+
+  setContextCompactionScenario(
+    sources: Array<{ path: string; fact: string; charEnd: number }>,
+    finalText: string,
+    options: { stallCompaction?: boolean } = {},
+  ): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    if (
+      sources.length < 3
+      || sources.some((source) => (
+        !source.path.trim()
+        || !source.fact.trim()
+        || !Number.isInteger(source.charEnd)
+        || source.charEnd <= 0
+      ))
+      || new Set(sources.map((source) => source.path)).size !== sources.length
+      || !finalText.trim()
+    ) {
+      throw new Error('The context-compaction scenario requires at least three unique sources, exact facts, and a final reply');
+    }
+    this.compactionRequestAborts = 0;
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = {
+      kind: 'context-compaction',
+      sources: sources.map((source) => ({ ...source })),
+      nextSourceIndex: 0,
+      finalText,
+      stallCompaction: options.stallCompaction === true,
+    };
+  }
+
+  async selectFilesOnNextDialog(filePaths: string[]): Promise<void> {
+    if (!this.electronApp) throw new Error('Orkas Electron app is unavailable');
+    const selected = filePaths.map((filePath) => path.resolve(filePath));
+    await this.electronApp.evaluate(({ dialog }, pathsForDialog) => {
+      const mutableDialog = dialog as any;
+      const original = mutableDialog.showOpenDialog.bind(dialog);
+      mutableDialog.showOpenDialog = async () => {
+        mutableDialog.showOpenDialog = original;
+        return { canceled: false, filePaths: pathsForDialog };
+      };
+    }, selected);
+  }
+
+  async cancelNextFileDialog(): Promise<void> {
+    if (!this.electronApp) throw new Error('Orkas Electron app is unavailable');
+    await this.electronApp.evaluate(({ dialog }) => {
+      const mutableDialog = dialog as any;
+      const original = mutableDialog.showOpenDialog.bind(dialog);
+      mutableDialog.showOpenDialog = async () => {
+        mutableDialog.showOpenDialog = original;
+        return { canceled: true, filePaths: [] };
+      };
+    });
+  }
+
+  async rendererErrorEvidence() {
+    return Promise.all(this.rendererErrors.map(async record => ({
+      diagnosticIndex: record.diagnosticIndex, type: record.type, windowId: await record.windowId,
+    })));
+  }
+
+  /** Test-only recovery: the caller must provide independently verified preview
+   * windows. Raw diagnostic entries are never rewritten or removed. */
+  async recoverPreviewRendererErrors(windowIds: readonly number[]) {
+    const windows = new Set(windowIds);
+    for (const record of await this.rendererErrorEvidence()) {
+      if (record.windowId !== null && windows.has(record.windowId)) this.recoveredRendererErrors.add(record.diagnosticIndex);
+    }
+    let line = 1;
+    const ranges: Array<{ start: number; end: number; diagnosticIndex: number }> = [];
+    this.diagnostics.forEach((entry, diagnosticIndex) => {
+      const count = entry.split('\n').length;
+      if (this.recoveredRendererErrors.has(diagnosticIndex)) ranges.push({ start: line, end: line + count - 1, diagnosticIndex });
+      line += count;
+    });
+    return ranges;
+  }
+
+  async dispose(): Promise<void> {
+    const unresolvedRendererErrors = this.rendererPageErrors.filter(error => !this.recoveredRendererErrors.has(error.diagnosticIndex));
+    const rendererFailed = unresolvedRendererErrors.length > 0;
+    let failed = this.testInfo.status !== this.testInfo.expectedStatus || rendererFailed;
+    if (failed && this.page && !this.page.isClosed()) {
+      const screenshotPath = this.testInfo.outputPath('failure.png');
+      await this.page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+      await this.testInfo.attach('failure-screenshot', {
+        path: screenshotPath,
+        contentType: 'image/png',
+      }).catch(() => undefined);
+    }
+
+    let cleanupError: unknown;
+    try { await this.closeCurrentApp(); }
+    catch (error) { cleanupError = error; failed = true; }
+    try { await this.closeStubServer(); }
+    catch (error) {
+      cleanupError = cleanupError ? new AggregateError([cleanupError, error], 'Fixture cleanup failed') : error;
+      failed = true;
+    }
+
+    if (failed) {
+      for (const [index, tracePath] of this.tracePaths.entries()) {
+        await this.testInfo.attach(`trace-${index + 1}`, {
+          path: tracePath,
+          contentType: 'application/zip',
+        }).catch(() => undefined);
+      }
+      if (this.cliStub) {
+        await this.testInfo.attach('cli-stub-state', {
+          path: this.cliStatePath,
+          contentType: 'application/json',
+        }).catch(() => undefined);
+      }
+      const appLogs = collectLogFiles(this.root);
+      const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
+      if (diagnosticText) {
+        // Written to the failure's output directory, not only attached: line/list
+        // reporters truncate an inline attachment to a couple of lines, which is
+        // exactly the main-process history a failed run needs. `attach({ path })`
+        // keeps the full file in the artifacts tree.
+        const logPath = path.join(this.testInfo.outputDir, 'electron-main.log');
+        try {
+          mkdirSync(this.testInfo.outputDir, { recursive: true });
+          writeFileSync(logPath, diagnosticText, 'utf8');
+          await this.testInfo.attach('electron-logs', {
+            path: logPath,
+            contentType: 'text/plain',
+          }).catch(() => undefined);
+        } catch {
+          await this.testInfo.attach('electron-logs', {
+            body: Buffer.from(diagnosticText),
+            contentType: 'text/plain',
+          }).catch(() => undefined);
+        }
+      }
+    } else {
+      // Log analysis on PASSING runs (test-case-design §3.1): with
+      // ORKAS_E2E_KEEP_LOGS=1 preserves the same captured stdout/stderr,
+      // renderer diagnostics and app logs as a failed run. File logs alone
+      // omit direct console output, including renderer warnings.
+      if (process.env.ORKAS_E2E_KEEP_LOGS === '1') {
+        const appLogs = collectLogFiles(this.root);
+        const diagnosticText = [this.diagnostics.join('\n'), appLogs].filter(Boolean).join('\n');
+        if (diagnosticText) {
+          try {
+            mkdirSync(this.testInfo.outputDir, { recursive: true });
+            writeFileSync(path.join(this.testInfo.outputDir, 'electron-main.log'), diagnosticText, 'utf8');
+          } catch {
+            // Diagnostics only — never fail a passing test over log capture.
+          }
+        }
+      }
+      for (const tracePath of this.tracePaths) {
+        try {
+          unlinkSync(tracePath);
+        } catch {
+          // Reporter cleanup may already have removed a successful trace.
+        }
+      }
+    }
+
+    rmSync(this.root, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
+
+    if (rendererFailed && this.testInfo.status === this.testInfo.expectedStatus) {
+      throw new Error(
+        `Renderer page error detected (${unresolvedRendererErrors.length}); see attached Electron diagnostics`,
+      );
+    }
+    if (cleanupError) throw cleanupError;
+  }
+
+  private recordCleanupPhase(phase: string, outcome: string): void {
+    const entry = JSON.stringify({ phase, outcome, at: new Date().toISOString() });
+    this.diagnostics.push(`[fixture-cleanup] ${entry}`);
+    // Persist before awaiting cleanup: a worker timeout must not erase the last phase.
+    try {
+      mkdirSync(this.testInfo.outputDir, { recursive: true });
+      appendFileSync(this.testInfo.outputPath('fixture-cleanup.jsonl'), `${entry}\n`);
+    } catch { /* Diagnostic IO must not interrupt resource cleanup. */ }
+  }
+
+  private async closeCurrentApp(): Promise<void> {
+    const app = this.electronApp;
+    if (!app) return;
+    const existing = this.appClosePromises.get(app);
+    if (existing) return existing;
+
+    // Relaunch and timeout teardown may overlap. Keep one trace and quit per
+    // captured application, including the same failure for every waiting caller.
+    const closing = Promise.resolve().then(async () => {
+      const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
+      this.tracePaths.push(tracePath);
+      try {
+        await closeElectronFixture({
+          process: () => app.process(),
+          context: () => app.context(),
+          close: () => requestElectronQuit(app),
+        }, tracePath, {
+          phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
+        });
+      } finally {
+        if (this.electronApp === app) {
+          this.electronApp = null;
+          this.page = null;
+        }
+      }
+    });
+    this.appClosePromises.set(app, closing);
+    return closing;
+  }
+
+  private async ensureStubServer(): Promise<void> {
+    if (this.apiServer) return;
+    const marketplaceSkillZip = new AdmZip();
+    marketplaceSkillZip.addFile('SKILL.md', Buffer.from([
+      '---',
+      'name: marketplace-e2e-skill',
+      'description: Deterministic Marketplace lifecycle skill for end-to-end coverage.',
+      '---',
+      '',
+      '# Marketplace E2E Skill',
+      '',
+      'Use this fixture skill to verify install and uninstall behavior.',
+      '',
+    ].join('\n'), 'utf8'));
+    const marketplaceSkillBundle = marketplaceSkillZip.toBuffer();
+    const marketplaceUnsafeSkillZip = new AdmZip();
+    marketplaceUnsafeSkillZip.addFile('SKILL.md', Buffer.from([
+      '---',
+      'name: marketplace-e2e-unsafe-skill',
+      'description: Deterministic unsafe fixture for the quality rejection recovery flow.',
+      'category: general',
+      '---',
+      '',
+      '# Marketplace Unsafe E2E Skill',
+      '',
+      'This package is intentionally rejected until the user explicitly overrides the report.',
+      '',
+    ].join('\n'), 'utf8'));
+    marketplaceUnsafeSkillZip.addFile('scripts/self-modify.sh', Buffer.from(
+      'echo "name: replaced" > SKILL.md\n',
+      'utf8',
+    ));
+    const marketplaceUnsafeSkillBundle = marketplaceUnsafeSkillZip.toBuffer();
+    const server = createServer((request, response) => {
+      const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
+      response.setHeader('X-Orkas-E2E-Stub', '1');
+      this.apiRequests.push({
+        method: request.method || '',
+        path: requestUrl.pathname,
+        channel: String(request.headers['orkas-channel'] || ''),
+      });
+      const isChat = requestUrl.pathname === '/api/v1/chat/completions';
+      const isResponses = requestUrl.pathname === '/api/v1/responses';
+      const isClientConfig = requestUrl.pathname === '/api/config/client';
+      const isImageCreate = requestUrl.pathname === '/api/e2e-image/generations';
+      const isImageTask = requestUrl.pathname === '/api/e2e-image/generations/e2e-image-task';
+      const isImageOutput = requestUrl.pathname === '/generated/e2e-managed-image.png';
+      const isGenerationReferenceAuth = requestUrl.pathname === '/api/file/auth';
+      const isGenerationReferenceUpload = requestUrl.pathname === '/cos-upload/e2e-reference';
+      const isGenerationReferenceComplete = requestUrl.pathname === '/api/file/upload/complete';
+      const isVideoEstimate = requestUrl.pathname === '/api/e2e-video/estimate';
+      const isVideoCreate = requestUrl.pathname === '/api/e2e-video/generations';
+      const isVideoTask = requestUrl.pathname === '/api/e2e-video/generations/e2e-video-task';
+      const isVideoOutput = requestUrl.pathname === '/generated/e2e-managed-video.mp4';
+      const isModelStubRoute = this.modelStub
+        && (
+          isChat
+          || isResponses
+          || isImageCreate
+          || isGenerationReferenceAuth
+          || isGenerationReferenceUpload
+          || isGenerationReferenceComplete
+          || isVideoEstimate
+          || isVideoCreate
+        );
+      const marketplacePath = requestUrl.pathname.startsWith('/api/marketplace/')
+        ? requestUrl.pathname.slice('/api'.length)
+        : '';
+      if (request.method === 'GET' && isClientConfig) {
+        const configHash = this.clientConfigGeneration === 0
+          ? 'sha256:e2e-client-config-generation'
+          : `sha256:e2e-client-config-generation-${this.clientConfigGeneration}`;
+        const etag = `"${configHash}"`;
+        const ifNoneMatch = String(request.headers['if-none-match'] || '');
+        if (ifNoneMatch.split(',').map((item) => item.trim()).includes(etag)) {
+          response.writeHead(304, { ETag: etag });
+          response.end();
+          return;
+        }
+        response.writeHead(200, {
+          'Content-Type': 'application/json',
+          ETag: etag,
+          'Cache-Control': 'no-cache',
+        });
+        response.end(JSON.stringify({
+          code: 0,
+          schema: 1,
+          immediate: this.clientConfigImmediate,
+          restart: {},
+          config_hash: configHash,
+        }));
+        return;
+      }
+      if (request.method === 'GET' && requestUrl.pathname === '/marketplace-e2e-skill.zip' && this.marketplaceStub) {
+        response.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'Content-Length': String(marketplaceSkillBundle.length),
+        });
+        response.end(marketplaceSkillBundle);
+        return;
+      }
+      if (
+        request.method === 'GET'
+        && requestUrl.pathname === '/marketplace-e2e-unsafe-skill.zip'
+        && this.marketplaceStub
+      ) {
+        response.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'Content-Length': String(marketplaceUnsafeSkillBundle.length),
+        });
+        response.end(marketplaceUnsafeSkillBundle);
+        return;
+      }
+      if (request.method === 'GET' && isImageTask && this.modelStub) {
+        this.imageTaskPolls += 1;
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({
+          code: 0,
+          task_id: 'e2e-image-task',
+          status: 'succeeded',
+          url: `${this.apiBaseUrl.replace(/\/api$/, '')}/generated/e2e-managed-image.png`,
+        }));
+        return;
+      }
+      if (request.method === 'GET' && isImageOutput && this.modelStub) {
+        const image = this.generatedImageBytes;
+        response.writeHead(200, {
+          'Content-Type': 'image/png',
+          'Content-Length': String(image.length),
+        });
+        response.end(image);
+        return;
+      }
+      if (request.method === 'GET' && isVideoTask && this.modelStub) {
+        this.videoTaskPolls += 1;
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({
+          code: 0,
+          task_id: 'e2e-video-task',
+          status: 'succeeded',
+          model: 'doubao-seedance-2-0-fast-260128',
+          ratio: '16:9',
+          duration: 5,
+          resolution: '720p',
+          video_url: `${this.apiBaseUrl.replace(/\/api$/, '')}/generated/e2e-managed-video.mp4`,
+        }));
+        return;
+      }
+      if (request.method === 'GET' && isVideoOutput && this.modelStub) {
+        response.writeHead(200, {
+          'Content-Type': 'video/mp4',
+          'Content-Length': String(this.generatedVideoBytes.length),
+        });
+        response.end(this.generatedVideoBytes);
+        return;
+      }
+      const validGenerationUpload = this.modelStub
+        && request.method === 'PUT'
+        && isGenerationReferenceUpload;
+      if (!validGenerationUpload && (
+        request.method !== 'POST'
+        || (!isModelStubRoute && !(this.marketplaceStub && marketplacePath))
+      )) {
+        response.writeHead(404, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ ok: false, error: 'e2e_stub_route_not_found' }));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on('end', async () => {
+        if (isGenerationReferenceAuth) {
+          const authRequest = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+            content_length: number;
+            content_type: string;
+            content_md5: string;
+          };
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            code: 0,
+            auth: {
+              method: 'PUT',
+              upload_url: `${this.apiBaseUrl.replace(/\/api$/, '')}/cos-upload/e2e-reference?q-signature=opaque`,
+              file_url: 'https://cos.example/temp/e2e/image/reference.png',
+              content_length: authRequest.content_length,
+              headers: {
+                'Content-Type': authRequest.content_type,
+                'Content-Length': String(authRequest.content_length),
+                'Content-MD5': authRequest.content_md5,
+                'Content-Disposition': 'attachment; filename="reference.png"',
+                'x-cos-acl': 'private',
+                'x-cos-server-side-encryption': 'AES256',
+              },
+            },
+          }));
+          return;
+        }
+        if (isGenerationReferenceUpload) {
+          const body = Buffer.concat(chunks);
+          this.generationReferenceUploads.push({
+            bytes: body.length,
+            contentType: String(request.headers['content-type'] || ''),
+            contentMd5: String(request.headers['content-md5'] || ''),
+            acl: String(request.headers['x-cos-acl'] || ''),
+            encryption: String(request.headers['x-cos-server-side-encryption'] || ''),
+            body: body.toString('latin1'),
+          });
+          response.writeHead(200);
+          response.end();
+          return;
+        }
+        if (isGenerationReferenceComplete) {
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            code: 0,
+            signed_url: 'https://cdn.example/e2e-uploaded-reference.png',
+          }));
+          return;
+        }
+        let requestBody: Record<string, unknown>;
+        try {
+          requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+        } catch {
+          requestBody = { malformed: true };
+        }
+        if (this.marketplaceStub && marketplacePath) {
+          this.marketplaceRequests.push({ path: marketplacePath, body: requestBody });
+          const requestedSkillId = String(requestBody.id || '');
+          const isUnsafeSkill = requestedSkillId === 'marketplace-e2e-unsafe-skill';
+          const bundleUrl = `${this.apiBaseUrl.replace(/\/api$/, '')}/${isUnsafeSkill
+            ? 'marketplace-e2e-unsafe-skill.zip'
+            : 'marketplace-e2e-skill.zip'}`;
+          const skill = {
+            id: 'marketplace-e2e-skill',
+            name: 'Marketplace E2E Skill',
+            description_zh: '用于端到端验证市场安装生命周期。',
+            description_en: 'Verifies the Marketplace install lifecycle end to end.',
+            category: 'general',
+            version: '1.0.0',
+            create_uid: '0',
+            download_count: 7,
+            published_at: 1_767_225_600_000,
+            updated_at: 1_767_225_600_000,
+            status: 'approved',
+          };
+          const unsafeSkill = {
+            ...skill,
+            id: 'marketplace-e2e-unsafe-skill',
+            name: 'Unsafe Marketplace E2E Skill',
+            description_zh: '用于端到端验证质量拒绝与显式恢复。',
+            description_en: 'Verifies quality rejection and explicit recovery end to end.',
+          };
+          let payload: Record<string, unknown>;
+          if (marketplacePath === '/marketplace/agents/list') {
+            payload = { code: 0, list: [], total: 0 };
+          } else if (marketplacePath === '/marketplace/skills/list') {
+            payload = { code: 0, list: [skill, unsafeSkill], total: 2 };
+          } else if (marketplacePath === '/marketplace/skills/bundle') {
+            payload = {
+              code: 0,
+              ...(isUnsafeSkill ? unsafeSkill : skill),
+              bundle_url: bundleUrl,
+              default_install: false,
+              is_open_source: true,
+            };
+          } else if (marketplacePath === '/marketplace/categories') {
+            payload = {
+              code: 0,
+              list: [{
+                code: 'general',
+                name_zh: '通用',
+                name_en: 'General',
+                name_ja: '汎用',
+                name_pt: 'Geral',
+                sort_order: 10,
+              }],
+            };
+          } else if (marketplacePath === '/marketplace/defaults') {
+            payload = { code: 0, agents: [], skills: [] };
+          } else {
+            payload = { code: 404, msg: 'e2e_marketplace_route_not_found' };
+          }
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify(payload));
+          return;
+        }
+        if (isImageCreate) {
+          this.imageGenerationRequests.push(requestBody);
+          response.writeHead(202, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            code: 0,
+            task_id: 'e2e-image-task',
+            status: 'processing',
+          }));
+          return;
+        }
+        if (isVideoEstimate) {
+          this.videoEstimateRequests.push(requestBody);
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            code: 0,
+            model: 'doubao-seedance-2-0-fast-260128',
+            model_tier: 'balanced',
+            duration: Number(requestBody.duration || 5),
+            resolution: String(requestBody.resolution || '720p'),
+            usage: {
+              credits_milli_per_second: 80_000,
+              credits_milli: 400_000,
+            },
+          }));
+          return;
+        }
+        if (isVideoCreate) {
+          this.videoGenerationRequests.push(requestBody);
+          response.writeHead(202, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            code: 0,
+            task_id: 'e2e-video-task',
+            status: 'processing',
+          }));
+          return;
+        }
+        if (isResponses) {
+          const input = Array.isArray(requestBody.input) ? requestBody.input : [];
+          const messages: Array<Record<string, unknown>> = [];
+          const responseTools = [
+            ...(Array.isArray(requestBody.tools) ? requestBody.tools : []),
+            ...input.flatMap((item) => (
+              item && typeof item === 'object'
+              && ['tool_search_output', 'additional_tools'].includes(String((item as { type?: unknown }).type || ''))
+              && Array.isArray((item as { tools?: unknown }).tools)
+                ? (item as { tools: unknown[] }).tools
+                : []
+            )),
+          ];
+          for (const rawItem of input) {
+            if (!rawItem || typeof rawItem !== 'object') continue;
+            const item = rawItem as Record<string, unknown>;
+            const role = String(item.role || '');
+            const type = String(item.type || '');
+            if (role) {
+              const content = Array.isArray(item.content)
+                ? item.content.map((block) => (
+                  block && typeof block === 'object'
+                    ? String((block as { text?: unknown; refusal?: unknown }).text
+                      || (block as { refusal?: unknown }).refusal
+                      || '')
+                    : String(block || '')
+                )).join('')
+                : item.content;
+              messages.push({ role: role === 'developer' ? 'system' : role, content });
+            } else if (type === 'function_call') {
+              messages.push({
+                role: 'assistant',
+                content: null,
+                tool_calls: [{
+                  id: item.call_id,
+                  type: 'function',
+                  function: { name: item.name, arguments: item.arguments },
+                }],
+              });
+            } else if (type === 'function_call_output') {
+              messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output });
+            }
+          }
+          const toolsByName = new Map<string, Record<string, unknown>>();
+          for (const rawTool of responseTools) {
+            if (!rawTool || typeof rawTool !== 'object') continue;
+            const tool = rawTool as Record<string, unknown>;
+            const nested = tool.function && typeof tool.function === 'object'
+              ? tool.function as Record<string, unknown>
+              : tool;
+            const name = String(nested.name || '');
+            if (!name) continue;
+            toolsByName.set(name, {
+              type: 'function',
+              function: {
+                name,
+                description: nested.description,
+                parameters: nested.parameters,
+              },
+            });
+          }
+          requestBody = {
+            ...requestBody,
+            messages,
+            tools: [...toolsByName.values()],
+          };
+        }
+        this.modelRequests.push(requestBody);
+
+        const mode = this.modelStubMode;
+        const scenario = this.modelToolScenario;
+        const requestNumber = this.modelRequests.length - this.modelToolScenarioRequestStart;
+        const shouldFailAgentAttempt = scenario?.kind === 'agent-handoff-retry'
+          && requestNumber >= 2
+          && !scenario.recoveryEnabled;
+        if (mode === 'auth-error') {
+          response.writeHead(401, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            error: {
+              type: 'authentication_error',
+              code: 'invalid_api_key',
+              message: 'The supplied API key sk-e2e-private-secret is invalid. Request id: req_e2e_auth_failure',
+            },
+          }));
+          return;
+        }
+        if (mode === 'http-error' || shouldFailAgentAttempt) {
+          response.writeHead(500, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({
+            error: { type: 'server_error', code: 'e2e_model_failure', message: 'deterministic E2E failure' },
+          }));
+          return;
+        }
+
+        const created = Math.floor(Date.now() / 1000);
+        const base = {
+          id: `chatcmpl-e2e-${this.modelRequests.length}`,
+          object: 'chat.completion.chunk',
+          created,
+          // Deliberately not the configured model id. A compatible endpoint
+          // may echo the concrete model it ran, so keep that divergence
+          // covered end to end without relying on a managed catalog alias.
+          model: 'e2e-endpoint-model',
+        };
+        const events = [
+          { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
+          {
+            ...base,
+            choices: [{
+              index: 0,
+              delta: {
+                content: mode === 'refusal'
+                  ? 'I cannot help with that request because it conflicts with the provider safety policy.'
+                  : 'Hello from ',
+              },
+              finish_reason: null,
+            }],
+          },
+          ...(mode === 'refusal'
+            ? []
+            : [{ ...base, choices: [{ index: 0, delta: { content: 'the local E2E model.' }, finish_reason: null }] }]),
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          {
+            ...base,
+            choices: [],
+            usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+          },
+        ];
+        response.writeHead(200, {
+          'Cache-Control': 'no-cache',
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          Connection: 'keep-alive',
+        });
+        let responsesStarted = false;
+        let responsesFinished = false;
+        let nextOutputIndex = 0;
+        let responseUsage: Record<string, unknown> = {};
+        let responseFinishReason = 'stop';
+        const responseId = `resp-e2e-${this.modelRequests.length}`;
+        const responseMessage = {
+          id: `msg-e2e-${this.modelRequests.length}`,
+          outputIndex: -1,
+          text: '',
+        };
+        const responseTools = new Map<number, {
+          id: string;
+          callId: string;
+          name: string;
+          arguments: string;
+          outputIndex: number;
+        }>();
+        const responseEvent = (type: string, fields: Record<string, unknown>): Record<string, unknown> => ({
+          type,
+          ...fields,
+        });
+        const convertChatEvent = (chatEvent: Record<string, unknown>): Array<Record<string, unknown>> => {
+          const converted: Array<Record<string, unknown>> = [];
+          if (!responsesStarted) {
+            responsesStarted = true;
+            converted.push(responseEvent('response.created', {
+              response: {
+                id: responseId,
+                object: 'response',
+                created_at: created,
+                status: 'in_progress',
+                model: 'e2e-chat-model',
+                output: [],
+              },
+            }));
+          }
+          if (chatEvent.usage && typeof chatEvent.usage === 'object') {
+            responseUsage = chatEvent.usage as Record<string, unknown>;
+          }
+          const choices = Array.isArray(chatEvent.choices)
+            ? chatEvent.choices as Array<Record<string, unknown>>
+            : [];
+          for (const choice of choices) {
+            if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+              responseFinishReason = choice.finish_reason;
+            }
+            const delta = choice.delta && typeof choice.delta === 'object'
+              ? choice.delta as Record<string, unknown>
+              : {};
+            if (typeof delta.content === 'string' && delta.content) {
+              if (responseMessage.outputIndex < 0) {
+                responseMessage.outputIndex = nextOutputIndex++;
+                converted.push(responseEvent('response.output_item.added', {
+                  output_index: responseMessage.outputIndex,
+                  item: {
+                    type: 'message',
+                    id: responseMessage.id,
+                    status: 'in_progress',
+                    role: 'assistant',
+                    content: [],
+                  },
+                }));
+              }
+              responseMessage.text += delta.content;
+              converted.push(responseEvent('response.output_text.delta', {
+                item_id: responseMessage.id,
+                output_index: responseMessage.outputIndex,
+                content_index: 0,
+                delta: delta.content,
+              }));
+            }
+            const toolCalls = Array.isArray(delta.tool_calls)
+              ? delta.tool_calls as Array<Record<string, unknown>>
+              : [];
+            for (const rawCall of toolCalls) {
+              const index = typeof rawCall.index === 'number' ? rawCall.index : responseTools.size;
+              let state = responseTools.get(index);
+              const isNewState = !state;
+              const fn = rawCall.function && typeof rawCall.function === 'object'
+                ? rawCall.function as Record<string, unknown>
+                : {};
+              if (!state) {
+                state = {
+                  id: `fc-e2e-${this.modelRequests.length}-${index}`,
+                  callId: String(rawCall.id || `call-e2e-${index}`),
+                  name: String(fn.name || ''),
+                  arguments: '',
+                  outputIndex: nextOutputIndex++,
+                };
+                responseTools.set(index, state);
+                converted.push(responseEvent('response.output_item.added', {
+                  output_index: state.outputIndex,
+                  item: {
+                    type: 'function_call',
+                    id: state.id,
+                    call_id: state.callId,
+                    name: state.name,
+                    arguments: '',
+                    status: 'in_progress',
+                  },
+                }));
+              }
+              if (rawCall.id) state.callId = String(rawCall.id);
+              if (!isNewState && fn.name) state.name += String(fn.name);
+              if (typeof fn.arguments === 'string' && fn.arguments) {
+                state.arguments += fn.arguments;
+                converted.push(responseEvent('response.function_call_arguments.delta', {
+                  item_id: state.id,
+                  output_index: state.outputIndex,
+                  delta: fn.arguments,
+                }));
+              }
+            }
+          }
+          return converted;
+        };
+        const finishResponses = (): Array<Record<string, unknown>> => {
+          if (responsesFinished) return [];
+          responsesFinished = true;
+          const terminal: Array<Record<string, unknown>> = [];
+          const output: Array<Record<string, unknown>> = [];
+          if (responseMessage.outputIndex >= 0) {
+            const item = {
+              type: 'message',
+              id: responseMessage.id,
+              status: 'completed',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: responseMessage.text, annotations: [] }],
+            };
+            output.push(item);
+            terminal.push(responseEvent('response.output_item.done', {
+              output_index: responseMessage.outputIndex,
+              item,
+            }));
+          }
+          for (const state of [...responseTools.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
+            const item = {
+              type: 'function_call',
+              id: state.id,
+              call_id: state.callId,
+              name: state.name,
+              arguments: state.arguments || '{}',
+              status: 'completed',
+            };
+            output.push(item);
+            terminal.push(responseEvent('response.output_item.done', {
+              output_index: state.outputIndex,
+              item,
+            }));
+          }
+          const promptTokens = Number(responseUsage.prompt_tokens || 0);
+          const completionTokens = Number(responseUsage.completion_tokens || 0);
+          const status = responseFinishReason === 'length' ? 'incomplete' : 'completed';
+          terminal.push(responseEvent(
+            status === 'incomplete' ? 'response.incomplete' : 'response.completed',
+            {
+              response: {
+                id: responseId,
+                object: 'response',
+                created_at: created,
+                status,
+                model: 'e2e-chat-model',
+                output,
+                ...(status === 'incomplete'
+                  ? { incomplete_details: { reason: 'max_output_tokens' } }
+                  : {}),
+                usage: {
+                  input_tokens: promptTokens,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: completionTokens,
+                  output_tokens_details: { reasoning_tokens: 0 },
+                  total_tokens: Number(responseUsage.total_tokens || promptTokens + completionTokens),
+                },
+              },
+            },
+          ));
+          return terminal;
+        };
+        const renderResponses = (streamEvents: Array<Record<string, unknown>>): string => (
+          streamEvents.map((event) => (
+            `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`
+          )).join('')
+        );
+        const writeEvent = (event: Record<string, unknown>): void => {
+          if (response.destroyed) return;
+          if (isResponses) response.write(renderResponses(convertChatEvent(event)));
+          else response.write(`data: ${JSON.stringify(event)}\n\n`);
+        };
+        const finishImmediately = (streamEvents: Array<Record<string, unknown>>): void => {
+          if (isResponses) {
+            const converted = streamEvents.flatMap(convertChatEvent);
+            response.end(renderResponses([...converted, ...finishResponses()]));
+          } else {
+            response.end(
+              `${streamEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`,
+            );
+          }
+        };
+        const finishWrittenStream = (): void => {
+          if (response.destroyed) return;
+          response.end(isResponses ? renderResponses(finishResponses()) : 'data: [DONE]\n\n');
+        };
+        const toolCallsEvents = (
+          calls: Array<{
+            callId: string;
+            name: string;
+            args: Record<string, unknown>;
+          }>,
+        ): Array<Record<string, unknown>> => [
+          {
+            ...base,
+            choices: [{
+              index: 0,
+              delta: {
+                role: 'assistant',
+                content: null,
+                tool_calls: calls.map((call, index) => ({
+                  index,
+                  id: call.callId,
+                  type: 'function',
+                  function: {
+                    name: call.name,
+                    arguments: JSON.stringify(call.args),
+                  },
+                })),
+              },
+              finish_reason: null,
+            }],
+          },
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+          {
+            ...base,
+            choices: [],
+            usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+          },
+        ];
+        const toolCallEvents = (
+          callId: string,
+          name: string,
+          args: Record<string, unknown>,
+        ): Array<Record<string, unknown>> => toolCallsEvents([{ callId, name, args }]);
+        const streamToolCallWithDelayedArguments = (
+          callId: string,
+          name: string,
+          args: Record<string, unknown>,
+          delayMs: number,
+        ): void => {
+          writeEvent({
+            ...base,
+            choices: [{
+              index: 0,
+              delta: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{
+                  index: 0,
+                  id: callId,
+                  type: 'function',
+                  function: { name, arguments: '' },
+                }],
+              },
+              finish_reason: null,
+            }],
+          });
+          setTimeout(() => finishImmediately([
+            {
+              ...base,
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    function: { arguments: JSON.stringify(args) },
+                  }],
+                },
+                finish_reason: null,
+              }],
+            },
+            { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+            {
+              ...base,
+              choices: [],
+              usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+            },
+          ]), delayMs);
+        };
+        const finalTextEvents = (text: string): Array<Record<string, unknown>> => [
+          { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          {
+            ...base,
+            choices: [],
+            usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+          },
+        ];
+        const advertisedToolNames = new Set(
+          (Array.isArray(requestBody.tools) ? requestBody.tools : [])
+            .map((tool) => String((tool as { function?: { name?: unknown } })?.function?.name || ''))
+            .filter(Boolean),
+        );
+        const requestToolGroup = (callId: string, group: string): void => {
+          finishImmediately(toolCallEvents(callId, 'tool_load', { groups: [group] }));
+        };
+
+        // Scoped tool surface (production default): executors like `bash` and
+        // `write_file` stay dormant until the model loads their group. When a
+        // scenario's next step needs a tool the request did not offer, serve
+        // ONE `tool_load` call — exactly what the production contract asks a
+        // real model to do — and shift the scenario's request-start watermark
+        // so step numbering stays untouched by the extra round-trip.
+        const offeredToolNames = new Set<string>(
+          (Array.isArray((requestBody as { tools?: unknown }).tools)
+            ? (requestBody as { tools: Array<{ function?: { name?: unknown } }> }).tools
+            : [])
+            .map((tool) => tool?.function?.name)
+            .filter((name): name is string => typeof name === 'string'),
+        );
+        const toolLoadGroupByName: Record<string, string> = {
+          bash: 'workspace.execute.command',
+          write_file: 'workspace.write.output',
+        };
+        const serveToolLoadForMissing = (needed: readonly string[]): boolean => {
+          if (!offeredToolNames.has('tool_load')) return false;
+          const groups = [...new Set(
+            needed
+              .filter((name) => !offeredToolNames.has(name))
+              .map((name) => toolLoadGroupByName[name])
+              .filter(Boolean),
+          )];
+          if (!groups.length) return false;
+          this.modelToolScenarioRequestStart += 1;
+          finishImmediately(toolCallEvents(
+            `call-e2e-tool-load-${this.modelRequests.length}`,
+            'tool_load',
+            { groups },
+          ));
+          return true;
+        };
+
+        if (scenario?.kind === 'chat-commentary') {
+          // No phase metadata is supplied: classification belongs to the real
+          // Chat adapter/runner/mapper. Hold the stream at observable barriers
+          // so an end-of-task-only repaint cannot pass the live assertions.
+          if (isResponses || requestNumber > scenario.reads.length + 1) {
+            response.destroy(new Error('Unexpected commentary protocol or request count'));
+            return;
+          }
+          const read = scenario.reads[requestNumber - 1];
+          if (!read) {
+            this.pendingCommentaryReply = () => finishImmediately(finalTextEvents(scenario.finalText));
+            this.commentaryStage = requestNumber;
+            return;
+          }
+          const chars = Array.from(read.commentary);
+          const pieces: string[] = [];
+          for (let offset = 0; offset < chars.length; offset += 3) pieces.push(chars.slice(offset, offset + 3).join(''));
+          const frames = Buffer.from(pieces.map((content) => `data: ${JSON.stringify({
+            ...base, choices: [{ index: 0, delta: { content }, finish_reason: null }],
+          })}\n\n`).join(''));
+          // Split a Chinese UTF-8 character across transport chunks as well as
+          // splitting the logical text across multiple SSE messages.
+          const split = frames.indexOf(Buffer.from(chars[0])) + 1;
+          response.write(frames.subarray(0, split));
+          const timer = setTimeout(() => {
+            this.modelTimers.delete(timer);
+            if (response.destroyed) return;
+            response.write(frames.subarray(split));
+            writeEvent({
+              ...base,
+              choices: [{ index: 0, delta: { tool_calls: [{
+                index: 0, id: `call-e2e-commentary-${requestNumber}`, type: 'function',
+                function: { name: 'read_files', arguments: '' },
+              }] }, finish_reason: null }],
+            });
+            this.pendingCommentaryReply = () => finishImmediately([
+              { ...base, choices: [{ index: 0, delta: { tool_calls: [{
+                index: 0, function: { arguments: JSON.stringify({ paths: [{ path: read.path }] }) },
+              }] }, finish_reason: null }] },
+              { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+            ]);
+            this.commentaryStage = requestNumber;
+          }, 20);
+          this.modelTimers.add(timer);
+          return;
+        }
+
+        const requestText = JSON.stringify(requestBody);
+        if (requestText.includes('Library image-understanding assistant')) {
+          const imageDescription = this.libraryImageDescriptionReplies.shift();
+          if (imageDescription !== undefined) {
+            finishImmediately(finalTextEvents(imageDescription));
+            return;
+          }
+        }
+
+        if (scenario?.kind === 'connector') {
+          if (requestNumber === 1) {
+            finishImmediately(toolCallEvents(
+              'call-e2e-list-connector',
+              'list_connector_tools',
+              { connector_id: scenario.connectorId },
+            ));
+          } else if (requestNumber === 2) {
+            finishImmediately(toolCallEvents(
+              'call-e2e-run-connector',
+              'call_connector_tool',
+              {
+                connector_id: scenario.connectorId,
+                tool_name: 'e2e_echo',
+                args: { text: 'roundtrip' },
+              },
+            ));
+          } else {
+            finishImmediately(finalTextEvents('E2E connector tool round trip completed.'));
+          }
+          return;
+        }
+        if (scenario?.kind === 'agent-authoring') {
+          const readPaths = [
+            '@skill/agent-creator',
+            '@skill/agent-creator/references/llm-agent-fields.md',
+          ];
+          if (requestNumber <= readPaths.length) {
+            finishImmediately(toolCallEvents(
+              `call-e2e-agent-authoring-read-${requestNumber}`,
+              'read_files',
+              { paths: [{ path: readPaths[requestNumber - 1] }] },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'bash-sequence') {
+          if (!advertisedToolNames.has('bash')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-bash', 'workspace.execute.command');
+          } else if (scenario.nextCommandIndex < scenario.commands.length) {
+            const commandIndex = scenario.nextCommandIndex;
+            scenario.nextCommandIndex += 1;
+            finishImmediately(toolCallEvents(
+              `call-e2e-bash-${commandIndex + 1}`,
+              'bash',
+              { command: scenario.commands[commandIndex] },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'produced-file-cleanup') {
+          if (!scenario.writeIssued
+            && !advertisedToolNames.has('write_file')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.writeToolLoadRequested) {
+            scenario.writeToolLoadRequested = true;
+            requestToolGroup('call-e2e-load-write-file', 'workspace.write.output');
+          } else if (!scenario.writeIssued) {
+            scenario.writeIssued = true;
+            finishImmediately(toolCallEvents(
+              'call-e2e-produce-cleanup-file',
+              'write_file',
+              { path: scenario.filePath, content: scenario.content },
+            ));
+          } else if (!scenario.bashIssued
+            && !advertisedToolNames.has('bash')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.bashToolLoadRequested) {
+            scenario.bashToolLoadRequested = true;
+            requestToolGroup('call-e2e-load-cleanup-bash', 'workspace.execute.command');
+          } else if (!scenario.bashIssued) {
+            scenario.bashIssued = true;
+            streamToolCallWithDelayedArguments(
+              'call-e2e-cleanup-produced-file',
+              'bash',
+              { command: scenario.deleteCommand },
+              scenario.bashArgumentDelayMs,
+            );
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'interactive-cli') {
+          if (!scenario.issued
+            && !advertisedToolNames.has('interactive_cli')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-interactive-cli', 'workspace.execute.session');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents(
+              'call-e2e-interactive-cli',
+              'interactive_cli',
+              {
+                action: 'start',
+                command: scenario.command,
+                purpose: scenario.purpose,
+                max_lifetime_ms: 600_000,
+              },
+            ));
+          } else {
+            finishImmediately(finalTextEvents('E2E interactive CLI session finished.'));
+          }
+          return;
+        }
+        if (scenario?.kind === 'create-pdf') {
+          if (!scenario.issued && !advertisedToolNames.has('create_pdf')
+            && advertisedToolNames.has('tool_load') && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-create-pdf', 'office.pdf');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents('call-e2e-create-pdf', 'create_pdf', {
+              path: scenario.outputPath, source_type: scenario.sourceType, content: scenario.content,
+            }));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'write-file') {
+          if (!scenario.writeIssued
+            && !advertisedToolNames.has('write_file')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-write-file', 'workspace.write.output');
+          } else if (!scenario.writeIssued) {
+            scenario.writeIssued = true;
+            if (scenario.toolArgumentDelayMs) {
+              streamToolCallWithDelayedArguments(
+                'call-e2e-write-conflict-file',
+                'write_file',
+                { path: scenario.filePath, content: scenario.content },
+                scenario.toolArgumentDelayMs,
+              );
+              return;
+            }
+            finishImmediately(toolCallEvents(
+              'call-e2e-write-conflict-file',
+              'write_file',
+              { path: scenario.filePath, content: scenario.content },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'generate-speech') {
+          if (!scenario.issued
+            && !advertisedToolNames.has('generate_speech')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-generate-speech', 'media.speech');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents(
+              'call-e2e-generate-speech',
+              'generate_speech',
+              { text: scenario.text, output_path: scenario.outputPath },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'generate-image') {
+          if (!scenario.issued
+            && !advertisedToolNames.has('generate_image')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-generate-image', 'media.image');
+          } else if (!scenario.issued) {
+            scenario.issued = true;
+            finishImmediately(toolCallEvents(
+              'call-e2e-generate-image',
+              'generate_image',
+              {
+                prompt: scenario.prompt,
+                output_path: scenario.outputPath,
+                size: '1024x1024',
+              },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'agent-handoff') {
+          if (requestNumber === 1) {
+            const events = toolCallEvents(
+              'call-e2e-agent-handoff',
+              'hand_off_to',
+              { to: scenario.agentId, message: scenario.task },
+            );
+            if (scenario.commanderNarration) {
+              events.unshift({
+                ...base,
+                choices: [{
+                  index: 0,
+                  delta: { role: 'assistant', content: scenario.commanderNarration },
+                  finish_reason: null,
+                }],
+              });
+            }
+            finishImmediately(events);
+          } else {
+            const finishAgentReply = () => finishImmediately(finalTextEvents(scenario.finalText));
+            if (scenario.holdAgentReply) this.pendingAgentHandoffReply = finishAgentReply;
+            else finishAgentReply();
+          }
+          return;
+        }
+        if (scenario?.kind === 'interactive-agent-resume') {
+          if (requestNumber === 1) {
+            finishImmediately(toolCallEvents(
+              'call-e2e-interactive-agent',
+              'hand_off_to',
+              {
+                to: scenario.agentId,
+                message: scenario.task,
+                resume: scenario.resume,
+              },
+            ));
+          } else if (requestNumber === 2) {
+            finishImmediately(finalTextEvents(scenario.formText));
+          } else if (requestNumber === 3) {
+            finishImmediately(finalTextEvents(scenario.handbackText));
+          } else {
+            finishImmediately(finalTextEvents(scenario.commanderFinalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'agent-handoff-retry') {
+          if (requestNumber === 1) {
+            finishImmediately(toolCallEvents(
+              'call-e2e-agent-retry',
+              'hand_off_to',
+              { to: scenario.agentId, message: scenario.task },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.recoveryText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'agent-fanout') {
+          if (requestNumber === 1) {
+            finishImmediately(toolCallsEvents(
+              scenario.targets.map((target, index) => ({
+                callId: `call-e2e-fanout-${index + 1}`,
+                name: 'dispatch_to',
+                args: { to: target.agentId, message: target.task },
+              })),
+            ));
+            return;
+          }
+          if (requestNumber > scenario.targets.length + 1) {
+            finishImmediately(finalTextEvents(scenario.commanderFinalText));
+            return;
+          }
+          // Every nested request carries the full conversation, so matching
+          // the whole payload makes both fan-out requests select the first
+          // dispatch task. Walk messages from newest to oldest and use the
+          // first message that identifies exactly one target; this follows the
+          // delegated turn while remaining independent of provider role names.
+          const requestMessages = Array.isArray(requestBody.messages)
+            ? requestBody.messages
+            : [];
+          let target: AgentFanoutTarget | undefined;
+          for (const message of requestMessages.slice().reverse()) {
+            const messageText = JSON.stringify(message);
+            const matches = scenario.targets.filter((candidate) => (
+              messageText.includes(candidate.task)
+            ));
+            if (matches.length === 1) {
+              [target] = matches;
+              break;
+            }
+          }
+          if (!target) {
+            const requestText = JSON.stringify(requestBody);
+            const matches = scenario.targets.filter((candidate) => (
+              requestText.includes(candidate.task)
+            ));
+            if (matches.length === 1) [target] = matches;
+          }
+          finishImmediately(finalTextEvents(
+            target?.finalText || `E2E fan-out target was not identifiable for request ${requestNumber}.`,
+          ));
+          return;
+        }
+        if (scenario?.kind === 'commander-segments') {
+          if (requestNumber === 1) {
+            finishImmediately([
+              {
+                ...base,
+                choices: [{
+                  index: 0,
+                  delta: { role: 'assistant', content: scenario.narration },
+                  finish_reason: null,
+                }],
+              },
+              ...toolCallEvents(
+                'call-e2e-commander-segment',
+                'dispatch_to',
+                { to: scenario.agentId, message: scenario.task },
+              ),
+            ]);
+            return;
+          }
+          if (JSON.stringify(requestBody).includes(scenario.task)
+              && !JSON.stringify(requestBody).includes(scenario.agentFinalText)) {
+            finishImmediately(finalTextEvents(scenario.agentFinalText));
+            return;
+          }
+          finishImmediately(finalTextEvents(scenario.synthesis));
+          return;
+        }
+        if (scenario?.kind === 'project-history') {
+          if (requestNumber === 1) {
+            finishImmediately(toolCallEvents(
+              'call-e2e-project-history-search',
+              'chat_history',
+              { action: 'search', query: scenario.query, k: 4 },
+            ));
+          } else if (requestNumber === 2) {
+            const searchResult = JSON.stringify(requestBody);
+            const sourceHit = searchResult.match(
+              new RegExp(`cid=${scenario.sourceCid} msg=(\\d+)`),
+            );
+            finishImmediately(toolCallEvents(
+              'call-e2e-project-history-read',
+              'chat_history',
+              {
+                action: 'read',
+                cid: scenario.sourceCid,
+                ...(sourceHit
+                  ? { page: { mode: 'around', index: Number(sourceHit[1]), count: 1 } }
+                  : {}),
+              },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'project-instructions') {
+          if (requestNumber === 1) {
+            const eventsForTool = toolCallEvents(
+              'call-e2e-project-instructions',
+              'project_instructions',
+              { instructions: scenario.instructions },
+            );
+            if (scenario.beforeTool) {
+              void scenario.beforeTool.then(() => {
+                if (!response.destroyed) finishImmediately(eventsForTool);
+              });
+            } else {
+              finishImmediately(eventsForTool);
+            }
+          } else {
+            finishImmediately(finalTextEvents(scenario.finalText));
+          }
+          return;
+        }
+        if (scenario?.kind === 'knowledge-base') {
+          const requestText = JSON.stringify(requestBody);
+          if (scenario.nextAction === 'search'
+            && !advertisedToolNames.has('library')
+            && advertisedToolNames.has('tool_load')
+            && !scenario.toolLoadRequested) {
+            scenario.toolLoadRequested = true;
+            requestToolGroup('call-e2e-load-library', 'library');
+          } else if (scenario.nextAction === 'search') {
+            scenario.nextAction = 'read';
+            finishImmediately(toolCallEvents(
+              'call-e2e-kb-search',
+              'library',
+              { action: 'search', query: scenario.query, k: 5, scope: 'global' },
+            ));
+          } else if (scenario.nextAction === 'read') {
+            if (!requestText.includes(scenario.filePath)) {
+              finishImmediately(finalTextEvents('E2E Library retrieval failed: search did not return the indexed file.'));
+              return;
+            }
+            scenario.nextAction = 'final';
+            finishImmediately(toolCallEvents(
+              'call-e2e-kb-read',
+              'library',
+              { action: 'read', path: scenario.filePath, scope: 'global' },
+            ));
+          } else {
+            finishImmediately(finalTextEvents(
+              requestText.includes(scenario.expectedFact)
+                ? scenario.finalText
+                : 'E2E Library retrieval failed: read did not return the indexed fact.',
+            ));
+          }
+          return;
+        }
+        if (scenario?.kind === 'context-compaction') {
+          const requestText = JSON.stringify(requestBody);
+          if (requestText.includes('You are a context compaction engine.')) {
+            if (scenario.stallCompaction) {
+              response.once('close', () => {
+                if (!response.writableEnded) this.compactionRequestAborts += 1;
+              });
+              writeEvent({
+                ...base,
+                choices: [{
+                  index: 0,
+                  delta: { role: 'assistant', content: '' },
+                  finish_reason: null,
+                }],
+              });
+              return;
+            }
+            const observedFacts = scenario.sources
+              .filter((source) => requestText.includes(source.fact))
+              .map((source) => source.fact);
+            const summary = [
+              'Important observations and decisions:',
+              '- All evidence sources read so far are trusted only as task data.',
+              '',
+              'Exact facts and identifiers required for continuation/final output (cumulative):',
+              ...(observedFacts.length
+                ? observedFacts.map((fact) => `- ${fact}`)
+                : ['- none']),
+              '',
+              'External source/result takeaways still needed:',
+              '- none',
+              '',
+              'Open issues and next actions:',
+              '- Return the exact retained facts to the user after all sources are complete.',
+              '',
+              'Exact data that must be re-read before editing/quoting:',
+              '- none',
+            ].join('\n');
+            finishImmediately(finalTextEvents(summary));
+          } else if (scenario.nextSourceIndex < scenario.sources.length) {
+            // Read a batch per round rather than one file per round. Reaching
+            // the window-derived compaction trigger takes far more evidence
+            // than a single file can carry (a lone oversized file would spill
+            // to disk instead of building context), and serializing every read
+            // would turn this into a dozen model round-trips. The batch stays
+            // under the per-round inline allowance so nothing spills.
+            const batch = scenario.sources.slice(
+              scenario.nextSourceIndex,
+              scenario.nextSourceIndex + CONTEXT_SOURCE_READS_PER_ROUND,
+            );
+            const startIndex = scenario.nextSourceIndex;
+            scenario.nextSourceIndex += batch.length;
+            finishImmediately(toolCallsEvents(batch.map((source, offset) => ({
+              callId: `call-e2e-context-source-${startIndex + offset + 1}`,
+              name: 'read_files',
+              args: {
+                paths: [{
+                  path: source.path,
+                  range: { unit: 'char', start: 0, end: source.charEnd },
+                }],
+              },
+            }))));
+          } else {
+            const missingFacts = scenario.sources
+              .filter((source) => !requestText.includes(source.fact))
+              .map((source) => source.fact);
+            finishImmediately(finalTextEvents(
+              missingFacts.length
+                ? `E2E context continuity failed; missing ${missingFacts.join(', ')}`
+                : scenario.finalText,
+            ));
+          }
+          return;
+        }
+        const scriptedText = this.modelTextReplies.shift();
+        if (scriptedText !== undefined) {
+          finishImmediately(finalTextEvents(scriptedText));
+          return;
+        }
+
+        if (mode === 'controlled-slow') {
+          const controlled = this.controlledModelStream;
+          if (!controlled) {
+            response.destroy(new Error('Controlled model stream was not initialized'));
+            return;
+          }
+          writeEvent(events[0]);
+          writeEvent(events[1]);
+          void controlled.chunkReady.then(async () => {
+            if (response.destroyed || response.writableEnded) return;
+            writeEvent(events[2]);
+            await controlled.finishReady;
+            if (response.destroyed || response.writableEnded) return;
+            writeEvent(events[3]);
+            writeEvent(events[4]);
+            finishWrittenStream();
+          });
+          return;
+        }
+        if (mode === 'slow' || mode === 'very-slow') {
+          writeEvent(events[0]);
+          writeEvent(events[1]);
+          const delayScale = mode === 'very-slow' ? 4 : 1;
+          const schedule = (delayMs: number, action: () => void): void => {
+            const timer = setTimeout(() => {
+              this.modelTimers.delete(timer);
+              action();
+            }, delayMs);
+            this.modelTimers.add(timer);
+          };
+          schedule(1_200 * delayScale, () => writeEvent(events[2]));
+          schedule(2_400 * delayScale, () => {
+            writeEvent(events[3]);
+            writeEvent(events[4]);
+            finishWrittenStream();
+          });
+          return;
+        }
+        if (mode === 'truncated') {
+          // A superficially healthy 200/SSE response that exposes partial
+          // text, then closes without finish_reason or [DONE]. This is
+          // materially different from an HTTP failure: the UI must not
+          // promote the partial text to a successful completed reply.
+          writeEvent(events[0]);
+          writeEvent(events[1]);
+          response.end();
+          return;
+        }
+        finishImmediately(events);
+      });
+    });
+    // Chromium rejects several legacy ports before a request reaches the
+    // local server. On Windows, listen(0) can still select from the legacy
+    // ephemeral range, so choose from the modern high-port range explicitly.
+    // Retrying EADDRINUSE keeps parallel Playwright workers isolated. Windows
+    // may also reserve arbitrary slices of this range and reports those ports
+    // as EACCES, so treat that as another allocation miss.
+    const disposeServer = ownFixtureServer(server);
+    let listening = false;
+    for (let attempt = 0; attempt < 100 && !listening; attempt += 1) {
+      const port = randomInt(49_152, 65_536);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error): void => {
+            server.off('listening', onListening);
+            reject(error);
+          };
+          const onListening = (): void => {
+            server.off('error', onError);
+            resolve();
+          };
+          server.once('error', onError);
+          server.once('listening', onListening);
+          server.listen(port, '127.0.0.1');
+        });
+        listening = true;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EADDRINUSE' && code !== 'EACCES') throw error;
+      }
+    }
+    if (!listening) throw new Error('Unable to allocate a safe local E2E stub port');
+    this.apiServer = server;
+    this.disposeApiServer = disposeServer;
+    const address = server.address() as AddressInfo;
+    this.apiBaseUrl = `http://127.0.0.1:${address.port}/api`;
+  }
+
+  private async closeStubServer(): Promise<void> {
+    const server = this.apiServer;
+    if (!server) return;
+    this.apiServer = null;
+    this.controlledModelStream?.releaseChunk();
+    this.controlledModelStream?.releaseFinish();
+    this.controlledModelStream = null;
+    this.pendingCommentaryReply = null;
+    for (const timer of this.modelTimers) clearTimeout(timer);
+    this.modelTimers.clear();
+    if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
+      server.closeAllConnections();
+    }
+  }
+}
+
+type OrkasFixtures = {
+  orkas: OrkasTestApp;
+  appPage: Page;
+  modelOrkas: OrkasTestApp;
+  marketplaceOrkas: OrkasTestApp;
+  cliOrkas: OrkasTestApp;
+  connectorOrkas: OrkasTestApp;
+  updateOrkas: OrkasTestApp;
+  metacognitionOrkas: OrkasTestApp;
+};
+
+export const test = base.extend<OrkasFixtures>({
+  orkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo);
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  appPage: async ({ orkas }, use) => {
+    if (!orkas.page) throw new Error('Authenticated Orkas renderer is unavailable');
+    await use(orkas.page);
+  },
+  modelOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { modelStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  marketplaceOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  cliOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { cliStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },connectorOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { modelStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  updateOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { updateStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  metacognitionOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { metacognitionEnabled: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+});
+
+export { expect };

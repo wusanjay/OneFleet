@@ -1,0 +1,247 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+
+import {
+  loadAuthStore,
+  saveAuthStore,
+  writeOAuthCredentials,
+  writeApiKeyCredential,
+  removeCredential,
+  resolveApiKeyFromStore,
+  isOAuthExpired,
+  getOAuthCredential,
+  listCredentials,
+  resolveAuthDir,
+  resolveAuthStorePath,
+} from "../src/auth/store.js";
+
+describe("Auth Store", () => {
+  // Use the real auth dir but save/restore original state
+  let originalStore: string | undefined;
+  const storePath = resolveAuthStorePath();
+
+  beforeEach(() => {
+    try {
+      originalStore = fs.readFileSync(storePath, "utf-8");
+    } catch {
+      originalStore = undefined;
+    }
+    // Start with clean state
+    try { fs.unlinkSync(storePath); } catch { /* ignore */ }
+  });
+
+  afterEach(() => {
+    // Restore original state
+    if (originalStore !== undefined) {
+      fs.writeFileSync(storePath, originalStore, "utf-8");
+    } else {
+      try { fs.unlinkSync(storePath); } catch { /* ignore */ }
+    }
+    vi.restoreAllMocks();
+  });
+
+  it("returns empty store when no file exists", () => {
+    const store = loadAuthStore();
+    expect(store.version).toBe(1);
+    expect(Object.keys(store.profiles)).toHaveLength(0);
+  });
+
+  it("treats a host-managed encrypted store as opaque without a parse warning", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, "ORKLSEC1:encrypted-envelope", "utf-8");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(loadAuthStore()).toEqual({ version: 1, profiles: {} });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a host-managed encrypted store", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    const encrypted = "ORKLSEC1:encrypted-envelope";
+    fs.writeFileSync(storePath, encrypted, "utf-8");
+
+    expect(() => saveAuthStore({ version: 1, profiles: {} }))
+      .toThrow("auth store is managed by the embedding host");
+    expect(fs.readFileSync(storePath, "utf-8")).toBe(encrypted);
+  });
+
+  it("still warns for malformed plaintext JSON", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, "not-json", "utf-8");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(loadAuthStore()).toEqual({ version: 1, profiles: {} });
+    expect(warn).toHaveBeenCalledWith(
+      "[auth-store]",
+      "failed to load auth store",
+      { code: "UNKNOWN" },
+    );
+  });
+
+  it("resolves auth dir under home directory", () => {
+    // The home-dir path is the *fallback*, so the override has to be gone for
+    // this to mean anything. It normally isn't: the vitest setup pins
+    // CORE_AGENT_AUTH_DIR to a tmp dir (and the app exports its own value to
+    // every child process), which is what the rest of this file writes to.
+    const prev = process.env.CORE_AGENT_AUTH_DIR;
+    delete process.env.CORE_AGENT_AUTH_DIR;
+    try {
+      expect(resolveAuthDir()).toBe(path.join(os.homedir(), ".core-agent"));
+    } finally {
+      if (prev === undefined) delete process.env.CORE_AGENT_AUTH_DIR;
+      else process.env.CORE_AGENT_AUTH_DIR = prev;
+    }
+  });
+
+  it("saves and loads auth store", () => {
+    const store = {
+      version: 1,
+      profiles: {
+        "openai:default": {
+          type: "api_key" as const,
+          provider: "openai",
+          key: "sk-test-key",
+        },
+      },
+    };
+    saveAuthStore(store);
+
+    const loaded = loadAuthStore();
+    expect(loaded.version).toBe(1);
+    expect(loaded.profiles["openai:default"]).toEqual(store.profiles["openai:default"]);
+  });
+
+  it("writes and resolves API key credential", () => {
+    const profileId = writeApiKeyCredential("openai", "sk-test-123");
+    expect(profileId).toBe("openai:default");
+
+    const key = resolveApiKeyFromStore("openai");
+    expect(key).toBe("sk-test-123");
+  });
+
+  it("writes OAuth credentials", () => {
+    const creds = {
+      access: "access-token-abc",
+      refresh: "refresh-token-xyz",
+      expires: Date.now() + 3600_000,
+    };
+
+    const profileId = writeOAuthCredentials("openai-codex", creds);
+    expect(profileId).toBe("openai-codex:default");
+
+    const stored = getOAuthCredential("openai-codex");
+    expect(stored).toBeDefined();
+    expect(stored!.access).toBe("access-token-abc");
+    expect(stored!.refresh).toBe("refresh-token-xyz");
+    expect(stored!.provider).toBe("openai-codex");
+  });
+
+  it("resolves API key from valid OAuth credential", () => {
+    const creds = {
+      access: "access-token-valid",
+      refresh: "refresh-token",
+      expires: Date.now() + 3600_000,
+    };
+    writeOAuthCredentials("openai-codex", creds);
+
+    const key = resolveApiKeyFromStore("openai-codex");
+    expect(key).toBe("access-token-valid");
+  });
+
+  it("returns undefined for expired OAuth credential", () => {
+    const creds = {
+      access: "expired-token",
+      refresh: "refresh-token",
+      expires: Date.now() - 1000, // expired
+    };
+    writeOAuthCredentials("openai-codex", creds);
+
+    const key = resolveApiKeyFromStore("openai-codex");
+    expect(key).toBeUndefined();
+  });
+
+  it("detects expired OAuth credentials", () => {
+    const creds = {
+      access: "token",
+      refresh: "refresh",
+      expires: Date.now() - 1000,
+    };
+    writeOAuthCredentials("openai-codex", creds);
+
+    expect(isOAuthExpired("openai-codex")).toBe(true);
+  });
+
+  it("detects valid OAuth credentials as not expired", () => {
+    const creds = {
+      access: "token",
+      refresh: "refresh",
+      expires: Date.now() + 3600_000,
+    };
+    writeOAuthCredentials("openai-codex", creds);
+
+    expect(isOAuthExpired("openai-codex")).toBe(false);
+  });
+
+  it("removes credentials", () => {
+    writeApiKeyCredential("openai", "sk-test");
+    expect(resolveApiKeyFromStore("openai")).toBe("sk-test");
+
+    const removed = removeCredential("openai:default");
+    expect(removed).toBe(true);
+    expect(resolveApiKeyFromStore("openai")).toBeUndefined();
+  });
+
+  it("returns false when removing non-existent credential", () => {
+    const removed = removeCredential("nonexistent:default");
+    expect(removed).toBe(false);
+  });
+
+  it("lists all stored credentials", () => {
+    writeApiKeyCredential("openai", "sk-key");
+    writeOAuthCredentials("openai-codex", {
+      access: "token",
+      refresh: "refresh",
+      expires: Date.now() + 3600_000,
+    });
+
+    const creds = listCredentials();
+    expect(creds).toHaveLength(2);
+    expect(creds.find((c) => c.provider === "openai")?.type).toBe("api_key");
+    expect(creds.find((c) => c.provider === "openai-codex")?.type).toBe("oauth");
+    expect(creds.find((c) => c.provider === "openai-codex")?.expired).toBe(false);
+  });
+
+  it("returns undefined for non-existent provider", () => {
+    expect(resolveApiKeyFromStore("nonexistent")).toBeUndefined();
+    expect(getOAuthCredential("nonexistent")).toBeUndefined();
+    expect(isOAuthExpired("nonexistent")).toBe(false);
+  });
+});
+
+describe("Auth Store atomic save", () => {
+  let originalStore: string | undefined;
+  const storePath = resolveAuthStorePath();
+
+  beforeEach(() => {
+    try { originalStore = fs.readFileSync(storePath, "utf-8"); }
+    catch { originalStore = undefined; }
+  });
+  afterEach(() => {
+    if (originalStore !== undefined) fs.writeFileSync(storePath, originalStore, "utf-8");
+    else { try { fs.rmSync(storePath, { force: true }); } catch { /* ignore */ } }
+  });
+
+  it("saveAuthStore writes via tmp+rename and leaves no tmp file behind", () => {
+    // A torn direct write would make loadAuthStore fall back to an EMPTY store,
+    // silently wiping every provider credential — the save must be atomic.
+    saveAuthStore({ version: 1, profiles: { "p:default": { type: "api_key", provider: "p", key: "k" } as any } });
+    const dir = path.dirname(storePath);
+    const base = path.basename(storePath);
+    const leftovers = fs.readdirSync(dir).filter((n) => n.startsWith(`${base}.tmp`));
+    expect(leftovers).toEqual([]);
+    const loaded = loadAuthStore();
+    expect(Object.keys(loaded.profiles)).toContain("p:default");
+  });
+});

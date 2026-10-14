@@ -1,0 +1,336 @@
+import { composerText, expectComposerText } from './fixtures/composer';
+import { expect, test } from './fixtures/orkas';
+
+test.describe('conversations and resource picker', () => {
+  test('keeps direct-agent routing mentions out of the task title after refresh', async ({ modelOrkas }) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = modelOrkas.page;
+    const agentName = 'E2ETitleAgent';
+    const taskText = 'Draft E2E launch summary';
+    const created = await modelOrkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: agentName,
+      description: 'Handles the deterministic title-routing regression.',
+      category: 'general',
+    });
+
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-recipient-chip').click();
+    const picker = page.locator('#agent-picker');
+    await picker.locator(
+      `.skill-picker-item[data-kind="agent"][data-id="${created.agent.agent_id}"]`,
+    ).click();
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText(agentName);
+    // The pick inserted `@Agent ` into the composer; the task text follows it.
+    const input = page.locator('#new-chat-input');
+    await input.fill(`${await composerText(input)}${taskText}`);
+    await page.locator('#new-chat-send-btn').click();
+
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect(page.locator('#chat-header-title')).toHaveText(taskText);
+    // The bubble keeps the routing mention; only the title strips it.
+    await expect(page.locator('#chat-history .chat-message.user')).toContainText(
+      `@${agentName} ${taskText}`,
+    );
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toBeVisible({
+      timeout: 20_000,
+    });
+
+    const listed = await modelOrkas.invoke<{
+      conversations: Array<{ conversation_id: string; title: string }>;
+    }>('conversations.list');
+    const conversation = listed.conversations.find((item) => item.title === taskText);
+    expect(conversation).toBeDefined();
+    expect(conversation?.title).not.toContain(`@${agentName}`);
+
+    await page.evaluate(async (cid) => {
+      const app = window as any;
+      await app.loadConversations();
+      app.setView('conversation', cid);
+    }, conversation?.conversation_id);
+    await expect(page.locator('#chat-header-title')).toHaveText(taskText);
+    await expect(page.locator(`#conversation-list .conv-item[data-cid="${conversation?.conversation_id}"] .conv-item-title`))
+      .toHaveText(taskText);
+  });
+
+  test('pins, renames, opens, persists, and deletes a conversation', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'E2E Conversation Before Rename',
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+
+    let row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toContainText('E2E Conversation Before Rename');
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="pin"]').click();
+    await expect(row).toHaveClass(/\bis-pinned\b/);
+
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="rename"]').click();
+    const renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
+    await renameInput.fill('E2E Conversation After Rename');
+    await renameInput.press('Enter');
+    row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toContainText('E2E Conversation After Rename');
+
+    await row.click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect(page.locator('#chat-header-title')).toContainText('E2E Conversation After Rename');
+
+    const relaunchedPage = await orkas.relaunch();
+    row = relaunchedPage.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toContainText('E2E Conversation After Rename');
+    await expect(row).toHaveClass(/\bis-pinned\b/);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await relaunchedPage.locator('#conversation-action-menu [data-action="delete"]').click();
+    await expect(relaunchedPage.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();
+    await relaunchedPage.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+    await expect(row).toHaveCount(0);
+    await expect(relaunchedPage.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+  });
+
+  test('keeps an unsaved task rename draft during a background list refresh', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const originalTitle = 'E2E Task Rename Refresh Original';
+    const draftTitle = 'E2E Task Rename Refresh Draft';
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: originalTitle,
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="rename"]').click();
+    let renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
+    await renameInput.fill(draftTitle);
+    await expect(renameInput).toBeFocused();
+    await renameInput.evaluate((element: any) => { element.__e2eRenameInputIdentity = true; });
+
+    await page.evaluate(async () => {
+      await (window as any).loadConversations();
+    });
+
+    renameInput = page.locator(`#conversation-list input[data-conv-rename-cid="${cid}"]`);
+    await expect(renameInput).toHaveValue(draftTitle);
+    await expect(renameInput).toBeFocused();
+    expect(await renameInput.evaluate((element: any) => element.__e2eRenameInputIdentity)).toBe(true);
+    const listed = await orkas.invoke<{
+      conversations: Array<{ conversation_id: string; title: string }>;
+    }>('conversations.list');
+    expect(listed.conversations.find((item) => item.conversation_id === cid)?.title).toBe(originalTitle);
+
+    await renameInput.press('Enter');
+    await expect(row.locator('.conv-item-title')).toHaveText(draftTitle);
+  });
+
+  test('keeps an unsaved nested task rename draft during a project refresh', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'E2E Nested Task Rename Project',
+    });
+    const projectId = project.project.project_id;
+    const originalTitle = 'E2E Nested Task Rename Original';
+    const draftTitle = 'E2E Nested Task Rename Draft';
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: originalTitle,
+      projectId,
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => {
+      const app = window as any;
+      await app.loadProjects(true);
+      await app.loadConversations({ full: true });
+    });
+
+    let projectRow = page.locator(`.project-row[data-pid="${projectId}"]`);
+    await projectRow.click();
+    projectRow = page.locator(`.project-row[data-pid="${projectId}"]`);
+    await projectRow.click();
+    const row = page.locator(`.project-conv-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toBeVisible();
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="rename"]').click();
+    let renameInput = row.locator(`input[data-conv-rename-cid="${cid}"]`);
+    await renameInput.fill(draftTitle);
+    await expect(renameInput).toBeFocused();
+    await renameInput.evaluate((element: any) => { element.__e2eRenameInputIdentity = true; });
+
+    await page.evaluate(async () => {
+      await (window as any).loadProjects(true);
+    });
+
+    renameInput = page.locator(
+      `.project-conv-list .conv-item[data-cid="${cid}"] input[data-conv-rename-cid="${cid}"]`,
+    );
+    await expect(renameInput).toHaveValue(draftTitle);
+    await expect(renameInput).toBeFocused();
+    expect(await renameInput.evaluate((element: any) => element.__e2eRenameInputIdentity)).toBe(true);
+    const listed = await orkas.invoke<{
+      conversations: Array<{ conversation_id: string; title: string }>;
+    }>('conversations.list');
+    expect(listed.conversations.find((item) => item.conversation_id === cid)?.title).toBe(originalTitle);
+
+    await renameInput.press('Enter');
+    await expect(row.locator('.conv-item-title')).toHaveText(draftTitle);
+  });
+
+  test('keeps a conversation visible when deletion fails and lets the user retry', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'E2E Conversation Delete Retry',
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+
+    let row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toBeVisible();
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__e2eOriginalApiFetch = w.apiFetch;
+      w.apiFetch = async (url: string, options: { method?: string } = {}) => {
+        if (options.method === 'DELETE' && url.startsWith('/api/conversations/')) {
+          return {
+            ok: false,
+            status: 500,
+            async json() {
+              return { ok: false, error: 'E2E simulated delete failure' };
+            },
+          };
+        }
+        return w.__e2eOriginalApiFetch(url, options);
+      };
+    });
+
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="delete"]').click();
+    await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+
+    await expect(row).toBeVisible();
+    await expect(page.locator('.ui-dialog-overlay:visible .ui-dialog')).toContainText(
+      'Delete failed: Unknown error',
+    );
+    const afterFailure = await orkas.invoke<{
+      conversations: Array<{ conversation_id: string }>;
+    }>('conversations.list');
+    expect(afterFailure.conversations.some((item) => item.conversation_id === cid)).toBe(true);
+    await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+
+    await page.evaluate(() => {
+      const w = window as any;
+      w.apiFetch = w.__e2eOriginalApiFetch;
+      delete w.__e2eOriginalApiFetch;
+    });
+    row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="delete"]').click();
+    await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
+    await expect(row).toHaveCount(0);
+  });
+
+  test('keeps fast-switch drafts isolated across conversations and relaunch', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const first = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'E2E Draft Owner A',
+    });
+    const second = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'E2E Draft Owner B',
+    });
+    const firstCid = first.conversation.conversation_id;
+    const secondCid = second.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+
+    await page.evaluate(({ firstCid, secondCid }) => {
+      const w = window as any;
+      const input = document.getElementById('chat-input') as HTMLDivElement;
+      w.setView('conversation', firstCid);
+      const view = w._composerApi(input).view;
+      view.dispatch(view.state.tr.insertText('draft owned by conversation A'));
+      // Switch before the 180 ms draft debounce fires, then type in B.
+      w.setView('conversation', secondCid);
+      view.dispatch(view.state.tr.insertText('draft owned by conversation B'));
+    }, { firstCid, secondCid });
+    await page.waitForTimeout(250);
+
+    await page.evaluate((cid) => (window as any).setView('conversation', cid), firstCid);
+    await expectComposerText(page.locator('#chat-input'), 'draft owned by conversation A');
+    await page.evaluate((cid) => (window as any).setView('conversation', cid), secondCid);
+    await expectComposerText(page.locator('#chat-input'), 'draft owned by conversation B');
+
+    const relaunchedPage = await orkas.relaunch();
+    await relaunchedPage.evaluate((cid) => (window as any).setView('conversation', cid), firstCid);
+    await expectComposerText(relaunchedPage.locator('#chat-input'), 'draft owned by conversation A');
+    await relaunchedPage.evaluate((cid) => (window as any).setView('conversation', cid), secondCid);
+    await expectComposerText(relaunchedPage.locator('#chat-input'), 'draft owned by conversation B');
+  });
+
+  test('selects a shipped agent, custom skills, and Library files from the composer picker', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    await orkas.invoke('skills.create', {
+      name: 'picker-e2e-skill',
+      description: 'Selectable E2E skill.',
+      category: 'general',
+    });
+    await orkas.invoke('contexts.write', {
+      path: 'picker-e2e-library.md',
+      content: '# Picker Library\n',
+    });
+    await expect.poll(
+      async () => {
+        const result = await orkas.invoke<{ agents: Array<{ agent_id: string }> }>('agents.list');
+        return result.agents.some((agent) => agent.agent_id === '173d4235a431');
+      },
+      {
+        message: 'wait for the asynchronous builtin marketplace seed',
+        timeout: 30_000,
+      },
+    ).toBe(true);
+
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-recipient-chip').click();
+    const picker = page.locator('#agent-picker');
+    await expect(picker).toBeVisible();
+    await expect(
+      picker.locator('.skill-picker-item[data-kind="agent"][data-id="173d4235a431"]'),
+    ).toContainText('ContentWriter');
+
+    await picker.locator('[data-agent-picker-tab="skills"]').click();
+    await picker.locator('.skill-picker-item[data-kind="skill"]', { hasText: 'picker-e2e-skill' }).click();
+    const composerInput = page.locator('#new-chat-input');
+    await expectComposerText(composerInput, /Skill: picker-e2e-skill/);
+    await composerInput.press('ControlOrMeta+A');
+    await composerInput.press('Backspace');
+    await expect.poll(() => composerText(composerInput)).not.toMatch(/picker-e2e-skill/);
+
+    await page.locator('#new-chat-recipient-chip').click();
+    await picker.locator('[data-agent-picker-tab="library"]').click();
+    await picker.locator('.skill-picker-item[data-kind="library"]', { hasText: 'picker-e2e-library.md' }).click();
+    const libraryChip = page.locator('#new-chat-attachments .chat-attach-chip', {
+      hasText: 'picker-e2e-library.md',
+    });
+    await expect(libraryChip).toBeVisible();
+    await libraryChip.locator('.chat-attach-remove').click();
+    await expect(libraryChip).toHaveCount(0);
+
+    await page.locator('#new-chat-recipient-chip').click();
+    await picker.locator('[data-agent-picker-tab="agents"]').click();
+    await picker.locator('.skill-picker-item[data-kind="agent"][data-id="173d4235a431"]').click();
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText('ContentWriter');
+    await page.keyboard.press('Escape');
+    await expect(picker).toBeHidden();
+  });
+});

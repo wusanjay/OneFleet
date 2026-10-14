@@ -1,0 +1,100 @@
+name: Linux source smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-source:
+    name: Linux ${{ matrix.arch }} source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Restore verified built-in dependency cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            resources/embedding-model
+            resources/officecli
+            resources/runtime/python
+            resources/runtime/uv
+            resources/runtime/node
+            resources/runtime/ffmpeg
+            resources/runtime/whisper
+          key: linux-source-${{ matrix.arch }}-${{ hashFiles('package-lock.json', 'resources/runtime/manifest.json', 'bin/runtime-gate.cjs', 'bin/packaged-resource-gate.cjs', 'scripts/fetch-embedding-model.mjs', 'scripts/fetch-officecli.cjs', 'scripts/fetch-ffmpeg.cjs', 'scripts/fetch-whisper.cjs') }}
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Install the Linux test desktop when the runner image does not provide it
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v openbox >/dev/null 2>&1 || ! command -v xprop >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes xvfb openbox x11-utils
+          fi
+
+      - name: Restore standard read-only system font permissions
+        run: |
+          stat -c '%u:%g %a %n' /usr/share/fonts /usr/share/fonts/truetype
+          # Avoid Fontconfig mutating root-owned runner-writable font trees.
+          sudo chmod -R go-w /usr/share/fonts
+
+      - name: Prepare and verify built-in Linux dependencies
+        run: node scripts/ensure-dev-dependencies.cjs
+
+      - name: Run Linux platform-native test lane
+        run: |
+          xvfb-run --auto-servernum bash -eu -c '
+            openbox --sm-disable &
+            window_manager_pid=$!
+            trap "kill $window_manager_pid 2>/dev/null || true" EXIT
+            # Xvfb supplies a display; minimization requires a ready window manager.
+            for attempt in {1..50}; do
+              kill -0 "$window_manager_pid"
+              if xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id # 0x"; then
+                break
+              fi
+              sleep 0.1
+            done
+            xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id # 0x"
+            npm run test:platform-native
+          '
+
+      - name: Type-check
+        run: node node_modules/typescript/bin/tsc --noEmit
+
+      - name: Launch the real Orkas application and renderer
+        run: >-
+          ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum
+          npm run test:e2e --
+          test/e2e/app_e2e_smoke.spec.ts
+          --grep "launches the hidden real renderer and preload bridge"
+
+      - name: Run native inference and Electron GUI smoke
+        run: xvfb-run --auto-servernum npm run test:linux-source
+
+      - name: Run real Linux local transcription smoke
+        run: npm run test:linux-whisper

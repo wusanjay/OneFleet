@@ -1,0 +1,332 @@
+{
+  "name": "orkas",
+  "version": "2026.10.1",
+  "private": true,
+  "description": "Orkas desktop — Electron + Node one-piece app",
+  "main": "bootstrap.cjs",
+  "type": "commonjs",
+  "packageManager": "npm@11.11.0",
+  "imports": {
+    "#core-agent": "./src/core-agent/src/index.ts"
+  },
+  "scripts": {
+    "prestart": "node scripts/ensure-dev-dependencies.cjs",
+    "start": "electron .",
+    "prestart:electron": "node scripts/ensure-dev-dependencies.cjs",
+    "start:electron": "electron .",
+    "stop": "pkill -TERM -f \"^$PWD/node_modules/electron/dist/Orkas\\.app/Contents/MacOS/Electron $PWD\" || true",
+    "smoke": "tsx src/main/smoke.ts",
+    "web-app-sdk:docs": "tsx scripts/web-app-sdk-docs.ts",
+    "web-app-sdk:check": "tsx scripts/web-app-sdk-docs.ts --check",
+    "typecheck": "npm run typecheck:main && npm run typecheck:core-agent",
+    "typecheck:main": "tsc --noEmit",
+    "typecheck:core-agent": "tsc --noEmit -p src/core-agent/tsconfig.json",
+    "test": "node scripts/run-tests.mjs suite",
+    "test:non-model": "npm run typecheck && npm test && npm run test:e2e:typecheck && npm run test:e2e && npm run test:platform-native && npm run smoke",
+    "test:js": "node scripts/run-tests.mjs run",
+    "test:e2e": "node scripts/run-e2e.cjs test --config playwright.config.ts",
+    "test:app-template-generation": "node scripts/run-e2e.cjs test --config playwright.config.ts test/e2e/app_templates_e2e_model.spec.ts",
+    "test:web-app-generation": "node scripts/run-e2e.cjs test --config playwright.config.ts test/e2e/web_app_generation_e2e_model.spec.ts",
+    "test:e2e:debug": "node scripts/run-e2e.cjs test --config playwright.config.ts --debug",
+    "test:e2e:typecheck": "tsc --noEmit --project test/e2e/tsconfig.json",
+    "test:e2e:update": "playwright test --config playwright.config.ts --update-snapshots",
+    "test:resources": "node scripts/run-python-tests.mjs resources/builtin resources/test -q",
+    "test:coverage": "node scripts/run-tests.mjs run --coverage",
+    "test:watch": "node scripts/run-tests.mjs",
+    "test:local-agents:live": "tsx scripts/test-local-agents-live.ts",
+    "test:local-agents:prepare": "tsx scripts/test-local-agents-live.ts --install-only",
+    "test:platform-native": "node scripts/run-platform-native-tests.mjs",
+    "test:video-studio-inspect-canary": "node test/gui/run-inspect-canary.mjs",
+    "test:windows-native": "node scripts/run-windows-native-tests.mjs",
+    "test:windows-stability": "node scripts/run-windows-stability-tests.mjs",
+    "test:linux-source": "node scripts/verify-linux-source-dependencies.cjs --full-embedding --gui",
+    "test:linux-whisper": "ORKAS_REAL_WHISPER_TEST=1 node scripts/run-tests.mjs run --maxWorkers=1 -t \"Linux real bundled whisper transcribes within the performance budget\" test/main/features/video_studio_native_qa.test.ts",
+    "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
+    "officecli:policy-check": "node bin/officecli-policy-gate.cjs",
+    "officecli:fetch": "node scripts/fetch-officecli.cjs && node bin/officecli-policy-gate.cjs --require-host-binary",
+    "test:office-artifacts": "npm run officecli:fetch && node bin/officecli-policy-gate.cjs --require-host-binary && tsx scripts/run-office-artifact-smoke.mjs",
+    "ffmpeg:fetch": "node scripts/fetch-ffmpeg.cjs",
+    "vc:fetch": "node scripts/fetch-win-vc-runtime.cjs --platform win32 --arch x64",
+    "whisper:fetch": "node scripts/fetch-whisper.cjs",
+    "runtime:prepare:dev": "node scripts/ensure-dev-dependencies.cjs",
+    "builtin:manifest": "node scripts/update-builtin-manifest.cjs",
+    "builtin:manifest:check": "node scripts/update-builtin-manifest.cjs --check",
+    "rebuild:sqlite:electron": "node scripts/ensure-sqlite-electron-abi.mjs",
+    "postinstall": "node scripts/ensure-sqlite-electron-abi.mjs && node scripts/fetch-embedding-model.mjs",
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "prepack": "node scripts/ensure-dev-dependencies.cjs && node bin/officecli-policy-gate.cjs --require-host-binary",
+    "native:check": "node scripts/verify-native-dependencies.cjs",
+    "native:repair": "node scripts/verify-native-dependencies.cjs --host-only && npm install --include=optional --no-save && node bin/ensure-runtime.cjs --kind node && npm run native:check",
+    "test:web-assist-input-canary": "node test/gui/run-web-assist-input-canary.mjs"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@electron/rebuild": "4.2.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "@playwright/test": "^1.61.1",
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "7zip-bin": "^5.2.0",
+    "electron": "42.11.9",
+    "ffmpeg-static": "^5.3.0",
+    "semver": "7.8.5",
+    "tar": "7.5.21",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.99.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "adm-zip": "^0.6.1",
+    "async-mutex": "^0.5.0",
+    "better-sqlite3": "^12.11.1",
+    "electron-log": "^5.4.3",
+    "fast-xml-parser": "5.7.3",
+    "fastembed": "^2.1.0",
+    "jimp": "^1.6.1",
+    "mammoth": "^1.12.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.2.108",
+    "quickjs-emscripten": "0.32.0",
+    "sharp": "^0.35.4",
+    "socks-proxy-agent": "^8.0.5",
+    "sqlite-vec": "^0.1.9",
+    "tsx": "^4.21.0",
+    "undici": "^7.30.0",
+    "yaml": "^2.9.1",
+    "zod": "^3.24.0"
+  },
+  "overrides": {
+    "@anush008/tokenizers": "0.6.0",
+    "@hono/node-server": "2.0.11",
+    "esbuild": "0.28.1",
+    "tar": "7.5.21"
+  },
+  "build": {
+    "appId": "com.orkas.desktop",
+    "productName": "Orkas",
+    "protocols": [
+      {
+        "name": "Orkas",
+        "schemes": [
+          "orkas"
+        ],
+        "role": "Viewer"
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "bootstrap.cjs",
+      "bin/**/*",
+      "!bin/builtin-resource-gate.cjs",
+      "!bin/ensure-runtime.cjs",
+      "!bin/native-package-gate.cjs",
+      "!bin/officecli-policy-gate.cjs",
+      "!bin/packaged-dependency-gate.cjs",
+      "!bin/packaged-entrypoint-gate.cjs",
+      "!bin/packaged-resource-gate.cjs",
+      "!bin/runtime-gate.cjs",
+      "src/main/**/*.{js,ts,mjs,md,json}",
+      "resources/connectors/setup/*.md",
+      "src/main/native/build/*.node",
+      "src/renderer/**/*",
+      "src/resources/icons/**/*",
+      "tsconfig.json",
+      "node_modules/tsx/**/*",
+      "node_modules/get-tsconfig/**/*",
+      "node_modules/resolve-pkg-maps/**/*",
+      "node_modules/esbuild/**/*",
+      "node_modules/@esbuild/**/*",
+      "node_modules/@modelcontextprotocol/sdk/**/*",
+      "node_modules/ajv/**/*",
+      "node_modules/ajv-formats/**/*",
+      "node_modules/zod/**/*",
+      "node_modules/zod-to-json-schema/**/*",
+      "node_modules/fast-deep-equal/**/*",
+      "node_modules/fast-uri/**/*",
+      "node_modules/json-schema-traverse/**/*",
+      "node_modules/undici/**/*",
+      "node_modules/fast-xml-parser/**/*",
+      "node_modules/fast-xml-builder/**/*",
+      "node_modules/@nodable/entities/**/*",
+      "node_modules/path-expression-matcher/**/*",
+      "node_modules/strnum/**/*",
+      "node_modules/xml-naming/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/detect-libc/**/*",
+      "node_modules/semver/**/*",
+      "node_modules/@img/**/*",
+      "node_modules/pdf-lib/**/*",
+      "node_modules/@pdf-lib/**/*",
+      "node_modules/pako/**/*",
+      "node_modules/tslib/**/*",
+      "src/core-agent/package.json",
+      "src/core-agent/src/**/*.ts",
+      "!**/*.{py,pyc}",
+      "!**/__pycache__",
+      "!**/.DS_Store",
+      "!src/core-agent/test/**",
+      "!src/main/features/*_dev.ts",
+      "!src/main/ipc/dev_handlers.ts"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "bin/**/*",
+      "src/main/native/build/*.node",
+      "node_modules/tsx/**/*",
+      "node_modules/get-tsconfig/**/*",
+      "node_modules/resolve-pkg-maps/**/*",
+      "node_modules/esbuild/**/*",
+      "node_modules/@esbuild/**/*",
+      "node_modules/@modelcontextprotocol/sdk/**/*",
+      "node_modules/ajv/**/*",
+      "node_modules/ajv-formats/**/*",
+      "node_modules/zod/**/*",
+      "node_modules/zod-to-json-schema/**/*",
+      "node_modules/fast-deep-equal/**/*",
+      "node_modules/fast-uri/**/*",
+      "node_modules/json-schema-traverse/**/*",
+      "node_modules/undici/**/*",
+      "node_modules/fast-xml-parser/**/*",
+      "node_modules/fast-xml-builder/**/*",
+      "node_modules/@nodable/entities/**/*",
+      "node_modules/path-expression-matcher/**/*",
+      "node_modules/strnum/**/*",
+      "node_modules/xml-naming/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/detect-libc/**/*",
+      "node_modules/semver/**/*",
+      "node_modules/@img/**/*",
+      "node_modules/better-sqlite3/**/*",
+      "node_modules/bindings/**/*",
+      "node_modules/file-uri-to-path/**/*",
+      "node_modules/sqlite-vec*/**/*",
+      "node_modules/fastembed/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/embedding-model",
+        "to": "embedding-model",
+        "filter": [
+          "**/*",
+          "!*.tar.gz"
+        ]
+      },
+      {
+        "from": "resources/runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/builtin",
+        "to": "builtin",
+        "filter": [
+          "**/*",
+          "!**/.DS_Store",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "resources/officecli",
+        "to": "officecli",
+        "filter": [
+          "**/*",
+          "!*.part"
+        ]
+      },
+      {
+        "from": "resources/xls-reader",
+        "to": "xls-reader",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "resources/mac-locales",
+        "to": ".",
+        "filter": [
+          "en.lproj/InfoPlist.strings",
+          "ja.lproj/InfoPlist.strings",
+          "zh-Hans.lproj/InfoPlist.strings",
+          "es.lproj/InfoPlist.strings",
+          "fr.lproj/InfoPlist.strings",
+          "ko.lproj/InfoPlist.strings",
+          "de.lproj/InfoPlist.strings",
+          "ru.lproj/InfoPlist.strings",
+          "it.lproj/InfoPlist.strings",
+          "hi.lproj/InfoPlist.strings",
+          "id.lproj/InfoPlist.strings",
+          "th.lproj/InfoPlist.strings",
+          "tr.lproj/InfoPlist.strings",
+          "vi.lproj/InfoPlist.strings",
+          "zh-Hant.lproj/InfoPlist.strings",
+          "pt-PT.lproj/InfoPlist.strings",
+          "es-419.lproj/InfoPlist.strings",
+          "ar.lproj/InfoPlist.strings"
+        ]
+      }
+    ],
+    "beforePack": "scripts/ensure-runtime-before-pack.cjs",
+    "afterPack": "scripts/codesign-adhoc.cjs",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "entitlements": "product/signing/entitlements.mac.plist",
+      "entitlementsInherit": "product/signing/entitlements.mac.inherit.plist",
+      "notarize": false,
+      "forceCodeSigning": true,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "icon": "src/resources/icons/icon.icns",
+      "extendInfo": {}
+    },
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "src/resources/icons/icon.ico",
+      "extraFiles": [
+        {
+          "from": "resources/runtime/vc/win32-x64",
+          "to": ".",
+          "filter": [
+            "*.dll"
+          ]
+        }
+      ],
+      "signtoolOptions": {
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "rfc3161TimeStampServer": "http://ts.ssl.com"
+      }
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

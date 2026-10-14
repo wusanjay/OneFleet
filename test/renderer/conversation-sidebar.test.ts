@@ -1,0 +1,10865 @@
+import { composerAccessorSource, composerDraftSource } from './composer-test-source';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as vm from 'node:vm';
+import { cssDeclarationsForSelector, onlyCssDeclarations } from './helpers/css-oracle';
+
+function escapeHtml(s: unknown) {
+  return String(s ?? '').replace(/[&<>"]/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+  }[c] || c));
+}
+
+function createProcessTestElement(tagName = 'div'): any {
+  const listeners = new Map<string, Set<(event: any) => void>>();
+  const node: any = {
+    tagName: String(tagName).toUpperCase(),
+    className: '',
+    dataset: {},
+    children: [],
+    parentElement: null,
+    innerHTML: '',
+    open: false,
+    appendChild(child: any) {
+      child.remove?.();
+      this.children.push(child);
+      child.parentElement = this;
+      return child;
+    },
+    insertBefore(child: any, reference: any) {
+      child.remove?.();
+      const index = this.children.indexOf(reference);
+      this.children.splice(index < 0 ? this.children.length : index, 0, child);
+      child.parentElement = this;
+      return child;
+    },
+    remove() {
+      const parent = this.parentElement;
+      if (!parent) return;
+      const index = parent.children.indexOf(this);
+      if (index >= 0) parent.children.splice(index, 1);
+      this.parentElement = null;
+    },
+    querySelector(selector: string) {
+      const className = selector.startsWith('.') ? selector.slice(1) : '';
+      for (const child of this.children) {
+        if (className && child.classList.contains(className)) return child;
+        const nested = child.querySelector?.(selector);
+        if (nested) return nested;
+      }
+      return null;
+    },
+    setAttribute(name: string, value: unknown) { this[name] = String(value); },
+    removeAttribute(name: string) { delete this[name]; },
+    addEventListener(type: string, listener: (event: any) => void) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type)!.add(listener);
+    },
+    removeEventListener(type: string, listener: (event: any) => void) {
+      listeners.get(type)?.delete(listener);
+    },
+    dispatchEvent(event: any) {
+      for (const listener of listeners.get(String(event?.type || '')) || []) {
+        listener.call(this, event);
+      }
+      return true;
+    },
+  };
+  node.classList = {
+    contains(name: string) {
+      return String(node.className || '').split(/\s+/).filter(Boolean).includes(name);
+    },
+    add(name: string) {
+      this.toggle(name, true);
+    },
+    remove(name: string) {
+      this.toggle(name, false);
+    },
+    toggle(name: string, enabled: boolean) {
+      const classes = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+      if (enabled) classes.add(name);
+      else classes.delete(name);
+      node.className = Array.from(classes).join(' ');
+    },
+  };
+  Object.defineProperties(node, {
+    childElementCount: { get: () => node.children.length },
+    firstChild: { get: () => node.children[0] || null },
+    nextElementSibling: {
+      get: () => {
+        const parent = node.parentElement;
+        if (!parent) return null;
+        const index = parent.children.indexOf(node);
+        return index >= 0 ? (parent.children[index + 1] || null) : null;
+      },
+    },
+  });
+  return node;
+}
+
+function loadConversationRenderer() {
+  const pendingConvs = new Map<string, any>();
+  const groupBusyConvs = new Map<string, boolean>();
+  const context: any = {
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    requestAnimationFrame: (fn: Function) => {
+      setTimeout(fn, 0);
+      return 1;
+    },
+    encodeURIComponent,
+    URLSearchParams,
+    Date,
+    JSON,
+    Map,
+    Set,
+    CSS: { escape: (s: string) => String(s).replace(/["\\]/g, '\\$&') },
+    Array,
+    String,
+    Number,
+    RegExp,
+    currentCid: '',
+    conversations: [],
+    pendingConvs,
+    groupBusyConvs,
+    isGroupConversationBusy: (cid: string) => groupBusyConvs.has(cid),
+    setGroupConversationBusy: (cid: string, busy: boolean) => {
+      if (busy) groupBusyConvs.set(cid, true);
+      else groupBusyConvs.delete(cid);
+    },
+    isConvPending: (cid: string) => pendingConvs.has(cid) || groupBusyConvs.has(cid),
+    createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
+    escapeHtml,
+    t: (key: string, params: any = {}) => ({
+      'chat.new_conv_title': 'New task',
+      'chat.conv_pin_title': 'Pin',
+      'chat.conv_unpin_title': 'Unpin',
+      'chat.conv_rename_title': 'Rename',
+      'chat.conv_del_title': 'Delete',
+      'project.menu.more_actions': 'More actions',
+      'project.todo.status_blocked': 'Blocked',
+      'chat.status.failed_short': 'Failed',
+      'auto.title': 'Automation',
+      'agents.use_label': `Agent: ${params?.agent || ''}`,
+      'skills.use_label': `Skill: ${params?.skill || ''}`,
+      'chat.stream.compaction_tokens': `Conversation organized · ${params?.before} → ${params?.after} tokens`,
+      'chat.stream.compaction': 'Conversation organized',
+      'chat.stream.compacting': 'Organize conversation',
+      'chat.stream.error': `Error: ${params?.msg}`,
+      'chat.stream.reasoning_error_with': `Thinking failed · ${params?.msg}`,
+      'chat.stream.approval_with': `Awaiting confirmation: ${params?.p}`,
+      'chat.stream.plan_with_steps': `Plan (${params?.n} steps): ${params?.titles}`,
+      'chat.stream.plan': `Plan ${params?.p}`,
+      'chat.stream.phase_progress': 'progress',
+      'chat.process.with_target': `${params?.action} · ${params?.target}`,
+      'chat.process.with_status': `${params?.label} · ${params?.status}`,
+      'chat.process.started_action': `Started · ${params?.label}`,
+      'chat.process.action_view_skill': 'View skill',
+      'chat.process.action_use_skill': 'Use skill',
+      'chat.process.action_view_agent': 'View agent',
+      'chat.process.action_view_file': 'View file',
+      'chat.process.action_check_file': 'Check file',
+      'chat.process.action_render_file': 'Render file',
+      'chat.process.action_view_directory': 'View folder',
+      'chat.process.target_current_workspace': 'Current task workspace',
+      'chat.process.action_get_file_info': 'Get file info',
+      'chat.process.action_read_file': 'Read file',
+      'chat.process.action_view_image': 'View image',
+      'chat.process.action_modify_skill': 'Edit skill',
+      'chat.process.action_modify_agent': 'Edit agent',
+      'chat.process.action_modify_file': 'Edit file',
+      'chat.process.action_create_file': 'Create file',
+      'chat.process.action_delete_skill': 'Delete skill',
+      'chat.process.action_delete_agent': 'Delete agent',
+      'chat.process.action_delete_file': 'Delete file',
+      'chat.process.action_recognize_text': 'Recognize text',
+      'chat.process.action_search_files': 'Search files',
+      'chat.process.action_search_web': 'Search the web',
+      'chat.process.action_view_web': 'View webpage',
+      'chat.process.action_view_reference': 'View reference',
+      'chat.process.action_search_reference': 'Search references',
+      'chat.process.action_view_conversation': 'View conversation',
+      'chat.process.action_search_conversation': 'Search conversation',
+      'chat.process.action_run_command': 'Run command',
+      'chat.process.action_generate_image': 'Generate image',
+      'chat.from_agent_unknown': 'Agent',
+      'chat.process.action_generate_video': 'Generate video',
+      'chat.from_agent_unknown': 'Agent',
+      'chat.process.action_generate_audio': 'Generate audio',
+      'chat.process.action_create_plan': 'Create plan',
+      'chat.process.action_execute_plan': 'Execute plan',
+      'chat.process.action_update_plan': 'Update plan',
+      'chat.process.action_organize_conversation': 'Organize conversation',
+      'chat.process.action_view_memory': 'View memory',
+      'chat.process.action_update_memory': 'Update memory',
+      'chat.process.action_use_connector': 'Use connector',
+      'chat.process.action_view_connector': 'View connector',
+      'chat.process.action_add_connector': 'Add connector',
+      'chat.process.action_call_agent': 'Call agent',
+      'chat.process.action_handoff_commander': 'Hand off to Commander',
+      'chat.process.action_execute': 'Run action',
+      'chat.process.action_start_agent': 'Start agent',
+      'chat.process.action_background_task': 'Background task',
+      'chat.process.action_not_allowed': 'Not allowed',
+      'chat.process.status_done': 'Done',
+      'chat.process.status_failed': 'Failed',
+      'chat.process.status_not_executed': 'Not executed',
+      'chat.process.preparing_action': `Preparing: ${params?.label || ''}`,
+      'chat.process.video_narration_timing_mismatch': `Narration ${params?.measured}s outside ${params?.min}-${params?.max}s`,
+      'chat.process.video_narration_timing_decision': `Narration ${params?.measured}s still outside ${params?.min}-${params?.max}s; decide next step`,
+      'chat.process.repeated_failure_decision': 'Current candidate failed repeatedly; decide next step',
+      'chat.process.status_stopped': 'Stopped',
+      'chat.process.agent_ready': 'Agent connected',
+      'chat.process.task_running': 'Handle task',
+      'chat.process.task_done': 'Task complete',
+      'chat.tool_result_expand_hint': 'Click to view full output',
+      'chat.form.submit_failed': 'Submit failed',
+      'chat.process.response_timeout': 'Response timed out',
+      'chat.process.wait_agent_response': `Wait for agent response · ${params?.duration}`,
+      'chat.process.wait_background_task': `Waiting on background task${params?.detail || ''} · ${params?.duration}`,
+      'chat.process.cli_login_required': 'External agent sign-in required',
+      'chat.process.connection_recovered': 'Connection restored',
+      'chat.stream.approval': 'Awaiting confirmation',
+      'chat.stream.waiting_input': 'Awaiting input',
+      'chat.stream.retry_wait': `retrying in ${params?.duration}`,
+      'chat.stream.background_started': `Background task started${params?.detail || ''}`,
+      'chat.stream.background_running': `Background task running${params?.detail || ''}`,
+      'chat.stream.background_completed': `Background task completed${params?.detail || ''}`,
+      'chat.stream.background_failed': `Background task failed${params?.detail || ''}`,
+      'chat.stream.background_stopped': `Background task stopped${params?.detail || ''}`,
+      'chat.stream.tool_progress': `Tool running${params?.detail || ''}`,
+      'chat.stream.thinking': 'Thinking',
+      'chat.stream.reasoning_done': 'Thinking complete',
+      'chat.activity_working': 'Working',
+      'chat.interrupted': 'Interrupted',
+      'chat.process_working': 'Working',
+      'chat.process_working_for': 'Working for',
+      'chat.process_worked': 'Worked',
+      'chat.process_worked_for': 'Worked for',
+      'chat.process_duration': 'Duration',
+      'chat.process.group_operations': `Operations ${params?.n}`,
+      'chat.stream.model_rerouted': `Switch model${params?.detail || ''}`,
+      'chat.stream.authenticating': 'Verify identity',
+      'chat.stream.rate_limit': 'Current usage limit reached',
+      'chat.stream.request_limited': 'Request rate limited',
+      'chat.stream.service_busy': 'Model service is busy',
+      'chat.stream.service_unavailable': 'Model service is temporarily unavailable',
+      'chat.stream.network_unavailable': 'Network connection unavailable',
+      'chat.stream.service_error': 'Temporary model service error',
+      'chat.stream.retry_attempt': `Retry ${params?.attempt}`,
+      'chat.stream.retry_attempt_total': `Retry ${params?.attempt}/${params?.total}`,
+      'chat.stream.retry_continue': `Continue in ${params?.duration}`,
+      'model.retrying': 'Retrying',
+      'model.retrying_n': `Retrying (attempt ${params?.attempt})`,
+      'chat.stream.context_history_start': 'Organize conversation history',
+      'chat.stream.context_history_done': 'Conversation history organized',
+      'chat.stream.context_history_failed': 'Could not organize conversation history',
+      'chat.stream.context_active_start': 'Organize current task progress',
+      'chat.stream.context_active_done': 'Current task progress organized',
+      'chat.stream.context_active_failed': 'Could not organize current task progress',
+      'chat.stream.runtime_total': `Total time ${params?.duration}`,
+      'chat.stream.runtime_model': `model ${params?.duration}`,
+      'chat.stream.runtime_tools': `tools ${params?.duration}`,
+      'chat.stream.runtime_context': `conversation organization ${params?.duration}`,
+      'chat.stream.runtime_retry': `retry wait ${params?.duration}`,
+      'chat.stream.duration_s': `${params?.s}s`,
+      'chat.stream.duration_ms': `${params?.m}m ${params?.s}s`,
+      'chat.stream.duration_hms': `${params?.h}h ${params?.m}m ${params?.s}s`,
+      'sidebar.bucket.today': 'Today',
+      'sidebar.bucket.last30': 'Last 30 days',
+      'sidebar.load_more_conversations': 'Load more',
+      'sidebar.commander_running': `${params?.n} running`,
+    }[key] || key),
+    _BUCKET_ORDER: ['today', 'last30'],
+    timeBucket: () => 'today',
+    renderAvatarHtml: () => '',
+    localStorage: {
+      getItem: () => null,
+      setItem() {},
+      removeItem() {},
+    },
+    document: {
+      readyState: 'loading',
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getElementById: () => null,
+    },
+    window: {
+      addEventListener() {},
+      uiIconHtml: (name: string, className: string) => `<svg class="${escapeHtml(className)}" data-icon="${escapeHtml(name)}"></svg>`,
+      ConversationRuntime: {},
+    },
+  };
+  context.window.window = context.window;
+  vm.createContext(context);
+  vm.runInContext(composerAccessorSource, context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/strip-structural-blocks.js'), 'utf8'), context);
+  const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+  vm.runInContext(source, context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8'), context);
+  return context;
+}
+
+// History recovery exercises the real latest-page action and deferred layout.
+// Keep those browser APIs present so a caught fixture error cannot silently
+// skip the pending-row recovery this suite is meant to verify.
+function setupHistoryLayout(context: any, history: any) {
+  const siblings: any[] = [];
+  const frames: Function[] = [];
+  const warnings = vi.fn();
+  context.__historyWarnings = warnings;
+  vm.runInContext('_convLog.warn = __historyWarnings', context);
+  context.document.createElement = createProcessTestElement;
+  context.document.getElementById = (id: string) => id === 'chat-history'
+    ? history : siblings.find(node => node.id === id) || null;
+  history.after = (node: any) => { siblings.push(node); };
+  history.getBoundingClientRect = () => ({ top: 0, bottom: 100, height: 100 });
+  history.clientHeight = 100;
+  context.requestAnimationFrame = (fn: Function) => { frames.push(fn); return frames.length; };
+  return (expectedWarnings = 0, expectButton = true, unmatchedReplies = 0) => {
+    while (frames.length) frames.shift()!();
+    expect(warnings).toHaveBeenCalledTimes(expectedWarnings + unmatchedReplies);
+    const unmatched = warnings.mock.calls.filter(call => call[0] === 'keyed record found no live row');
+    expect(unmatched).toHaveLength(unmatchedReplies);
+    for (const call of unmatched) expect(call).toEqual(['keyed record found no live row', {
+      reason: 'no_live_row', render_key: 'm:a1', from_kind: 'commander',
+      seg: -1, unkeyed_content_rows: 0,
+    }]);
+    for (const call of warnings.mock.calls.filter(call => call[0] !== 'keyed record found no live row')) {
+      expect(call).toEqual(['conversation history load failed', expect.objectContaining({
+        failure_stage: expect.stringMatching(/^(history|post_paint)$/), has_arrivals: expect.any(Boolean),
+      })]);
+    }
+    if (!expectButton) return;
+    expect(siblings.filter(node => node.id === 'chat-history-latest')).toHaveLength(1);
+    expect(siblings[0].hidden).toBe(true);
+  };
+}
+
+function setupRunningObserverTestContext(context: any, cid = 'c1') {
+  context.AbortController = AbortController;
+  context.TextDecoder = TextDecoder;
+  context.currentCid = cid;
+  context.startPolling = () => {};
+  context._updateConvSidebarBadge = () => {};
+  context._updateConvSendUI = () => {};
+  context._refreshGroupMembers = async () => [];
+  context._observerShouldDeferCleanup = () => true;
+
+  const historyEl = {
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  } as any;
+  const loadingEl = {
+    dataset: {},
+    parentElement: historyEl,
+  } as any;
+  context.pendingConvs.set(cid, {
+    loadingEl,
+    needsIndicator: false,
+    startedAtMs: Date.now() - 60_000,
+    controller: null,
+    aborted: false,
+  });
+  context.document.getElementById = (id: string) => (id === 'chat-history' ? historyEl : null);
+  return { historyEl, loadingEl };
+}
+
+function createObserverTestStream(signal: AbortSignal, chunks: string[] = []) {
+  let chunkIndex = 0;
+  let readCount = 0;
+  let releaseReader: (() => void) | null = null;
+  return {
+    body: {
+      getReader: () => ({
+        read: () => {
+          readCount += 1;
+          if (chunkIndex < chunks.length) {
+            const value = new TextEncoder().encode(chunks[chunkIndex]);
+            chunkIndex += 1;
+            return Promise.resolve({ value, done: false });
+          }
+          if (signal.aborted) return Promise.resolve({ done: true });
+          return new Promise((resolve) => {
+            releaseReader = () => resolve({ done: true });
+            signal.addEventListener('abort', releaseReader, { once: true });
+          });
+        },
+      }),
+    },
+    get readCount() { return readCount; },
+    release() { releaseReader?.(); },
+  };
+}
+
+describe('delegation process presentation', () => {
+  it.each(['dispatch_to', 'hand_off_to'])(
+    'renders persisted %s identity in live progress and history without the registry cache', (name) => {
+      const context = loadConversationRenderer();
+      const events = [
+        { stream: 'tool', data: { phase: 'start', id: 'delegate-1', name } },
+        { stream: 'tool', data: { phase: 'progress', id: 'delegate-1', name,
+          arguments: { to: 'd76b91de8c7b' }, agent_name: 'ProductDemoBuilder' } },
+        { stream: 'tool', data: { phase: 'end', id: 'delegate-1', name,
+          agent_name: 'ProductDemoBuilder', duration_ms: 8000 } },
+      ];
+      const lines: string[] = [];
+      context._streamingAppendProgress = (_msg: unknown, line: string) => lines.push(line);
+      const message = {};
+      for (const event of events) context._renderAgentEvent(message, event);
+      expect(lines.slice(1).every((line) => line.includes('Call agent · ProductDemoBuilder'))).toBe(true);
+      expect(lines.join('\n')).not.toContain('d76b91de8c7b');
+      const replay = context._createProcessDisplayContext();
+      for (const event of JSON.parse(JSON.stringify(events)).slice(1)) {
+        expect(context._formatEventLine(event, replay)).toContain('Call agent · ProductDemoBuilder');
+      }
+    },
+  );
+
+  it.each(['registry', 'members', 'unknown', 'explicit'])(
+    'resolves legacy delegation ids using %s identity information', (source) => {
+      const context = loadConversationRenderer();
+      context.currentCid = 'c1';
+      if (source === 'registry') context._agentsCache = [{ agent_id: 'd76b91de8c7b', name: 'ProductDemoBuilder' }];
+      if (source === 'members') vm.runInContext(
+        '_groupMembersCache.set("c1", [{ id: "d76b91de8c7b", name: "ProductDemoBuilder" }])', context,
+      );
+      const line = context._formatEventLine({ stream: 'tool', data: {
+        phase: 'start', name: 'dispatch_to', arguments: { to: 'd76b91de8c7b' },
+        ...(source === 'explicit' ? { agent_name: 'aabbccddeeff' } : {}),
+      } });
+      const expectedName = source === 'explicit' ? 'aabbccddeeff' : source === 'unknown' ? 'Agent' : 'ProductDemoBuilder';
+      expect(line).toContain(`Call agent · ${expectedName}`);
+      expect(line).not.toContain('d76b91de8c7b');
+    },
+  );
+
+});
+
+describe('delegation and video process presentation', () => {
+  it.each(['dispatch_to', 'hand_off_to'])(
+    'renders persisted %s identity in live progress and history without the registry cache', (name) => {
+      const context = loadConversationRenderer();
+      const events = [
+        { stream: 'tool', data: { phase: 'start', id: 'delegate-1', name } },
+        { stream: 'tool', data: { phase: 'progress', id: 'delegate-1', name,
+          arguments: { to: 'd76b91de8c7b' }, agent_name: 'ProductDemoBuilder' } },
+        { stream: 'tool', data: { phase: 'end', id: 'delegate-1', name,
+          agent_name: 'ProductDemoBuilder', duration_ms: 8000 } },
+      ];
+      const lines: string[] = [];
+      context._streamingAppendProgress = (_msg: unknown, line: string) => lines.push(line);
+      const message = {};
+      for (const event of events) context._renderAgentEvent(message, event);
+      expect(lines.slice(1).every((line) => line.includes('Call agent · ProductDemoBuilder'))).toBe(true);
+      expect(lines.join('\n')).not.toContain('d76b91de8c7b');
+      const replay = context._createProcessDisplayContext();
+      for (const event of JSON.parse(JSON.stringify(events)).slice(1)) {
+        expect(context._formatEventLine(event, replay)).toContain('Call agent · ProductDemoBuilder');
+      }
+    },
+  );
+
+  it.each(['registry', 'members', 'unknown', 'explicit'])(
+    'resolves legacy delegation ids using %s identity information', (source) => {
+      const context = loadConversationRenderer();
+      context.currentCid = 'c1';
+      if (source === 'registry') context._agentsCache = [{ agent_id: 'd76b91de8c7b', name: 'ProductDemoBuilder' }];
+      if (source === 'members') vm.runInContext(
+        '_groupMembersCache.set("c1", [{ id: "d76b91de8c7b", name: "ProductDemoBuilder" }])', context,
+      );
+      const line = context._formatEventLine({ stream: 'tool', data: {
+        phase: 'start', name: 'dispatch_to', arguments: { to: 'd76b91de8c7b' },
+        ...(source === 'explicit' ? { agent_name: 'aabbccddeeff' } : {}),
+      } });
+      const expectedName = source === 'explicit' ? 'aabbccddeeff' : source === 'unknown' ? 'Agent' : 'ProductDemoBuilder';
+      expect(line).toContain(`Call agent · ${expectedName}`);
+      expect(line).not.toContain('d76b91de8c7b');
+    },
+  );
+
+  it('preserves the video action through terminal events and a fresh replay', () => {
+    const context = loadConversationRenderer();
+    const events = [
+      { stream: 'tool', data: { phase: 'start', id: 'video-1', name: 'generate_video', arguments: { output_path: 'demo.mp4' } } },
+      { stream: 'tool', data: { phase: 'end', id: 'video-1', name: 'generate_video' } },
+    ];
+    for (let pass = 0; pass < 2; pass += 1) {
+      const display = context._createProcessDisplayContext();
+      for (const event of events) expect(context._formatEventLine(event, display)).toContain('Generate video · demo.mp4');
+    }
+  });
+});
+
+describe('conversation form submission boundary', () => {
+  it('rejects a failed form mark with the backend error so the widget can retry', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: false, error: 'Directory does not exist' }),
+    });
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: () => null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'form-1',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: 'relative/path' }, []))
+      .rejects.toThrow('Directory does not exist');
+  });
+
+  it('undoes the optimistic submitted state and rejects when replay send fails', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        submission: { text: '@OpenCode\nselected /tmp/project', agent_id: 'agent-1' },
+      }),
+    });
+    context.sendInConversation = async () => {
+      throw new Error('Could not start task');
+    };
+    const classes = new Set<string>();
+    const formHost = {
+      classList: {
+        add: (name: string) => classes.add(name),
+        remove: (name: string) => classes.delete(name),
+      },
+    };
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: (selector: string) => selector === '.chat-input-form' ? formHost : null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'abcdef12',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: '/tmp/project' }, []))
+      .rejects.toThrow('Could not start task');
+    expect(classes.has('is-submitted')).toBe(false);
+  });
+
+  it('undoes the optimistic state when replay resolves without starting', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        submission: { text: '@OpenCode\nselected /tmp/project', agent_id: 'agent-1' },
+      }),
+    });
+    context.sendInConversation = async () => ({
+      started: false,
+      queued: false,
+      result: 'failure',
+      reason: 'model_not_configured',
+    });
+    const classes = new Set<string>();
+    const formHost = {
+      classList: {
+        add: (name: string) => classes.add(name),
+        remove: (name: string) => classes.delete(name),
+      },
+    };
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: (selector: string) => selector === '.chat-input-form' ? formHost : null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'abcdef12',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: '/tmp/project' }, []))
+      .rejects.toThrow('Submit failed');
+    expect(classes.has('is-submitted')).toBe(false);
+  });
+});
+
+describe('conversation create-agent inline gate', () => {
+  it('hides while the current task is pending even without a scroll spacer', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.pendingConvs.set('c1', { loadingEl: null, aborted: false });
+
+    const busy = context._isConvCreateAgentInlineRuntimeBusy('c1');
+
+    expect(busy).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, busy, false)).toBe(false);
+  });
+
+  it('also hides for group-runtime work that has no request controller', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+
+    const busy = context._isConvCreateAgentInlineRuntimeBusy('c1');
+
+    expect(busy).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, busy, false)).toBe(false);
+  });
+
+  it('shows only for an idle user-only conversation', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._shouldShowConvCreateAgentInline(true, false, false)).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, false, true)).toBe(false);
+    expect(context._shouldShowConvCreateAgentInline(false, false, false)).toBe(false);
+  });
+});
+
+describe('sidebar running task counts', () => {
+  it('shows the app-wide total on Commander and isolates Tasks and Project totals', () => {
+    const context = loadConversationRenderer();
+    const commanderChip: any = { hidden: true, textContent: '' };
+    const tasksChip: any = { hidden: true, textContent: '' };
+    const projectOneChip: any = {
+      hidden: true,
+      textContent: '',
+      dataset: { projectRunningChip: 'p1' },
+    };
+    const projectTwoChip: any = {
+      hidden: true,
+      textContent: '',
+      dataset: { projectRunningChip: 'p2' },
+    };
+    context.conversations.push(
+      { conversation_id: 'c1', project_id: 'p1' },
+      { conversation_id: 'c2', project_id: 'p1' },
+      { conversation_id: 'c3', project_id: 'p2' },
+      { conversation_id: 'c4', project_id: '' },
+    );
+    context.pendingConvs.set('c1', { aborted: false });
+    context.pendingConvs.set('c2', { aborted: true });
+    context.pendingConvs.set('c3', { aborted: false });
+    // Recovery can expose group activity before pendingConvs is populated.
+    context.groupBusyConvs.set('c4', true);
+    context.document.getElementById = (id: string) => (
+      id === 'commander-running-chip' ? commanderChip
+        : id === 'tasks-running-chip' ? tasksChip
+          : null
+    );
+    context.document.querySelectorAll = (selector: string) => (
+      selector === '[data-project-running-chip]'
+        ? [projectOneChip, projectTwoChip]
+        : []
+    );
+
+    context._refreshSidebarRunningChips();
+
+    expect(commanderChip).toMatchObject({ hidden: false, textContent: '3 running' });
+    expect(tasksChip).toMatchObject({ hidden: false, textContent: '1 running' });
+    expect(projectOneChip).toMatchObject({ hidden: false, textContent: '1 running' });
+    expect(projectTwoChip).toMatchObject({ hidden: false, textContent: '1 running' });
+
+    context.groupBusyConvs.delete('c4');
+    context._refreshSidebarRunningChips();
+    expect(tasksChip).toMatchObject({ hidden: true, textContent: '' });
+    expect(commanderChip).toMatchObject({ hidden: false, textContent: '2 running' });
+    expect(projectOneChip).toMatchObject({ hidden: false, textContent: '1 running' });
+    expect(projectTwoChip).toMatchObject({ hidden: false, textContent: '1 running' });
+  });
+
+  it('clears the Project title count as soon as its last task stops', () => {
+    const context = loadConversationRenderer();
+    const projectChip: any = {
+      hidden: true,
+      textContent: '',
+      dataset: { projectRunningChip: 'p1' },
+    };
+    context.conversations.push({ conversation_id: 'c1', project_id: 'p1' });
+    context.pendingConvs.set('c1', { aborted: false });
+    context.document.querySelectorAll = (selector: string) => (
+      selector === '[data-project-running-chip]' ? [projectChip] : []
+    );
+
+    context._refreshSidebarRunningChips();
+    expect(projectChip).toMatchObject({ hidden: false, textContent: '1 running' });
+
+    context.pendingConvs.delete('c1');
+    context._refreshSidebarRunningChips();
+    expect(projectChip).toMatchObject({ hidden: true, textContent: '' });
+  });
+});
+
+describe('conversation history initial window', () => {
+  it('uses ten-message cursor pages for initial and older history requests', () => {
+    const context = loadConversationRenderer();
+    context.conversations.push({ conversation_id: 'c1', project_id: 'p1' });
+
+    expect(context._historyRequestUrl('c1')).toBe('/api/conversations/c1/history?limit=10&project_id=p1');
+    expect(context._historyRequestUrl('c1', 999)).toBe('/api/conversations/c1/history?limit=10&before=999&project_id=p1');
+    expect(context._historyRequestUrl('global')).toBe('/api/conversations/global/history?limit=10&project_id=');
+  });
+
+  it('paints bounded history while a cold Agent identity cache is still loading', async () => {
+    const context = loadConversationRenderer();
+    let resolveAgents!: () => void;
+    let agentLoadSettled = false;
+    const agentLoad = new Promise<void>((resolve) => { resolveAgents = resolve; })
+      .then(() => { agentLoadSettled = true; });
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      scrollHeight: 100,
+      scrollTop: 0,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild() {},
+      insertBefore() {},
+    } as any;
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context._agentsCache = null;
+    context.loadAgents = () => agentLoad;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    const assertHistoryLayout = setupHistoryLayout(context, history);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._ensureConvCreateAgentInline = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._renderConvDisabledBanner = () => {};
+    context._updateConvSendUI = () => {};
+    context._scrollToBottomNoAnim = () => {};
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        history: [],
+        conversation: { agent_enabled: true, processing: false },
+        next_cursor: null,
+      }),
+    });
+
+    const load = context.loadConversationHistory('c1');
+    await vi.waitFor(() => expect(history.innerHTML).toContain('chat.empty'), { timeout: 100 });
+
+    expect(agentLoadSettled).toBe(false);
+    resolveAgents();
+    await load;
+    assertHistoryLayout();
+  });
+
+  it('repaints mounted sender identity after the secondary Agent cache becomes ready', () => {
+    const context = loadConversationRenderer();
+    const name = { textContent: 'Unknown Agent' };
+    const avatarSlot = { innerHTML: '<span>fallback</span>' };
+    const row = {
+      dataset: { fromActor: 'agent-a' },
+      querySelector(selector: string) {
+        if (selector === '.chat-msg-header .chat-msg-from') return name;
+        if (selector === '.chat-msg-header [data-role="from-avatar"]') return avatarSlot;
+        return null;
+      },
+    } as any;
+    let decoratedActor = '';
+    context.currentCid = 'c1';
+    context._agentsCache = [{
+      agent_id: 'agent-a', name: 'Writer', icon: 'spark', color: 'blue',
+    }];
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? {
+      querySelectorAll: (selector: string) => (
+        selector === '.chat-message.assistant[data-from-actor]' ? [row] : []
+      ),
+    } : null);
+    context._renderActorAvatarHtml = (actorId: string) => `<span>${actorId}-avatar</span>`;
+    context._decorateActorHeader = (_row: any, actorId: string) => { decoratedActor = actorId; };
+
+    context._refreshMountedConversationActorIdentities('c1');
+
+    expect(name.textContent).toBe('Writer');
+    expect(avatarSlot.innerHTML).toBe('<span>agent-a-avatar</span>');
+    expect(decoratedActor).toBe('agent-a');
+  });
+
+  it('cancels an old turn pin before rebuilding history for a task switch', () => {
+    const context = loadConversationRenderer();
+    const frames: Function[] = [];
+    const appended: any[] = [];
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      appendChild(node: any) { appended.push(node); },
+    } as any;
+    const msg = { isConnected: true } as any;
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.requestAnimationFrame = (fn: Function) => {
+      frames.push(fn);
+      return frames.length;
+    };
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._refreshGroupMembers = async () => [];
+    context.apiFetch = () => new Promise(() => {});
+
+    context._pinMessageToTopWithDynamicSpacer(msg, history);
+    expect(frames).toHaveLength(1);
+
+    void context.loadConversationHistory('c1');
+    frames.shift()?.();
+
+    expect(history._scrollPinActive).toBe(false);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('replays retained milestones after history reattaches a pending task row', async () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const msg = { isConnected: false } as any;
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      scrollHeight: 100,
+      scrollTop: 0,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild(node: any) { node.isConnected = true; },
+      insertBefore(node: any) { node.isConnected = true; },
+    } as any;
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'cli', data: { type: 'log', message: 'still working' } },
+          },
+        },
+      },
+    };
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    context.pendingConvs.set('c1', {
+      loadingEl: msg,
+      needsIndicator: true,
+      controller: { abort() {} },
+      aborted: false,
+    });
+    const assertHistoryLayout = setupHistoryLayout(context, history);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._ensureConvCreateAgentInline = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._renderConvDisabledBanner = () => {};
+    context._updateConvSendUI = () => {};
+    context.startPolling = () => {};
+    context._appendBeforeSpacer = (_container: any, node: any) => { node.isConnected = true; };
+    context._handleStreamEvent = (...args: any[]) => rendered.push(args);
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        history: [],
+        conversation: { agent_enabled: true, processing: false },
+        next_cursor: null,
+      }),
+    });
+    context._bufferOffViewGroupProcessEvent('c1', processEvent);
+
+    await context.loadConversationHistory('c1');
+    assertHistoryLayout();
+
+    expect(msg.isConnected).toBe(true);
+    expect(rendered).toEqual([['c1', msg, processEvent, { archive: true }]]);
+    expect(context._takeOffViewGroupProcessEvents('c1')).toEqual([]);
+  });
+
+  it('does not revive a completed Commander row when history reports an active Agent turn', async () => {
+    const context = loadConversationRenderer();
+    const appended: any[] = [];
+    const ensured: any[] = [];
+    const staleCommander = {
+      dataset: {
+        finalized: '1',
+        fromActor: 'commander',
+        msgId: 'commander-seg-0',
+        renderKey: 's:commander-turn:0',
+        turnId: 'commander-turn',
+      },
+      isConnected: false,
+      parentElement: null,
+    } as any;
+    const activeAgent = {
+      dataset: {},
+      isConnected: true,
+      parentElement: {},
+    } as any;
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      scrollHeight: 100,
+      scrollTop: 0,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild(node: any) { node.isConnected = true; },
+      insertBefore(node: any) { node.isConnected = true; },
+    } as any;
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    context.pendingConvs.set('c1', {
+      loadingEl: staleCommander,
+      needsIndicator: true,
+      controller: { abort() {} },
+      aborted: false,
+    });
+    const assertHistoryLayout = setupHistoryLayout(context, history);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._ensureConvCreateAgentInline = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._renderConvDisabledBanner = () => {};
+    context._updateConvSendUI = () => {};
+    context.startPolling = () => {};
+    context._appendBeforeSpacer = (_container: any, node: any) => {
+      appended.push(node);
+      node.isConnected = true;
+    };
+    context._createStreamingAssistantMessage = () => activeAgent;
+    context._ensureActorPlaceholder = (...args: any[]) => {
+      ensured.push(args);
+      return args[2];
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        history: [],
+        conversation: {
+          agent_enabled: true,
+          processing: true,
+          processing_since: new Date().toISOString(),
+          in_flight: ['agent-a'],
+          active_recipient: 'agent-a',
+          active_turns: [{ actor: 'agent-a', turn_id: 'agent-turn' }],
+        },
+        next_cursor: null,
+      }),
+    });
+
+    await context.loadConversationHistory('c1');
+    assertHistoryLayout();
+
+    expect(appended, 'settled history-owned rows must never be reattached').not.toContain(staleCommander);
+    expect(ensured).toHaveLength(1);
+    expect(ensured[0][1]).toBe('agent-a');
+    expect(ensured[0][2], 'the active Agent must receive a fresh reusable row').toBe(activeAgent);
+    expect(context.pendingConvs.get('c1').loadingEl).toBe(activeAgent);
+  });
+
+  it.each([
+    {
+      name: 'persisted row',
+      dataset: { finalized: '1', msgId: 'msg-1', fromActor: 'agent-a', turnId: 'turn-a' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'previous actor',
+      dataset: { fromActor: 'commander', turnId: 'turn-c', renderKey: 's:turn-c:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'previous turn of the same actor',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-old', renderKey: 's:turn-old:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-new' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: false,
+    },
+    {
+      name: 'matching active turn',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-a', renderKey: 's:turn-a:0' },
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: true,
+    },
+    {
+      name: 'unclaimed controller row',
+      dataset: {},
+      activeTurns: [{ actor: 'agent-a', turn_id: 'turn-a' }],
+      inFlight: ['agent-a'],
+      authoritative: true,
+      expected: true,
+    },
+    {
+      name: 'legacy snapshot without actor identity',
+      dataset: { fromActor: 'agent-a', turnId: 'turn-a', renderKey: 's:turn-a:0' },
+      activeTurns: [],
+      inFlight: [],
+      authoritative: false,
+      expected: true,
+    },
+  ])('classifies a $name for pending history recovery', ({
+    dataset, activeTurns, inFlight, authoritative, expected,
+  }) => {
+    const context = loadConversationRenderer();
+
+    expect(context._canReattachPendingLoadingEl(
+      { dataset }, activeTurns, inFlight, authoritative,
+    )).toBe(expected);
+  });
+
+  it('recognizes a stale deleted-conversation result as recoverable', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._isConversationMissingResponse({ ok: false, error: 'conversation not found' })).toBe(true);
+    expect(context._isConversationMissingResponse({ ok: false, code: 'E_CONVERSATION_NOT_FOUND' })).toBe(true);
+    expect(context._isConversationMissingResponse({ ok: false, error: 'database unavailable' })).toBe(false);
+  });
+
+  it('drops a missing current conversation and returns to the new-task view', async () => {
+    const context = loadConversationRenderer();
+    const views: string[] = [];
+    context.currentCid = 'gone';
+    context.conversations.push({ conversation_id: 'gone' }, { conversation_id: 'keep' });
+    context.abortConvStream = () => {};
+    context._forgetConvLocal = () => {};
+    context.renderConversationList = () => {};
+    context.setView = (view: string) => { views.push(view); context.currentCid = null; };
+    context.loadConversations = async () => {};
+
+    await context._recoverMissingConversation('gone');
+
+    expect(context.conversations.map((item: any) => item.conversation_id)).toEqual(['keep']);
+    expect(views).toEqual(['new-chat']);
+  });
+});
+
+
+describe('conversation history response ordering', () => {
+  const question = { id: 'u1', from: 'user', text: 'Question', ts: '2026-01-01T00:00:00Z' };
+  const answer = {
+    id: 'a1', from: 'commander', text: 'Answer', ts: '2026-01-01T00:00:01Z',
+    produced: ['synthetic-output.png'], form: { title: 'Review', fields: [] },
+  };
+  const response = (history: any[], extra: any = {}) => ({
+    json: async () => ({ ok: true, history, conversation: { processing: false }, next_cursor: null, ...extra }),
+  });
+  let verifyLayout: (() => void) | undefined;
+  afterEach(() => { try { verifyLayout?.(); } finally { verifyLayout = undefined; } });
+  function setup() {
+    const context = loadConversationRenderer();
+    const rows: any[] = [];
+    const history: any = {
+      classList: { remove() {} }, style: { removeProperty() {} },
+      querySelector: () => null, querySelectorAll: () => [],
+      addEventListener() {}, scrollHeight: 100, scrollTop: 0,
+      appendChild(fragment: any) { rows.push(...fragment.children); },
+    };
+    let html = '';
+    Object.defineProperty(history, 'innerHTML', {
+      get: () => html,
+      set: (value) => { html = value; rows.length = 0; },
+    });
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context._agentsCache = [];
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    const assertLayout = setupHistoryLayout(context, history);
+    const expected = { warnings: 0, painted: true, unmatchedReplies: 0 };
+    verifyLayout = () => assertLayout(expected.warnings, expected.painted, expected.unmatchedReplies);
+    context.document.createDocumentFragment = () => ({ children: [] });
+    for (const name of ['_ensureCreateAgentInlineObserver', '_ensureConvCreateAgentInline',
+      '_renderConvDisabledBanner', '_updateConvSendUI', '_scrollToBottomNoAnim',
+      '_scheduleConversationTurnNavigation', '_syncFailedFromHistory',
+      '_bumpConvToTop', '_scheduleConversationInfoFileRefresh']) context[name] = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._recoverMissingConversation = vi.fn();
+    // Exercise the real request, projection, visibility, and live-event paths;
+    // replace only the final DOM/card drawing with observable message rows.
+    context.appendChatMessage = (message: any, _scroll: boolean, opts: any = {}) => {
+      const node = { message, dataset: { msgId: message._msg_id } };
+      if (opts.container) opts.container.children.push(node);
+      else rows.push(node);
+      return node;
+    };
+    let resolve!: (value: any) => void;
+    let reject!: (error: Error) => void;
+    context.apiFetch = () => new Promise((res, rej) => { resolve = res; reject = rej; });
+    return {
+      context, rows, history, expected,
+      resolve: (value: any) => resolve(value), reject: (error: Error) => reject(error),
+      ids: () => rows.map((row) => row.message._msg_id),
+      receive: (gm: any, cid = 'c1') => context._handleGroupBusEvent(cid, null, {
+        type: 'message', msg: gm, turn_end: gm.from !== 'user',
+      }),
+    };
+  }
+
+  it.each(['success', 'failure', 'missing'] as const)('ignores an older request after a newer load succeeds: %s', async (outcome) => {
+    const s = setup();
+    const older = s.context.loadConversationHistory('c1');
+    s.context.apiFetch = async () => response([question, answer]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    if (outcome === 'failure') s.reject(new Error('Synthetic IPC failure'));
+    else s.resolve(response([question], outcome === 'missing' ? { ok: false, code: 'E_CONVERSATION_NOT_FOUND' } : {}));
+    await older;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    expect(s.context._recoverMissingConversation).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('retains a live reply and its sidecars without duplication (already in snapshot: %s)', async (included) => {
+    const s = setup();
+    s.expected.unmatchedReplies = 1;
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(answer);
+    expect(s.ids()).toEqual(['a1']);
+    s.resolve(response(included ? [question, answer] : [question], {
+      page_start: 20, history_indexes: included ? [20, 21] : [20],
+    }));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    expect(s.rows[1].message).toMatchObject({ content: 'Answer', produced: answer.produced, form: answer.form });
+    expect(s.rows[1].message._history_index).toBe(included ? 21 : undefined);
+    // The temporary arrival buffer must not become a persistent shadow history.
+    s.context.apiFetch = async () => response([question]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1']);
+  });
+
+  it('preserves a reply if the current history request fails after it arrives', async () => {
+    const s = setup();
+    s.expected.unmatchedReplies = 1;
+    s.expected.warnings = 1;
+    s.expected.painted = false;
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(answer);
+    s.reject(new Error('Synthetic IPC failure'));
+    await loading;
+    expect(s.ids()).toEqual(['a1']);
+  });
+
+  it('retains admitted user messages alongside new replies while history is loading', async () => {
+    const s = setup();
+    s.expected.unmatchedReplies = 1;
+    s.context._claimPersistedUserMessage = () => false;
+    s.context._syncRenderedGroupMessageIdentity = () => {};
+    s.context._moveUserBeforeOrphanLivePlaceholder = () => {};
+    s.context._markEarlierLiveMessagesForUser = () => {};
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive(question);
+    s.receive(answer);
+    s.resolve(response([]));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('retains a reply recovered by polling during the history request', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    await s.context._recoverPolledVisibleMessages('c1', [answer]);
+    expect(s.ids()).toEqual(['a1']);
+    s.resolve(response([question]));
+    await loading;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('does not paint polled replies after switching conversations during member refresh', async () => {
+    const s = setup();
+    s.expected.painted = false;
+    let finishMembers!: () => void;
+    s.context._refreshGroupMembers = () => new Promise<void>((resolve) => { finishMembers = resolve; });
+    const polling = s.context._recoverPolledVisibleMessages('c1', [answer]);
+    s.context.currentCid = 'c2';
+    finishMembers();
+    expect(await polling).toBe(false);
+    expect(s.ids()).toEqual([]);
+  });
+
+  it('carries unpainted arrivals into a replacement history request', async () => {
+    const s = setup();
+    s.expected.unmatchedReplies = 1;
+    const older = s.context.loadConversationHistory('c1');
+    const finishOlder = s.resolve;
+    s.receive(answer);
+    s.context.apiFetch = async () => response([question]);
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+    finishOlder(response([]));
+    await older;
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+
+  it('does not mix background messages into a loading conversation', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    s.receive({ ...answer, id: 'foreign' }, 'c2');
+    s.resolve(response([question]));
+    await loading;
+    expect(s.ids()).toEqual(['u1']);
+  });
+
+  it('does not let a failed request from a previous conversation erase the current one', async () => {
+    const s = setup();
+    const older = s.context.loadConversationHistory('c1');
+    s.context.currentCid = 'c2';
+    s.context.apiFetch = async () => response([{ ...answer, id: 'c2-answer' }]);
+    await s.context.loadConversationHistory('c2');
+    s.reject(new Error('Synthetic IPC failure'));
+    await older;
+    expect(s.ids()).toEqual(['c2-answer']);
+  });
+
+  it('keeps a painted transcript if a secondary post-paint action rejects', async () => {
+    const s = setup();
+    s.expected.warnings = 1;
+    s.context.apiFetch = async () => response([question, answer]);
+    s.context._evaluateAutoRecipient = async () => { throw new Error('Synthetic secondary failure'); };
+    await s.context.loadConversationHistory('c1');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+});
+
+describe('conversation run observer cleanup', () => {
+  it('defers cleanup only while the primary send stream still owns the turn', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._observerShouldDeferCleanup('c1', true)).toBe(false);
+    expect(context._observerShouldDeferCleanup('c1', false)).toBe(false);
+
+    vm.runInContext('_convChatCtrls.set("c1", { abort() {} })', context);
+
+    expect(context._observerShouldDeferCleanup('c1', true)).toBe(true);
+    expect(context._observerShouldDeferCleanup('c1', false)).toBe(false);
+  });
+});
+
+describe('conversation sidebar task row actions', () => {
+  it('keeps the selected task mounted while other task rows still navigate', () => {
+    const context = loadConversationRenderer();
+    const navigations: Array<[string, string]> = [];
+    const trackedClicks: Array<[string, Record<string, unknown>]> = [];
+    let rowClick: ((event: any) => void) | null = null;
+    const row: any = {
+      dataset: { cid: 'c1' },
+      addEventListener(type: string, listener: (event: any) => void) {
+        if (type === 'click') rowClick = listener;
+      },
+    };
+    const container: any = {
+      querySelectorAll(selector: string) {
+        return selector === '.conv-item' ? [row] : [];
+      },
+    };
+    const event = { target: { closest: () => null } };
+    context.currentView = 'conversation';
+    context.currentCid = 'c1';
+    context.setView = (view: string, cid: string) => { navigations.push([view, cid]); };
+    context.window.Monitor = true;
+    context.Monitor = {
+      click: (action: string, data: Record<string, unknown>) => trackedClicks.push([action, data]),
+    };
+
+    context._bindConversationSidebarItems(container);
+    expect(rowClick).not.toBeNull();
+
+    rowClick!(event);
+    expect(navigations).toEqual([]);
+
+    row.dataset.cid = 'c2';
+    rowClick!(event);
+    expect(navigations).toEqual([['conversation', 'c2']]);
+  });
+
+  it('renders a single menu button after the title', () => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Pinned layout',
+      pinned_at: '',
+    });
+
+    const titleIdx = html.indexOf('class="conv-item-title"');
+    const actionsIdx = html.indexOf('class="conv-item-actions"');
+    const menuIdx = html.indexOf('class="conv-item-action conv-item-menu"');
+
+    expect(titleIdx).toBeGreaterThan(-1);
+    expect(actionsIdx).toBeGreaterThan(titleIdx);
+    expect(menuIdx).toBeGreaterThan(actionsIdx);
+    expect(html).toContain('data-hide-pin="0"');
+  });
+
+  it('marks the menu as no-pin in surfaces that explicitly hide pinning', () => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c2',
+      title: 'Automation run task',
+      origin_auto_task_id: 'auto-1',
+    }, { hidePin: true });
+
+    expect(html).toContain('class="conv-item-actions"');
+    expect(html).toContain('conv-item-menu');
+    expect(html).toContain('data-hide-pin="1"');
+  });
+
+  it('renders an inline title input while renaming a row', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      _conversationInlineRenameCid = "c1";
+      _conversationInlineRenameOriginal = "Editable task";
+      _conversationInlineRenameDraft = "Unsaved draft";
+    `, context);
+
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Editable task',
+    });
+
+    expect(html).toContain('class="conv-item-title-input"');
+    expect(html).toContain('data-conv-rename-cid="c1"');
+    expect(html).toContain('value="Unsaved draft"');
+    expect(html).not.toContain('class="conv-item-title" title="Editable task"');
+  });
+
+  it('renders nested task lists with time bucket headers', () => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationTimeBucketList([
+      {
+        conversation_id: 'c1',
+        title: 'Project task',
+        updated_at: '2026-06-02T00:00:00.000Z',
+      },
+    ], { nested: true });
+
+    expect(html).toContain('class="conv-list-section-header"');
+    expect(html).toContain('Today');
+    expect(html).toContain('conv-item-nested');
+  });
+
+  it('renders no status marker for an idle entry', () => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Normal task',
+    });
+
+    expect(html).not.toContain('conv-item-status-dot');
+    expect(html).not.toContain('conv-item-status-label');
+  });
+
+  it('places the live running icon to the left of an automation icon on every sidebar copy', () => {
+    const context = loadConversationRenderer();
+    const makeCopy = () => {
+      const autoIcon: any = { kind: 'automation' };
+      const title: any = { kind: 'title', parentElement: null };
+      const row: any = {
+        children: [autoIcon, title],
+        insertBefore(node: any, anchor: any) {
+          const anchorIndex = this.children.indexOf(anchor);
+          this.children.splice(anchorIndex, 0, node);
+        },
+      };
+      title.parentElement = row;
+      const item = {
+        querySelector(selector: string) {
+          if (selector === '.conv-status-badge') return null;
+          if (selector === '.conv-item-title') return title;
+          if (selector === '.conv-item-row > .conv-item-auto-icon') return autoIcon;
+          return null;
+        },
+      };
+      return { item, row, autoIcon, title };
+    };
+    // The same task mounted twice: in the Today aggregate and under its project.
+    const todayCopy = makeCopy();
+    const projectCopy = makeCopy();
+    let badges = 0;
+    context.document.querySelectorAll = (selector: string) => (
+      selector === '.conv-item[data-cid="c1"]' ? [todayCopy.item, projectCopy.item] : []
+    );
+    context.document.createElement = () => ({
+      kind: `running-${++badges}`,
+      className: '',
+      classList: { add() {} },
+      innerHTML: '',
+    });
+    context._getQueue = () => [];
+    context.pendingConvs.set('c1', { aborted: false });
+
+    context._updateConvSidebarBadge('c1');
+
+    expect(todayCopy.row.children.map((c: any) => c.kind)).toEqual(['running-1', 'automation', 'title']);
+    expect(projectCopy.row.children.map((c: any) => c.kind)).toEqual(['running-2', 'automation', 'title']);
+  });
+
+  it('focuses the rename editor in the list the menu was opened from', async () => {
+    const context = loadConversationRenderer();
+    const focused: string[] = [];
+    const makeInput = (name: string) => ({ focus() { focused.push(name); }, select() {} });
+    const todayInput = makeInput('today');
+    const tasksInput = makeInput('tasks');
+    context.conversations.push({ conversation_id: 'c1', title: 'Task' });
+    context.renderConversationList = () => {};
+    // Document order puts the Today aggregate first.
+    context.document.querySelector = (selector: string) => (
+      selector.startsWith('input.conv-item-title-input') ? todayInput : null
+    );
+    context.document.getElementById = (id: string) => (
+      id === 'conversation-list' ? { querySelector: () => tasksInput } : null
+    );
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    context._startConversationInlineRename('c1', { anchorListId: 'conversation-list' });
+    await tick();
+    expect(focused).toEqual(['tasks']);
+
+    context._startConversationInlineRename('c1');
+    await tick();
+    expect(focused).toEqual(['tasks', 'today']);
+  });
+
+  it('renders the rename editor only in the list the rename was started from', async () => {
+    const context = loadConversationRenderer();
+    context.conversations.push({ conversation_id: 'c1', title: 'Task' });
+    context.renderConversationList = () => {};
+
+    context._startConversationInlineRename('c1', { anchorListId: 'today-list' });
+    const todayCopy = context._renderConversationSidebarItem({ conversation_id: 'c1', title: 'Task' }, { listId: 'today-list' });
+    const tasksCopy = context._renderConversationSidebarItem({ conversation_id: 'c1', title: 'Task' }, { listId: 'conversation-list' });
+    const legacyList = context._renderConversationSidebarItem({ conversation_id: 'c1', title: 'Task' });
+
+    expect(todayCopy).toContain('data-conv-rename-cid="c1"');
+    expect(tasksCopy).not.toContain('data-conv-rename-cid');
+    expect(tasksCopy).toContain('class="conv-item-title" title="Task"');
+    // A list that declares no id keeps the previous behavior.
+    expect(legacyList).toContain('data-conv-rename-cid="c1"');
+
+    // A rename started without an anchor (no menu origin) edits every copy.
+    context._cancelConversationInlineRename('c1');
+    context._startConversationInlineRename('c1');
+    expect(context._renderConversationSidebarItem({ conversation_id: 'c1', title: 'Task' }, { listId: 'conversation-list' }))
+      .toContain('data-conv-rename-cid="c1"');
+  });
+
+  it('passes the opening list to the rename action from the row menu', () => {
+    const context = loadConversationRenderer();
+    const renameCalls: any[] = [];
+    context._startConversationInlineRename = (cid: string, opts: any) => { renameCalls.push([cid, opts]); };
+    context.conversations.push({ conversation_id: 'c1', title: 'Task' });
+    const menuItems: any[] = [];
+    const menu: any = {
+      id: 'conversation-action-menu',
+      style: { display: 'none' },
+      dataset: {},
+      innerHTML: '',
+      getBoundingClientRect: () => ({ width: 120, height: 90 }),
+      querySelectorAll: (selector: string) => (selector === '.ctx-row-menu-item' ? menuItems : []),
+    };
+    context.document.getElementById = (id: string) => (id === 'conversation-action-menu' ? menu : null);
+    context.document.querySelectorAll = () => [];
+    context.window.innerWidth = 1200;
+    context.window.innerHeight = 800;
+    const row = {
+      classList: { add() {}, remove() {} },
+      closest: (selector: string) => (selector === '[id]' ? { id: 'today-list' } : null),
+    };
+    const anchorBtn = {
+      closest: (selector: string) => (selector === '.conv-item' ? row : null),
+      getBoundingClientRect: () => ({ left: 100, right: 160, top: 300, bottom: 320 }),
+    };
+    Object.defineProperty(menu, 'innerHTML', {
+      set(value: string) {
+        menuItems.length = 0;
+        for (const match of value.matchAll(/data-action="([^"]+)" data-action-idx="(\d+)"/g)) {
+          const item: any = { dataset: { action: match[1], actionIdx: match[2] }, listeners: {} as any };
+          item.addEventListener = (type: string, fn: any) => { item.listeners[type] = fn; };
+          menuItems.push(item);
+        }
+      },
+      get() { return ''; },
+    });
+
+    context._openConversationActionMenu(anchorBtn, 'c1', { hidePin: false });
+    const rename = menuItems.find((item) => item.dataset.action === 'rename');
+    rename.listeners.click({ stopPropagation() {} });
+
+    expect(renameCalls).toEqual([['c1', expect.objectContaining({ anchorListId: 'today-list', hidePin: false })]]);
+  });
+
+  it('shows a text label without a dot for an abnormal (blocked) status', () => {
+    const context = loadConversationRenderer();
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Stuck task',
+      status: 'blocked',
+    });
+
+    const labelIdx = html.indexOf('class="conv-item-status-label is-blocked"');
+    const titleIdx = html.indexOf('class="conv-item-title"');
+    const actionsIdx = html.indexOf('class="conv-item-actions"');
+
+    expect(html).not.toContain('conv-item-status-dot');
+    expect(labelIdx).toBeGreaterThan(titleIdx); // label after the title
+    expect(labelIdx).toBeLessThan(actionsIdx); // and before the hover actions
+    expect(html).toContain('>Blocked<');
+  });
+
+  it('never fabricates a status: unknown and normal values stay unadorned', () => {
+    const context = loadConversationRenderer();
+    const unknown = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Mystery',
+      status: 'totally-made-up',
+    });
+    expect(unknown).not.toContain('conv-item-status-dot');
+    expect(unknown).not.toContain('conv-item-status-label');
+
+    const done = context._renderConversationSidebarItem({
+      conversation_id: 'c2',
+      title: 'Finished',
+      status: 'done',
+    });
+    expect(done).not.toContain('conv-item-status-dot');
+    expect(done).not.toContain('conv-item-status-label');
+  });
+
+  it('renders a failed label without a dot for a conversation marked failed in-session', () => {
+    const context = loadConversationRenderer();
+    // Simulate the in-session overlay set by the streaming controller onDone.
+    vm.runInContext('_failedConvs.add("c1")', context);
+
+    const html = context._renderConversationSidebarItem({
+      conversation_id: 'c1',
+      title: 'Analyze Google earnings',
+    });
+
+    expect(html).not.toContain('conv-item-status-dot');
+    const labelIdx = html.indexOf('class="conv-item-status-label is-failed"');
+    const titleIdx = html.indexOf('class="conv-item-title"');
+    const actionsIdx = html.indexOf('class="conv-item-actions"');
+    expect(labelIdx).toBeGreaterThan(titleIdx);
+    expect(labelIdx).toBeLessThan(actionsIdx);
+    expect(html).toContain('>Failed<');
+  });
+
+  it('failed overlay wins over a backend status and clears when the cid leaves the set', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext('_failedConvs.add("c1")', context);
+    // Even with a backend `status`, the in-session failure takes precedence.
+    expect(context._convRowStatus({ conversation_id: 'c1', status: 'done' })).toBe('failed');
+
+    vm.runInContext('_failedConvs.delete("c1")', context);
+    expect(context._convRowStatus({ conversation_id: 'c1', status: 'done' })).toBe('done');
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('derives the failed mark from history: a persisted failure reply (failure_kind + danger text)', () => {
+    const context = loadConversationRenderer();
+    // Shape mirrors the on-disk `<cid>.jsonl` model/provider failure record.
+    const history = [
+      { from: 'user', text: '为什么自由现金会劣化' },
+      {
+        from: 'commander',
+        failure_kind: 'model',
+        failure_code: 'provider_error',
+        text: '<span style="color:var(--danger)">⚠️ 模型调用失败：All configured model candidates failed</span>',
+      },
+    ];
+    context._syncFailedFromHistory('c1', history);
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('failed');
+  });
+
+  it('uses the latest persisted message instead of a stale failed index status after reopen', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext('_failedConvs.add("c1")', context);
+
+    // A clean persisted reply is the user's durable result. A future/legacy
+    // index may still carry an older failed status, but it must not override
+    // what reopening the task just proved from history.
+    context._syncFailedFromHistory('c1', [
+      { from: 'user', text: 'hi' },
+      { from: 'commander', text: 'Here is the answer.' },
+    ]);
+    expect(context._convRowStatus({ conversation_id: 'c1', status: 'failed' })).toBe('idle');
+
+    // A trailing unanswered user message is pending, not failed. It also
+    // neutralizes a stale failed index without pretending the turn settled.
+    vm.runInContext('_failedConvs.add("c2")', context);
+    context._syncFailedFromHistory('c2', [
+      { from: 'commander', text: 'Prior reply.' },
+      { from: 'user', text: 'follow-up, no reply yet' },
+    ]);
+    expect(context._convRowStatus({ conversation_id: 'c2', status: 'failed' })).toBe('idle');
+  });
+
+  it('does NOT flag a healthy reply that merely mentions error text (no structured failure_kind)', () => {
+    const context = loadConversationRenderer();
+    // A successful reply about the failure feature itself: contains danger
+    // styling + the words "模型调用失败" but carries no `failure_kind`. Must stay idle.
+    context._syncFailedFromHistory('c1', [
+      { from: 'user', text: '把头像去掉' },
+      {
+        from: 'commander',
+        text: '好的，已完成。异常态用 <span style="color:var(--danger)">模型调用失败</span> 的样式展示。',
+      },
+    ]);
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('_isStructuredFailure ignores retired semantic failure codes and never sniffs text', () => {
+    const context = loadConversationRenderer();
+    expect(context._isStructuredFailure({ failure_kind: 'model' })).toBe(true);
+    expect(context._isStructuredFailure({ failed: true })).toBe(true);
+    expect(context._isStructuredFailure({ error: true })).toBe(true);
+    expect(context._isStructuredFailure({ failure_kind: 'operation', failure_code: 'claimed_media_missing' })).toBe(false);
+    expect(context._isStructuredFailure({ failure_kind: 'operation', failure_code: 'agent_reported_failure' })).toBe(false);
+    // Danger-styled / error-mentioning TEXT with no structured flag → not failed.
+    expect(context._isStructuredFailure({ text: '<span style="color:var(--danger)">模型调用失败</span>' })).toBe(false);
+    expect(context._isStructuredFailure({})).toBe(false);
+    expect(context._isStructuredFailure(null)).toBe(false);
+  });
+
+  it('marks a BACKGROUND conversation failed the moment its turn-end reply fails (no open needed)', () => {
+    const context = loadConversationRenderer();
+    // currentCid is '' in the harness, so 'bg' is a non-open background conv.
+    context._handleGroupBusEvent('bg', null, {
+      type: 'message',
+      turn_end: true,
+      msg: { from: 'commander', failure_kind: 'model', text: '⚠️ 模型调用失败' },
+    });
+    expect(context._convRowStatus({ conversation_id: 'bg' })).toBe('failed');
+  });
+
+  it('clears a background conversation when its latest turn-end reply is clean', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext('_failedConvs.add("bg")', context);
+    context._handleGroupBusEvent('bg', null, {
+      type: 'message',
+      turn_end: true,
+      msg: { from: 'commander', text: 'All done successfully.' },
+    });
+    expect(context._convRowStatus({ conversation_id: 'bg' })).toBe('idle');
+  });
+
+  it.each([
+    ['completed', 'idle'],
+    ['waiting_input', 'idle'],
+    ['cancelled', 'idle'],
+    ['failed', 'failed'],
+  ])('shows the user-visible task outcome for a canonical %s terminal', (status, expected) => {
+    const context = loadConversationRenderer();
+    vm.runInContext('_failedConvs.add("c1")', context);
+
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'run-1',
+      status,
+      finished_at_ms: 2_000,
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe(expected);
+  });
+
+  it('does not let an older replayed terminal overwrite a newer terminal result', () => {
+    const context = loadConversationRenderer();
+
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'new-run',
+      status: 'completed',
+      finished_at_ms: 3_000,
+    });
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'old-run',
+      status: 'failed',
+      finished_at_ms: 2_000,
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('does not let an older failed terminal overwrite a newer successful reply', () => {
+    const context = loadConversationRenderer();
+    context._handleGroupBusEvent('c1', null, {
+      type: 'message',
+      turn_end: true,
+      turn_id: 'new-turn',
+      msg: {
+        from: 'commander',
+        text: 'The task completed successfully.',
+        ts: '2026-08-08T12:00:03.000Z',
+      },
+    });
+
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'old-run',
+      status: 'failed',
+      finished_at_ms: new Date('2026-08-08T12:00:02.000Z').getTime(),
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('keeps canonical completion authoritative over a stale failed index row', () => {
+    const context = loadConversationRenderer();
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'run-1',
+      status: 'completed',
+      finished_at_ms: 2_000,
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1', status: 'failed' })).toBe('idle');
+  });
+
+  it('ignores malformed and cross-conversation terminals without clearing a real failure', () => {
+    const context = loadConversationRenderer();
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'failed-run',
+      status: 'failed',
+      finished_at_ms: 2_000,
+    });
+
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'malformed-run',
+      status: 'mystery',
+      finished_at_ms: 3_000,
+    });
+    context._syncFailedFromTaskTerminal({
+      type: 'terminal',
+      conversation_id: 'c2',
+      run_id: 'other-run',
+      status: 'completed',
+      finished_at_ms: 4_000,
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('failed');
+    expect(context._convRowStatus({ conversation_id: 'c2' })).toBe('idle');
+  });
+
+  it('does not mark on a mid-turn (non turn-end) message', () => {
+    const context = loadConversationRenderer();
+    context._handleGroupBusEvent('bg', null, {
+      type: 'message',
+      turn_end: false,
+      msg: { from: 'commander', failure_kind: 'model', text: 'partial' },
+    });
+    expect(context._convRowStatus({ conversation_id: 'bg' })).toBe('idle');
+  });
+
+  it('looks only at the last reply: a clean latest reply clears an earlier failure', () => {
+    const context = loadConversationRenderer();
+    context._syncFailedFromHistory('c1', [
+      { from: 'user', text: 'q1' },
+      { from: 'commander', failure_kind: 'model', text: '⚠️ 模型调用失败' },
+      { from: 'user', text: 'q2 (retry)' },
+      { from: 'commander', text: 'Here is the successful answer.' },
+    ]);
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('refreshes time bucket headers only when foreground return crosses a local day', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      __renderCalls = 0;
+      renderConversationList = function() { __renderCalls += 1; };
+      _conversationBucketDateKey = _conversationLocalDateKey(new Date(2026, 4, 15, 23, 50, 0));
+    `, context);
+
+    const sameDay = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 15, 23, 55, 0))',
+      context,
+    );
+    const nextDay = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 16, 0, 5, 0))',
+      context,
+    );
+    const nextDayAgain = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 16, 9, 0, 0))',
+      context,
+    );
+
+    expect(sameDay).toBe(false);
+    expect(nextDay).toBe(true);
+    expect(nextDayAgain).toBe(false);
+    expect(context.__renderCalls).toBe(1);
+  });
+
+  it('renders old time buckets as static sections instead of nested collapsibles', () => {
+    const context = loadConversationRenderer();
+    context.timeBucket = () => 'last30';
+
+    const html = context._renderConversationTimeBucketList([
+      {
+        conversation_id: 'old1',
+        title: 'Old task',
+        updated_at: '2026-05-01T00:00:00.000Z',
+      },
+    ]);
+
+    expect(html).toContain('Last 30 days');
+    expect(html).toContain('Old task');
+    expect(html).not.toContain('data-conv-bucket-toggle');
+    expect(html).not.toContain('conv-list-section-caret');
+    expect(html).not.toContain('conv-list-section-count');
+  });
+
+  it('groups loaded rows by time without inserting pagination inside a bucket', () => {
+    const context = loadConversationRenderer();
+    context.timeBucket = (iso: string) => iso.startsWith('2025') ? 'last30' : 'today';
+
+    const html = context._renderConversationTimeBucketList([
+      { conversation_id: 'recent', title: 'Recent task', updated_at: '2026-05-01T00:00:00.000Z' },
+      { conversation_id: 'old', title: 'Old task', updated_at: '2025-05-01T00:00:00.000Z' },
+    ]);
+
+    expect(html).toContain('Today');
+    expect(html).toContain('Last 30 days');
+    expect(html).toContain('Recent task');
+    expect(html).toContain('Old task');
+    expect(html).not.toContain('Load more');
+    expect(html).not.toContain('data-conv-bucket-toggle');
+    expect(html).not.toContain('data-conv-bucket-more');
+  });
+
+  it('resets a project list to its first 10 tasks when reopened', async () => {
+    const context = loadConversationRenderer();
+    const requestedOffsets: number[] = [];
+    context.apiFetch = async (url: string) => {
+      const offset = Number(new URL(url, 'https://orkas.local').searchParams.get('offset'));
+      requestedOffsets.push(offset);
+      return {
+        json: async () => ({
+          ok: true,
+          conversations: Array.from({ length: 10 }, (_, index) => ({
+            conversation_id: `p1-${offset + index}`,
+            project_id: 'p1',
+            title: `Task ${offset + index}`,
+            updated_at: '2026-05-01T00:00:00.000Z',
+          })),
+          total: 25,
+          next_offset: offset + 10 < 25 ? offset + 10 : null,
+        }),
+      };
+    };
+    context.conversations = Array.from({ length: 20 }, (_, index) => ({
+      conversation_id: `old-p1-${index}`,
+      project_id: 'p1',
+    }));
+    vm.runInContext(`
+      __renderCalls = 0;
+      renderConversationList = function() { __renderCalls += 1; };
+      _conversationProjectPages.set('p1', { initialized: true, total: 25, nextOffset: 20 });
+    `, context);
+
+    await context.loadConversationProject('p1', { reset: true });
+
+    expect(requestedOffsets).toEqual([0]);
+    expect(context.conversations).toHaveLength(10);
+    expect(context.__renderCalls).toBe(1);
+    expect(vm.runInContext('_conversationProjectPages.get("p1").nextOffset', context)).toBe(10);
+  });
+
+  it('resets the unified non-project timeline to its first 10 rows when reopened', async () => {
+    const context = loadConversationRenderer();
+    const requestedOffsets: number[] = [];
+    context.apiFetch = async (url: string) => {
+      const parsed = new URL(url, 'https://orkas.local');
+      const offset = Number(parsed.searchParams.get('offset'));
+      requestedOffsets.push(offset);
+      return {
+        json: async () => ({
+          ok: true,
+          conversations: Array.from({ length: 10 }, (_, index) => ({
+            conversation_id: `outside-${offset + index}`,
+            title: `Task ${offset + index}`,
+            updated_at: '2026-05-01T00:00:00.000Z',
+          })),
+          total: 25,
+          next_offset: offset + 10 < 25 ? offset + 10 : null,
+        }),
+      };
+    };
+    context.conversations = Array.from({ length: 20 }, (_, index) => ({
+      conversation_id: `old-outside-${index}`,
+      title: `Old task ${index}`,
+    }));
+    vm.runInContext(`
+      __renderCalls = 0;
+      renderConversationList = function() { __renderCalls += 1; };
+      _unprojectedConversationPage.initialized = true;
+      _unprojectedConversationPage.total = 25;
+      _unprojectedConversationPage.nextOffset = 20;
+      _unprojectedConversationPage.loading = false;
+    `, context);
+
+    await context._resetUnprojectedConversations();
+
+    expect(requestedOffsets).toEqual([0]);
+    expect(context.conversations).toHaveLength(10);
+    expect(context.__renderCalls).toBe(1);
+    expect(vm.runInContext('_unprojectedConversationPage.nextOffset', context)).toBe(10);
+  });
+
+  it('builds pin or unpin menu items only where pinning is enabled', () => {
+    const context = loadConversationRenderer();
+    context.conversations = [
+      { conversation_id: 'c1', title: 'Normal' },
+      { conversation_id: 'c2', title: 'Pinned', pinned_at: '2026-06-02T00:00:00.000Z' },
+    ];
+
+    expect(context._conversationActionItems('c1').map((it: any) => it.label))
+      .toEqual(['Pin', 'Rename', 'Delete']);
+    expect(context._conversationActionItems('c2').map((it: any) => it.label))
+      .toEqual(['Unpin', 'Rename', 'Delete']);
+    expect(context._conversationActionItems('c1', { hidePin: true }).map((it: any) => it.label))
+      .toEqual(['Rename', 'Delete']);
+  });
+
+  it('offers to file a task under a project only while it has none', () => {
+    // Filing relocates the conversation on disk, so the entry must not appear
+    // for a conversation that is already inside a project — the backend
+    // refuses that move and the user would be clicking a dead item.
+    const context = loadConversationRenderer();
+    vm.runInContext(
+      fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-to-project.js'), 'utf8'),
+      context,
+    );
+    context.conversations = [
+      { conversation_id: 'c1', title: 'Loose' },
+      { conversation_id: 'c2', title: 'Filed', project_id: 'p1' },
+    ];
+
+    expect(context._conversationActionItems('c1').map((it: any) => it.action))
+      .toEqual(['pin', 'rename', 'to-project', 'delete']);
+    // Filing can happen without a click, so a filed task offers the way back
+    // rather than nothing. The two entries are mutually exclusive.
+    expect(context._conversationActionItems('c2').map((it: any) => it.action))
+      .toEqual(['pin', 'rename', 'out-of-project', 'delete']);
+    // Delete stays last, and stays the only destructive entry.
+    const loose = context._conversationActionItems('c1');
+    expect(loose[loose.length - 1].danger).toBe(true);
+    expect(loose.filter((it: any) => it.danger)).toHaveLength(1);
+    expect(loose.find((it: any) => it.action === 'to-project').disabled).toBe(false);
+    vm.runInContext("groupBusyConvs.set('c1', true)", context);
+    expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
+    vm.runInContext("groupBusyConvs.delete('c1'); pendingConvs.set('c1', { aborted: true })", context);
+    expect(context._conversationActionItems('c1').find((it: any) => it.action === 'to-project').disabled).toBe(true);
+    // The relocation refuses in either direction while a turn is live.
+    vm.runInContext("groupBusyConvs.set('c2', true)", context);
+    expect(context._conversationActionItems('c2').find((it: any) => it.action === 'out-of-project').disabled).toBe(true);
+  });
+});
+
+describe('conversation filing agent choices', () => {
+  function setup(choice: any, rejected: string[] = [], moveFails = false, onPushEvent?: Function) {
+    const bindings = new Set(['already-bound']);
+    const toasts: string[] = [];
+    const ctx: any = {
+      Map, Set, console,
+      _isCommanderAgent: (id: string) => id === 'commander' || id === '__commander__',
+      conversations: [{ conversation_id: 'c1', agent_id: 'a1', agent_ids: ['a1', 'a2'] }],
+      isConvPending: () => false,
+      t: (key: string, args: unknown) => JSON.stringify({ key, args }),
+      uiToast: (message: string) => toasts.push(message),
+      uiPrompt: async () => 'Created project',
+      apiFetch: async (url: string) => ({ json: async () => {
+        if (url.includes('/members')) return { actors: [{ kind: 'agent', id: 'a3', name: 'Third' }] };
+        if (url.includes('/agents/list')) return { agents: [{ agent_id: 'a1', name: 'First', icon: 'rocket', color: 'coral' }] };
+        if (moveFails) return { ok: false, error: 'has_running_conv' };
+        return { ok: true, conversation: { conversation_id: 'c1', project_id: 'p1' } };
+      } }),
+      window: { orkas: { onPushEvent, invoke: vi.fn(async (channel: string, args: any) => {
+        if (channel === 'projects.list') return { projects: [{ project_id: 'p1', name: 'Existing project' }] };
+        if (channel === 'projects.create') return { ok: true, project: { project_id: 'p1' } };
+        if (channel === 'projects.bindings.add') {
+          if (rejected.includes(args.id)) throw new Error('agent_disabled');
+          bindings.add(args.id);
+          return { bindings: { agents: [...bindings] } };
+        }
+        throw new Error('unexpected channel');
+      }) } },
+    };
+    vm.createContext(ctx);
+  vm.runInContext(composerAccessorSource, ctx);
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-to-project.js'), 'utf8'), ctx);
+    ctx._openConversationProjectPicker = vi.fn(async () => choice);
+    return { ctx, bindings, toasts };
+  }
+
+  it.each([0, 2])('explains retained setup and manual recovery without retrying automatically (%s todos)', (count) => {
+    const listeners = new Map<string, Function>();
+    const subscribe = vi.fn((channel: string, handler: Function) => listeners.set(channel, handler));
+    const { ctx, toasts } = setup(null, [], false, subscribe);
+    // A reload flushes host receipts at did-finish-load, before deferred boot
+    // subscriptions run. This passive sink must already be listening then.
+    expect(listeners.has('conversations:filing-failed')).toBe(true);
+    ctx.startConversationFiledSubscription();
+    ctx.startConversationFiledSubscription();
+    expect(ctx.window.orkas.onPushEvent).toHaveBeenCalledTimes(2);
+    const onFailure = listeners.get('conversations:filing-failed');
+    expect(onFailure).toBeTypeOf('function');
+    onFailure!({ cid: 'c1', projectId: 'p1', projectName: 'Created project 2', todosCreated: count });
+    expect(JSON.parse(toasts[0])).toEqual({
+      key: count ? 'chat.conv_filing_failed_with_todos' : 'chat.conv_filing_failed',
+      args: { name: 'Created project 2', count },
+    });
+    expect(ctx.conversations[0].project_id).toBeUndefined();
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+  });
+
+
+  it.each([false, true])('adds only the chosen agents and preserves existing bindings (create=%s)', async (create) => {
+    const { ctx, bindings, toasts } = setup({ create, projectId: 'p1', agentIds: ['a1', 'a3'] });
+    await ctx._moveConversationToExistingProject('c1');
+    expect([...bindings]).toEqual(['already-bound', 'a1', 'a3']);
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved');
+    const offered = ctx._openConversationProjectPicker.mock.calls[0][1];
+    expect(offered.map((agent: any) => agent.id).sort()).toEqual(['a1', 'a2', 'a3']);
+    expect(offered.find((agent: any) => agent.id === 'a3').name).toBe('Third');
+    expect(offered.find((agent: any) => agent.id === 'a1')).toMatchObject({ icon: 'rocket', color: 'coral' });
+  });
+
+  it('takes a filed task back out and stops nesting it under the old project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async (channel: string) => {
+      if (channel === 'conversations.moveOut') {
+        // The backend row simply omits project_id once the task is unfiled.
+        return { ok: true, conversation: { conversation_id: 'c1', title: 'Filed' } };
+      }
+      throw new Error(`unexpected channel ${channel}`);
+    });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    // Merging the returned row would leave the old project_id in the cache and
+    // the sidebar would keep the task nested under a project it left.
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved_out');
+  });
+
+  it('updates the sidebar from a host unfile receipt and reports an unfile refusal without retrying', async () => {
+    const listeners = new Map<string, Function>();
+    const { ctx, toasts } = setup(null, [], false, (channel: string, handler: Function) => listeners.set(channel, handler));
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.startConversationFiledSubscription();
+    listeners.get('conversations:filing-failed')!({ cid: 'c1', kind: 'unfile' });
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_failed');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    listeners.get('conversations:filed')!({ conversation: { conversation_id: 'c1', title: 'Filed' } });
+    await Promise.resolve();
+    expect(ctx.conversations[0].project_id).toBe('');
+    expect(ctx.conversations[0].title).toBe('Filed');
+  });
+
+  it('keeps a task where it is when the relocation is refused', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Filed', project_id: 'p1' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('has_running_conv'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_running');
+  });
+
+  it('does nothing for a task that is not in a project', async () => {
+    const { ctx, toasts } = setup(null);
+    ctx.conversations = [{ conversation_id: 'c1', title: 'Loose' }];
+    ctx.window.orkas.invoke = vi.fn(async () => { throw new Error('should not be called'); });
+
+    await ctx._moveConversationOutOfProject('c1');
+
+    expect(ctx.window.orkas.invoke).not.toHaveBeenCalled();
+    expect(toasts).toEqual([]);
+  });
+
+  it('omits the commander even when legacy summaries include its actor ids', async () => {
+    const { ctx } = setup(null);
+    ctx.apiFetch = async () => ({ json: async () => ({ actors: [
+      { kind: 'commander', id: 'commander' }, { kind: 'user', id: 'user' },
+    ] }) });
+    expect(await ctx._convMoveAgents('c1', { agent_id: 'commander', agent_ids: ['__commander__'] })).toEqual([]);
+    const mixed = await ctx._convMoveAgents('c1', { agent_id: 'commander', agent_ids: ['a1', '__commander__'] });
+    expect(mixed.map((agent: any) => agent.id)).toEqual(['a1']);
+  });
+
+  it.each([['a2'], ['a1', 'a2']])('reports rejected selections without undoing the task move (%j)', async (...rejected) => {
+    const { ctx, bindings, toasts } = setup({ projectId: 'p1', agentIds: ['a1', 'a2'] }, rejected);
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect(bindings.has('already-bound')).toBe(true);
+    expect(bindings.has('a1')).toBe(!rejected.includes('a1'));
+    expect(JSON.parse(toasts[0])).toEqual({ key: 'chat.conv_moved_agents_failed', args: { name: 'Existing project', count: rejected.length } });
+  });
+
+  it('allows filing with every agent unchecked', async () => {
+    const { ctx, bindings, toasts } = setup({ projectId: 'p1', agentIds: [] });
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBe('p1');
+    expect([...bindings]).toEqual(['already-bound']);
+    expect(JSON.parse(toasts[0]).key).toBe('chat.conv_moved');
+  });
+
+  it.each([null, { projectId: 'p1', agentIds: ['a1'] }])('does not change bindings on cancel or refused move (%j)', async (choice) => {
+    const { ctx, bindings, toasts } = setup(choice, [], true);
+    await ctx._moveConversationToExistingProject('c1');
+    expect(ctx.conversations[0].project_id).toBeUndefined();
+    expect([...bindings]).toEqual(['already-bound']);
+    expect(toasts.length).toBe(choice ? 1 : 0);
+    if (choice) expect(JSON.parse(toasts[0]).key).toBe('chat.conv_move_running');
+  });
+});
+
+describe('conversation cross-conversation event isolation', () => {
+  it('does not render background task events into the visible task', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'visible';
+    context.__placeholderCalls = 0;
+    vm.runInContext(`
+      _ensureActorPlaceholder = function() {
+        __placeholderCalls += 1;
+        throw new Error('background event rendered into current DOM');
+      };
+    `, context);
+
+    context._handleGroupBusEvent('background', null, {
+      type: 'process',
+      cid: 'background',
+      actor: 'agent-1',
+      turn_id: 'turn-1',
+      data: { type: 'delta', text: 'hidden' },
+    });
+
+    expect(context.__placeholderCalls).toBe(0);
+  });
+
+  it('does not promote a background task in the sidebar when its reply lands', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'visible';
+    context.conversations = [
+      {
+        conversation_id: 'visible',
+        last_active_at: '2026-07-30T12:00:00.000Z',
+      },
+      {
+        conversation_id: 'background',
+        last_active_at: '2026-07-30T10:00:00.000Z',
+      },
+    ];
+    context.__renderCalls = 0;
+    vm.runInContext(`
+      renderConversationList = function() { __renderCalls += 1; };
+      appendChatMessage = function() { return null; };
+    `, context);
+
+    context._handleGroupBusEvent('background', null, {
+      type: 'message',
+      cid: 'background',
+      turn_id: 'turn-1',
+      turn_end: true,
+      msg: {
+        id: 'message-1',
+        ts: '2026-07-30T11:00:00.000Z',
+        from: 'agent-1',
+        to: ['user'],
+        text: 'done',
+      },
+    });
+
+    expect(context.conversations.map((item: any) => item.conversation_id))
+      .toEqual(['visible', 'background']);
+    expect(context.conversations[1].last_active_at).toBe('2026-07-30T11:00:00.000Z');
+    expect(context.__renderCalls).toBe(1);
+
+    // Opening the conversation rebuilds it from jsonl; there is no buffered
+    // backlog to replay, so ordering must already be settled by the line above.
+    context.currentCid = 'background';
+    expect(context.conversations.map((item: any) => item.conversation_id))
+      .toEqual(['visible', 'background']);
+    expect(context.conversations[1].last_active_at).toBe('2026-07-30T11:00:00.000Z');
+    expect(context.__renderCalls).toBe(1);
+  });
+});
+
+describe('conversation sticky scroll', () => {
+  function fakeScrollEl() {
+    const listeners: Record<string, Function[]> = {};
+    return {
+      scrollTop: 500,
+      scrollHeight: 1200,
+      clientHeight: 400,
+      _stickyEnabled: true,
+      _stickyUserPaused: false,
+      style: {
+        scrollBehavior: '',
+        removeProperty(name: string) {
+          if (name === 'scroll-behavior') this.scrollBehavior = '';
+        },
+      },
+      addEventListener(type: string, fn: Function) {
+        (listeners[type] ||= []).push(fn);
+      },
+      dispatch(type: string, event: any = {}) {
+        for (const fn of listeners[type] || []) fn(event);
+      },
+    } as any;
+  }
+
+  it('keeps the process rail pinned across non-user layout growth', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 800;
+
+    context._bindProcessStickToBottom(el);
+    el.scrollHeight = 1260;
+    context._stickProcessBottomIfPinned(el);
+
+    expect(el._processStickyBound).toBe(true);
+    expect(el._processStickyEnabled).toBe(true);
+    expect(el.scrollTop).toBe(1260);
+  });
+
+  it('pauses process-rail following after an explicit user scroll-up', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 800;
+
+    context._bindProcessStickToBottom(el);
+    el.dispatch('wheel', { deltaY: -120 });
+    el.scrollHeight = 1260;
+    context._stickProcessBottomIfPinned(el);
+
+    expect(el._processStickyEnabled).toBe(false);
+    expect(el._processStickyUserPaused).toBe(true);
+    expect(el.scrollTop).toBe(800);
+  });
+
+  it('resumes process-rail following after the user returns to the bottom', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 800;
+
+    context._bindProcessStickToBottom(el);
+    el.dispatch('wheel', { deltaY: -120 });
+    el.scrollHeight = 1260;
+    el.scrollTop = 860;
+    el.dispatch('scroll');
+    el.scrollHeight = 1320;
+    context._stickProcessBottomIfPinned(el);
+
+    expect(el._processStickyEnabled).toBe(true);
+    expect(el._processStickyUserPaused).toBe(false);
+    expect(el.scrollTop).toBe(1320);
+  });
+
+  it('binds user scroll gestures when a fresh history schedules its first send-time pin', () => {
+    const context = loadConversationRenderer();
+    const frames: Function[] = [];
+    context.requestAnimationFrame = (fn: Function) => {
+      frames.push(fn);
+      return frames.length;
+    };
+    const el = fakeScrollEl();
+    el.querySelector = () => null;
+    const msg = { isConnected: true } as any;
+
+    context._pinMessageToTopWithDynamicSpacer(msg, el);
+
+    // A new task enters the conversation with skipLoad=true, so history
+    // hydration never gets a chance to install these gesture listeners.
+    // The send-time pin must make its own scroll surface interactive before
+    // the delayed spacer is activated.
+    expect(el._stickyBound).toBe(true);
+  });
+
+  it('does not force bottom while the user scrolls up during streaming', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+
+    context._bindStickToBottom(el);
+    el.dispatch('wheel', { deltaY: -120 });
+    context._stickBottomIfPinned(el);
+
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('releases the send-time scroll pin on a downward wheel gesture', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el.scrollTop = 800; // currently at the artificial spacer's bottom edge
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('wheel', { deltaY: 120 });
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+  });
+
+  it('releases the send-time scroll pin on a touch scroll gesture', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('touchmove');
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+  });
+
+  it('releases the send-time scroll pin when a bare scroll moves away from its target', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el._scrollPinTargetTop = 500;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.scrollTop = 320;
+    el.dispatch('scroll');
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._scrollPinTargetTop).toBeUndefined();
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+    expect(el.scrollTop).toBe(320);
+  });
+
+  it('keeps the send-time scroll pin for its own delayed scroll event', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el._scrollPinTargetTop = 500;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('scroll');
+
+    expect(spacer.removed).toBe(false);
+    expect(el._scrollPinActive).toBe(true);
+    expect(el._scrollPinTargetTop).toBe(500);
+  });
+
+  it('adopts Chromium\'s clamped programmatic pin position before honoring later user scrolls', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el._scrollPinTargetTop = 500;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    context._markProgrammaticStickyScroll(el);
+    el.scrollTop = 477;
+    el.dispatch('scroll');
+
+    expect(spacer.removed).toBe(false);
+    expect(el._scrollPinActive).toBe(true);
+    expect(el._scrollPinTargetTop).toBe(477);
+
+    el._stickyProgrammaticUntil = 0;
+    el.scrollTop = 320;
+    el.dispatch('scroll');
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+  });
+
+  it('cancels a delayed send-time pin when the stream settles before layout frames run', () => {
+    const context = loadConversationRenderer();
+    const frames: Function[] = [];
+    context.requestAnimationFrame = (fn: Function) => {
+      frames.push(fn);
+      return frames.length;
+    };
+    const appended: any[] = [];
+    const el = {
+      isConnected: true,
+      _stickyEnabled: true,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      appendChild(node: any) { appended.push(node); },
+    } as any;
+    const msg = { isConnected: true } as any;
+
+    context._pinMessageToTopWithDynamicSpacer(msg, el);
+    expect(frames).toHaveLength(1);
+
+    // Mirrors createChatController's terminal finally block. The already
+    // queued rAF is intentionally still invoked below to prove the epoch
+    // guard works even when the host cannot cancel it.
+    context._setChatScrollOffset(false, el);
+    frames.shift()?.();
+
+    expect(appended).toHaveLength(0);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._scrollPinInnerRaf).toBeNull();
+  });
+
+  it('clears the active task scroll pin at terminal settlement', () => {
+    const context = loadConversationRenderer();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    const history = {
+      _scrollPinActive: true,
+      querySelector: (selector: string) => (
+        selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+      ),
+    } as any;
+    context.currentCid = 'c1';
+    context.pendingConvs.set('c1', { aborted: false });
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._stopRuntimeActorRecovery = () => {};
+    context._stopGroupEventObserver = () => {};
+    context.isGroupConversationBusy = () => false;
+    context.stopPolling = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context._settleDanglingActorPlaceholders = () => {};
+    context._updateConvSendUI = () => {};
+
+    context._finishStreamingMsg('c1');
+
+    expect(spacer.removed).toBe(true);
+    expect(history._scrollPinActive).toBe(false);
+  });
+
+  it('resumes bottom-follow after the user returns to the bottom', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+
+    context._bindStickToBottom(el);
+    el.dispatch('wheel', { deltaY: -120 });
+    el.scrollTop = 800;
+    el.dispatch('scroll');
+    context._stickBottomIfPinned(el);
+
+    expect(el._stickyEnabled).toBe(true);
+    expect(el._stickyUserPaused).toBe(false);
+    expect(el.scrollTop).toBe(1200);
+  });
+
+  it('treats scrollbar drag away from bottom as a manual pause', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+
+    context._bindStickToBottom(el);
+    el.scrollTop = 300;
+    el.dispatch('scroll');
+    context._stickBottomIfPinned(el);
+
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+    expect(el.scrollTop).toBe(300);
+  });
+
+  it('leaves outer scroll alone while scroll-pin spacer is active', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = { style: { height: '180px' } };
+    let refreshed = false;
+
+    el._scrollPinActive = true;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' ? spacer : null
+    );
+    context._setChatScrollOffset = () => { refreshed = true; };
+
+    context._stickBottomIfPinned(el);
+
+    expect(refreshed).toBe(false);
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('uses generic sticky scrolling for chat history', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.id = 'chat-history';
+
+    context._stickBottomIfPinned(el);
+
+    expect(el.scrollTop).toBe(1200);
+  });
+
+  it('preserves scroll position during background history reconcile', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 240;
+
+    context._restoreHistoryReloadScroll(el, { top: 240, bottom: 560, nearBottom: false });
+
+    expect(el.scrollTop).toBe(240);
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+  });
+
+  it('keeps the user anchored to bottom across history reconcile relayout', async () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 800;
+    const snapshot = context._captureHistoryReloadScroll(el);
+
+    el.scrollHeight = 400;
+    context._restoreHistoryReloadScroll(el, snapshot);
+    expect(el.scrollTop).toBe(0);
+
+    el.scrollHeight = 1800;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(el.scrollTop).toBe(1400);
+    expect(el._stickyEnabled).toBe(true);
+    expect(el._stickyUserPaused).toBe(false);
+  });
+
+  it('still jumps to bottom when opening conversation history explicitly', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 0;
+
+    context._scrollToBottomNoAnim(el);
+
+    expect(el.scrollTop).toBe(1200);
+    expect(el._stickyEnabled).toBe(true);
+    expect(el._stickyUserPaused).toBe(false);
+  });
+
+  it('does not force bottom when a streaming reply finalizes', () => {
+    const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
+    const parent = fakeScrollEl();
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    const finalEl = {
+      style: { display: 'none' },
+      innerHTML: '',
+      querySelector: () => null,
+    } as any;
+    const msg = {
+      dataset: { streamBuf: 'partial' },
+      parentElement: parent,
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        return null;
+      },
+    } as any;
+
+    context._streamingSetFinal(msg, 'done', { archive: false });
+
+    expect(parent.scrollTop).toBe(500);
+    expect(finalEl.style.display).toBe('');
+    expect(msg.dataset.finalText).toBe('done');
+  });
+
+  it('preserves Commander reply text verbatim at the streaming display boundary', () => {
+    const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    const finalEl = {
+      style: { display: 'none' },
+      innerHTML: '',
+      querySelector: () => null,
+    } as any;
+    const msg = {
+      dataset: { fromActor: 'commander', streamBuf: 'partial' },
+      parentElement: fakeScrollEl(),
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        return null;
+      },
+    } as any;
+    const reply = '[Commander -> User]\n\nThis literal example is part of the answer.';
+
+    context._streamingSetFinal(msg, reply, { archive: false });
+
+    expect(msg.dataset.finalText).toBe(reply);
+    expect(finalEl.innerHTML).toContain('Commander -&gt; User');
+    expect(finalEl.innerHTML).toContain('This literal example is part of the answer.');
+  });
+
+  it('waits for offscreen math before painting a finalized streaming reply', async () => {
+    const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    context.typesetMathHtml = async (html: string) => html.replace(
+      '\\(y=2x+b\\)',
+      '<mjx-container>y=2x+b</mjx-container>',
+    );
+    const finalEl = {
+      style: { display: '' },
+      innerHTML: '<div class="markdown-body">old</div>',
+      isConnected: true,
+      querySelector: (selector: string) => (
+        selector === '.markdown-body' ? {} : null
+      ),
+    } as any;
+    const msg = {
+      dataset: {
+        streamDisplay: '公式 \\(y=2x+b\\)',
+        streamBuf: '公式 \\(y=2x+b\\)',
+      },
+      parentElement: fakeScrollEl(),
+      _streamMathTimer: setTimeout(() => {}, 1000),
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        return null;
+      },
+    } as any;
+
+    context._streamingSetFinal(msg, '公式 \\(y=2x+b\\)', { archive: false });
+
+    expect(finalEl.innerHTML).toContain('old');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(finalEl.innerHTML).toContain('<mjx-container>y=2x+b</mjx-container>');
+    expect(msg._streamMathTimer).toBeNull();
+  });
+});
+
+describe('conversation stream lifecycle idempotency', () => {
+  it.each([false, true])('preserves an active recovery stream through pairing, cancellation, and reconnection (side observer: %s)', async (allowWithController) => {
+    const context = loadConversationRenderer();
+    const shouldDeferCleanup = context._observerShouldDeferCleanup;
+    const { loadingEl } = setupRunningObserverTestContext(context);
+    context._observerShouldDeferCleanup = shouldDeferCleanup;
+    context._removeEmptyStreamingPlaceholder = () => {};
+    const cleanup = vi.fn();
+    context._finishStreamingMsg = cleanup;
+    context._makeStreamPaintYield = () => () => null;
+    const delivered: any[] = [];
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    const streams: Array<{ writer: ReadableStreamDefaultController<Uint8Array>; signal: AbortSignal }> = [];
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      const body = new ReadableStream<Uint8Array>({
+        start(writer) {
+          streams.push({ writer, signal: options.signal });
+          options.signal.addEventListener('abort', () => writer.close(), { once: true });
+        },
+      });
+      return { ok: true, body };
+    };
+    const publish = (index: number, ...events: any[]) => streams[index].writer.enqueue(
+      new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('')),
+    );
+    const progress = (turn: string) => ({
+      type: 'process', actor: 'commander', turn_id: turn, seg: 0,
+      data: { type: 'delta', phase: 'commentary', text: 'Still checking.\n' },
+    });
+    const first = progress('before-pairing');
+    const next = progress('after-pairing');
+    const resumed = progress('after-reconnect');
+    const terminal = { type: 'message', msg: { id: 'reply-1', from: 'commander', text: 'Done.' } };
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController });
+    let reconnected: { cancel(): void } | null = null;
+    try {
+      publish(0, first);
+      await vi.waitFor(() => expect(delivered).toEqual([first]));
+      context.__primaryController = { abort: vi.fn() };
+      context.pendingConvs.get('c1').controller = context.__primaryController;
+      vm.runInContext(`_convChatCtrls.set('c1', __primaryController)`, context);
+      // Repeated polling/send triggers must reuse the same active transport.
+      for (let i = 0; i < 3; i += 1) {
+        context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+      }
+      expect(streams).toHaveLength(1);
+      context._handleStreamEvent('c1', loadingEl, {
+        type: 'event', event: { stream: 'group', data: next },
+      });
+      publish(0, next, terminal);
+      await vi.waitFor(() => expect(delivered).toEqual([first, next, terminal]));
+
+      // The normal observer-stop path must find the promoted subscription and
+      // cancel its transport, without aborting or settling the active send.
+      context._stopGroupEventObserver('c1');
+      expect(streams[0].signal.aborted).toBe(true);
+      await vi.waitFor(() => expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0));
+      expect(context.__primaryController.abort).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(context.pendingConvs.get('c1').controller).toBe(context.__primaryController);
+
+      // Once the primary is gone, a fresh recovery subscription owns text
+      // again. Pairing from the old subscription must not leak into it.
+      vm.runInContext(`_convChatCtrls.delete('c1')`, context);
+      context.pendingConvs.get('c1').controller = null;
+      reconnected = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+      expect(streams).toHaveLength(2);
+      publish(1, resumed);
+      await vi.waitFor(() => expect(delivered).toEqual([first, next, terminal, resumed]));
+    } finally {
+      observer.cancel();
+      reconnected?.cancel();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
+  it.each([
+    { allowWithController: false, primarySettled: false },
+    { allowWithController: true, primarySettled: false },
+    { allowWithController: false, primarySettled: true },
+    { allowWithController: true, primarySettled: true },
+  ])('hands an existing observer to a later primary without repeating progress ($allowWithController, settled: $primarySettled)', async ({ allowWithController, primarySettled }) => {
+    const context = loadConversationRenderer();
+    const shouldDeferCleanup = context._observerShouldDeferCleanup;
+    const { loadingEl } = setupRunningObserverTestContext(context);
+    context._observerShouldDeferCleanup = shouldDeferCleanup;
+    const delivered: any[] = [];
+    const cleanup = vi.fn();
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    context._finishStreamingMsg = cleanup;
+    context._removeEmptyStreamingPlaceholder = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    let resolveResponse: (value: unknown) => void = () => {};
+    let observerSignal: AbortSignal | undefined;
+    let subscriptions = 0;
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      subscriptions += 1;
+      observerSignal = options.signal;
+      return new Promise(resolve => { resolveResponse = resolve; });
+    };
+
+    // Recovery can subscribe before the next send, with its response still
+    // pending. Reusing that subscription must transfer process ownership.
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController });
+    context.__primaryController = { abort() {} };
+    context.pendingConvs.get('c1').controller = context.__primaryController;
+    vm.runInContext(`_convChatCtrls.set('c1', __primaryController)`, context);
+    context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+
+    // Equal prose from two distinct source events is valid and must survive.
+    const progress = [0, 1].map(seg => ({
+      type: 'process', actor: 'commander', turn_id: 'turn-1', seg,
+      data: { type: 'delta', phase: 'commentary', text: 'Checking the result.\n' },
+    }));
+    for (const event of progress) context._handleStreamEvent('c1', loadingEl, {
+      type: 'event', event: { stream: 'group', data: event },
+    });
+    // Already-buffered observer events must stay suppressed after the primary
+    // finishes; querying only the current controller map would replay them.
+    if (primarySettled) vm.runInContext(`_convChatCtrls.delete('c1')`, context);
+    const terminal = { type: 'message', msg: { id: 'reply-1', from: 'commander', text: 'Done.' } };
+    const stream = createObserverTestStream(observerSignal!, [
+      [...progress, terminal].map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+    ]);
+    resolveResponse({ ok: true, body: stream.body });
+    try {
+      await vi.waitFor(() => expect(stream.readCount).toBe(2), { timeout: 200 });
+      expect(delivered).toEqual([...progress, terminal]);
+      expect(subscriptions).toBe(1);
+      stream.release();
+      await vi.waitFor(() => expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0));
+      if (primarySettled) expect(cleanup).toHaveBeenCalledWith('c1');
+      else {
+        expect(cleanup).not.toHaveBeenCalled();
+        expect(context.pendingConvs.get('c1').controller).toBe(context.__primaryController);
+      }
+    } finally {
+      observer.cancel();
+      stream.release();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
+  it('keeps a standalone recovery stream consuming progress when polling re-arms that same controller', async () => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    const delivered: any[] = [];
+    context._handleGroupBusEvent = (_cid: string, _el: unknown, event: any) => delivered.push(event);
+    let resolveResponse: (value: unknown) => void = () => {};
+    let signal: AbortSignal | undefined;
+    const progress = { type: 'process', data: { type: 'delta', phase: 'commentary', text: 'Working.' } };
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (url.includes('/history')) return { ok: true, json: async () => ({ ok: true, history: [] }) };
+      signal = options.signal;
+      return new Promise(resolve => { resolveResponse = resolve; });
+    };
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+    context._observeConversationRunFromPlanAction('c1', { attachExisting: true, allowWithController: true });
+    const stream = createObserverTestStream(signal!, [`data: ${JSON.stringify(progress)}\n\n`]);
+    resolveResponse({ ok: true, body: stream.body });
+    try {
+      await vi.waitFor(() => expect(stream.readCount).toBe(2), { timeout: 200 });
+      expect(delivered).toEqual([progress]);
+    } finally {
+      observer.cancel();
+      stream.release();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  });
+
+  it('reserves a recovery observer before activity so concurrent triggers cannot double-subscribe', async () => {
+    const context = loadConversationRenderer();
+    context.AbortController = AbortController;
+    let streamStarts = 0;
+    context.apiFetch = (_url: string, options: any) => {
+      streamStarts += 1;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    };
+
+    const first = context._observeConversationRunFromPlanAction('c1');
+    const duplicate = context._observeConversationRunFromPlanAction('c1');
+
+    expect(first).not.toBeNull();
+    expect(duplicate).toBeNull();
+    expect(streamStarts).toBe(1);
+
+    first.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(vm.runInContext('_groupObserverReservations.size', context)).toBe(0);
+  });
+
+  it('catches up persisted replies after subscribing to an already-running task', async () => {
+    const context = loadConversationRenderer();
+    const { historyEl, loadingEl } = setupRunningObserverTestContext(context);
+    loadingEl.dataset = { placeholder: '1', renderKey: 's:turn-1:0' };
+    historyEl.querySelector = (selector: string) => selector.includes('data-render-key="s:turn-1:0"') ? loadingEl : null;
+    historyEl.querySelectorAll = (selector: string) => selector.includes('data-render-key="s:turn-1:0"') ? [loadingEl] : [];
+
+    const finalizedTexts: string[] = [];
+    context._finalizeActorPlaceholder = (_el: any, message: any) => {
+      finalizedTexts.push(String(message.text || ''));
+    };
+
+    let streamSubscribed = false;
+    let observerSignal: AbortSignal | null = null;
+    let stream: ReturnType<typeof createObserverTestStream> | null = null;
+    const requestedUrls: string[] = [];
+    context.apiFetch = async (url: string, options: any = {}) => {
+      requestedUrls.push(url);
+      if (url.includes('/events/stream')) {
+        streamSubscribed = true;
+        observerSignal = options.signal;
+        stream = createObserverTestStream(options.signal);
+        return {
+          ok: true,
+          status: 200,
+          body: stream.body,
+        };
+      }
+      if (url.includes('/history')) {
+        expect(streamSubscribed).toBe(true);
+        expect(options.signal).toBe(observerSignal);
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            history: [{
+              id: 'persisted-progress-1',
+              from: 'commander',
+              to: ['user'],
+              text: 'Progress saved before the renderer reconnected.',
+              ts: '2026-08-31T04:49:00.000Z',
+              turn_id: 'turn-1',
+              seg: 0,
+            }],
+          }),
+        };
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+    expect(observer).not.toBeNull();
+    try {
+      await vi.waitFor(() => {
+        expect(finalizedTexts).toEqual(['Progress saved before the renderer reconnected.']);
+      }, { timeout: 200 });
+      expect(requestedUrls.some((url) => url.includes('/history'))).toBe(true);
+    } finally {
+      observer.cancel();
+      stream?.release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  });
+
+  it('does not run recovery history against a paired primary send stream', async () => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    context.__primaryController = { abort() {} };
+    context.pendingConvs.get('c1').controller = context.__primaryController;
+    vm.runInContext(`_convChatCtrls.set('c1', __primaryController)`, context);
+
+    let stream: ReturnType<typeof createObserverTestStream> | null = null;
+    const requestedUrls: string[] = [];
+    context.apiFetch = async (url: string, options: any = {}) => {
+      requestedUrls.push(url);
+      if (!url.includes('/events/stream')) throw new Error(`Unexpected recovery request: ${url}`);
+      stream = createObserverTestStream(options.signal);
+      return { ok: true, status: 200, body: stream.body };
+    };
+
+    const observer = context._observeConversationRunFromPlanAction('c1', {
+      attachExisting: true,
+      allowWithController: true,
+    });
+    expect(observer).not.toBeNull();
+    try {
+      await vi.waitFor(() => expect(stream?.readCount).toBe(1), { timeout: 200 });
+    } finally {
+      observer.cancel();
+      stream?.release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  });
+
+  it('keeps consuming future events when recovery history is unavailable', async () => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+
+    const deliveredEvents: any[] = [];
+    context._handleGroupBusEvent = (_cid: string, _loadingEl: any, event: any) => {
+      deliveredEvents.push(event);
+    };
+    const futureEvent = {
+      type: 'message',
+      turn_id: 'turn-2',
+      turn_end: true,
+      msg: {
+        id: 'future-message-1',
+        from: 'commander',
+        to: ['user'],
+        text: 'Future live reply',
+        ts: '2026-08-31T05:00:00.000Z',
+        turn_id: 'turn-2',
+        seg: 0,
+      },
+    };
+    const eventChunk = `data: ${JSON.stringify(futureEvent)}\n\n`;
+    let stream: ReturnType<typeof createObserverTestStream> | null = null;
+    const requestedUrls: string[] = [];
+    context.apiFetch = async (url: string, options: any = {}) => {
+      requestedUrls.push(url);
+      if (url.includes('/events/stream')) {
+        stream = createObserverTestStream(options.signal, [eventChunk]);
+        return { ok: true, status: 200, body: stream.body };
+      }
+      if (url.includes('/history')) {
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({ ok: false, error: 'temporarily unavailable' }),
+        };
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    const observer = context._observeConversationRunFromPlanAction('c1', { attachExisting: true });
+    expect(observer).not.toBeNull();
+    try {
+      await vi.waitFor(() => expect(deliveredEvents).toEqual([futureEvent]), { timeout: 200 });
+    } finally {
+      observer.cancel();
+      stream?.release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  });
+
+  it('treats a duplicate terminal message as an idempotent replay of its finalized row', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.__existing = {
+      dataset: {
+        finalized: '1',
+        msgId: 'message-1',
+        renderKey: 's:turn-1:0',
+      },
+    };
+    context.__syncCalls = 0;
+    context.__autoRecipientCalls = 0;
+    context.document.getElementById = () => ({});
+    vm.runInContext(`
+      _findRenderedGroupMessage = function() { return __existing; };
+      _syncRenderedGroupMessageIdentity = function() { __syncCalls += 1; };
+      _claimRenderNodeForMessage = function() { throw new Error('replay claimed the row again'); };
+      appendChatMessage = function() { throw new Error('replay appended a duplicate row'); };
+      _evaluateAutoRecipient = function() { __autoRecipientCalls += 1; };
+      _scheduleConversationInfoFileRefresh = function() {};
+    `, context);
+
+    context._handleGroupBusEvent('c1', null, {
+      type: 'message',
+      turn_id: 'turn-1',
+      turn_end: true,
+      msg: {
+        id: 'message-1',
+        from: 'commander',
+        to: ['user'],
+        turn_id: 'turn-1',
+        seg: 0,
+        text: 'Canonical final answer',
+        ts: '2026-08-27T22:40:16.745Z',
+      },
+    });
+
+    expect(context.__syncCalls).toBe(1);
+    expect(context.__autoRecipientCalls).toBe(0);
+  });
+
+  it('drops a terminal-late process event instead of reopening or warning on the finalized row', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+    context.__settledRow = { dataset: { finalized: '1' } };
+    context.__warnCalls = 0;
+    vm.runInContext(`
+      _ensureActorPlaceholder = function() { return null; };
+      _findRenderNode = function() { return __settledRow; };
+      _convLog.warn = function() { __warnCalls += 1; };
+    `, context);
+
+    context._handleGroupBusEvent('c1', null, {
+      type: 'process',
+      actor: 'commander',
+      turn_id: 'turn-1',
+      seg: 0,
+      data: {
+        type: 'event',
+        event: { stream: 'tool', data: { phase: 'end', id: 'tool-1' } },
+      },
+    });
+
+    expect(context.__warnCalls).toBe(0);
+    expect(context.__settledRow.dataset).toEqual({ finalized: '1' });
+  });
+});
+
+describe('conversation history reconcile', () => {
+  // Matching used to fall back to a sender+second-timestamp+text-hash
+  // signature, which two genuinely different replies can share. Identity is now
+  // the record's render key, so a live segment row is matched exactly and a
+  // look-alike from another turn is not.
+  it('matches a live rendered reply by its render key, not by look-alike content', () => {
+    const context = loadConversationRenderer();
+    const gm = {
+      id: 'm-final',
+      from: 'commander',
+      turn_id: 'turn-1',
+      seg: 0,
+      text: 'Finished answer',
+      ts: '2026-06-28T11:20:00.000Z',
+    };
+    const live: any = { dataset: { renderKey: 's:turn-1:0' } };
+    const lookAlike: any = { dataset: { renderKey: 's:turn-2:0' } };
+    const container = {
+      querySelector(selector: string) {
+        if (selector.includes('data-msg-id')) return null;
+        return this.querySelectorAll(selector)[0] || null;
+      },
+      querySelectorAll(selector: string) {
+        const renderKey = selector.match(/data-render-key="([^"]+)"/)?.[1];
+        if (!renderKey) return [];
+        return [live, lookAlike].filter((el) => el.dataset.renderKey === renderKey);
+      },
+    };
+
+    const found = context._findRenderedGroupMessage(container, gm);
+    if (found) context._syncRenderedGroupMessageIdentity(found, gm);
+
+    expect(found).toBe(live);
+    expect(live.dataset.msgId).toBe('m-final');
+    expect(lookAlike.dataset.msgId).toBeUndefined();
+  });
+
+  // Two sends can be in flight at once (queue drain, retry) and can carry the
+  // same text within the same second. The positional fallback claims whichever
+  // un-stamped user bubble is last, so the second record would re-claim the
+  // first bubble and the first send's bubble would never get its id. The
+  // renderer-generated `client_msg_id`, echoed back by the bus, makes each
+  // claim exact.
+  // A placeholder minted after its turn began (history reload into a running
+  // conversation, re-entry, runtime recovery) must sit where the turn started,
+  // not at the bottom below newer queries (2026-08-31 report: Claude Code's
+  // live bubble rendered below the next query and its sibling agent's bubble).
+  it('anchors a late-minted placeholder at its turn start, not at the bottom', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+
+    function shimEl(className: string, ts: string, msgId = ''): any {
+      const el: any = {
+        className,
+        dataset: { ts, ...(msgId ? { msgId } : {}) },
+        style: {},
+        parentElement: null,
+        matches(selector: string) {
+          return selector === '.chat-message[data-ts]'
+            && String(this.className).includes('chat-message') && !!this.dataset.ts;
+        },
+        querySelector: () => null,
+      };
+      Object.defineProperty(el, 'previousElementSibling', {
+        get() {
+          const parent = el.parentElement;
+          if (!parent) return null;
+          return parent.children[parent.children.indexOf(el) - 1] || null;
+        },
+      });
+      Object.defineProperty(el, 'nextElementSibling', {
+        get() {
+          const parent = el.parentElement;
+          if (!parent) return null;
+          return parent.children[parent.children.indexOf(el) + 1] || null;
+        },
+      });
+      return el;
+    }
+    const container: any = {
+      children: [] as any[],
+      appendChild(node: any) {
+        if (node.parentElement === container) container.children.splice(container.children.indexOf(node), 1);
+        container.children.push(node); node.parentElement = container; return node;
+      },
+      insertBefore(node: any, ref: any) {
+        if (node.parentElement === container) container.children.splice(container.children.indexOf(node), 1);
+        const at = container.children.indexOf(ref);
+        container.children.splice(at < 0 ? container.children.length : at, 0, node);
+        node.parentElement = container; return node;
+      },
+      querySelector: (selector: string) => (selector === ':scope > .chat-scroll-spacer' ? null : null),
+      querySelectorAll: (selector: string) => (
+        selector === ':scope > .chat-message[data-ts]'
+          ? container.children.filter((el: any) => el.matches?.('.chat-message[data-ts]'))
+          : []
+      ),
+    };
+    const m1 = shimEl('chat-message user', '1000', 'm1');
+    const m2 = shimEl('chat-message user', '2000', 'm2');
+    container.appendChild(m1);
+    container.appendChild(m2);
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? container : null);
+    context._createStreamingAssistantMessage = (_c: any, opts: any) => {
+      const ph = shimEl('chat-message assistant', String(Date.now()));
+      ph.dataset.placeholder = '1';
+      if (opts?.triggerMsgId) ph.dataset.triggerMsgId = String(opts.triggerMsgId);
+      container.appendChild(ph); // mirrors the real creator: appended at bottom
+      return ph;
+    };
+    context._startPlaceholderActivity = () => {};
+    context._setPlaceholderActor = () => {};
+    context._knownGroupActorLabel = () => 'Claude Code';
+
+    const ph = context._ensureActorPlaceholder('c1', 'claude-code', null, 'turn-claude', 'm1', 1500);
+    expect(ph).toBeTruthy();
+    expect(ph.dataset.ts).toBe('1500');
+    expect(container.children.indexOf(ph)).toBe(1); // m1, [placeholder], m2
+    expect(ph.dataset.triggerMsgId).toBe('m1');
+
+    // A live-minted placeholder whose turn starts "now" stays at the bottom.
+    const ph2 = context._ensureActorPlaceholder('c1', 'seo-geo', null, 'turn-seo', 'm2', 2500);
+    expect(container.children.indexOf(ph2)).toBe(3);
+
+    // A selected Commander alongside an Agent is a real recipient and must
+    // be allowed to render its reply, even though the remembered floor is a set.
+    vm.runInContext('_serverFloorByCid.set("c1", ["commander", "claude-code"]);', context);
+    const commander = context._ensureActorPlaceholder('c1', 'commander', null, 'turn-commander', 'm2', 3000);
+    expect(commander).toBeTruthy();
+  });
+
+  it('claims each concurrent optimistic user bubble by its own client id', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+
+    const mk = (clientMsgId: string) => ({
+      className: 'chat-message user',
+      dataset: { clientMsgId },
+      parentElement: null as any,
+    });
+    const first = mk('c-aaa');
+    const second = mk('c-bbb');
+    const container: any = {
+      children: [first, second],
+      querySelector(selector: string) {
+        const byMsgId = selector.match(/data-msg-id="([^"]+)"/)?.[1];
+        if (byMsgId) return this.children.find((el: any) => el.dataset.msgId === byMsgId) || null;
+        const byClientId = selector.match(/data-client-msg-id="([^"]+)"/)?.[1];
+        if (byClientId) {
+          return this.children.find((el: any) => el.dataset.clientMsgId === byClientId
+            && !el.dataset.msgId) || null;
+        }
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+    first.parentElement = container;
+    second.parentElement = container;
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? container : null);
+    context._moveUserBeforeOrphanLivePlaceholder = () => {};
+
+    const sameText = 'run it';
+    const sameTs = '2026-07-30T16:42:37';
+    expect(context._claimPersistedUserMessage('c1', {
+      id: 'u-second', from: 'user', text: sameText, ts: sameTs, client_msg_id: 'c-bbb',
+    })).toBe(true);
+    expect(context._claimPersistedUserMessage('c1', {
+      id: 'u-first', from: 'user', text: sameText, ts: sameTs, client_msg_id: 'c-aaa',
+    })).toBe(true);
+
+    // Each bubble ends up with its own persisted id — no cross-claim, and no
+    // bubble left without one.
+    expect(first.dataset.msgId).toBe('u-first');
+    expect(second.dataset.msgId).toBe('u-second');
+  });
+
+  it('repositions queued user and finalized AI bubbles when persisted timestamps arrive', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+
+    function makeMsg(className: string, dataset: Record<string, string>) {
+      const el: any = {
+        className,
+        dataset: { ...dataset },
+        parentElement: null,
+        matches(selector: string) {
+          return selector === '.chat-message[data-ts]'
+            && this.className.includes('chat-message')
+            && this.dataset.ts != null;
+        },
+      };
+      Object.defineProperty(el, 'previousElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx > 0 ? this.parentElement.children[idx - 1] : null;
+        },
+      });
+      Object.defineProperty(el, 'nextElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx >= 0 && idx < this.parentElement.children.length - 1
+            ? this.parentElement.children[idx + 1]
+            : null;
+        },
+      });
+      return el;
+    }
+
+    const user = makeMsg('chat-message user', {
+      convPair: '1',
+      ts: '900',
+      retryContent: 'queued follow-up',
+    });
+    const laterUser = makeMsg('chat-message user', {
+      convPair: '2',
+      ts: '950',
+      retryContent: 'later queued turn',
+    });
+    const assistant = makeMsg('chat-message assistant', { msgId: 'a1', ts: '1000' });
+    const container: any = {
+      children: [user, laterUser, assistant],
+      querySelector(selector: string) {
+        if (selector.includes('data-msg-id')) {
+          const id = selector.match(/data-msg-id="([^"]+)"/)?.[1];
+          return this.children.find((el: any) => el.dataset.msgId === id) || null;
+        }
+        if (selector === ':scope > .chat-scroll-spacer') return null;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-message.user[data-conv-pair]:not([data-msg-id]):not([data-client-msg-id])') {
+          return this.children.filter((el: any) => el.className.includes('user')
+            && !!el.dataset.convPair && !el.dataset.msgId && !el.dataset.clientMsgId);
+        }
+        if (selector === '.chat-message.user:not([data-msg-id]):not([data-client-msg-id])') {
+          return this.children.filter((el: any) => el.className.includes('user')
+            && !el.dataset.msgId && !el.dataset.clientMsgId);
+        }
+        if (selector === ':scope > .chat-message[data-ts]') {
+          return this.children.filter((el: any) => el.dataset.ts != null);
+        }
+        return [];
+      },
+      removeChild(el: any) {
+        const idx = this.children.indexOf(el);
+        if (idx >= 0) this.children.splice(idx, 1);
+        el.parentElement = null;
+      },
+      insertBefore(el: any, ref: any) {
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        const refIdx = this.children.indexOf(ref);
+        this.children.splice(refIdx >= 0 ? refIdx : this.children.length, 0, el);
+        el.parentElement = this;
+      },
+      appendChild(el: any) {
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        this.children.push(el);
+        el.parentElement = this;
+      },
+    };
+    user.parentElement = container;
+    laterUser.parentElement = container;
+    assistant.parentElement = container;
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? container : null);
+
+    const claimed = context._claimPersistedUserMessage('c1', {
+      id: 'u1',
+      from: 'user',
+      text: 'queued follow-up',
+      ts: 1100,
+    });
+
+    expect(claimed).toBe(true);
+    expect(container.children).toEqual([laterUser, assistant, user]);
+    expect(user.dataset.msgId).toBe('u1');
+    expect(user.dataset.fromActor).toBe('user');
+    expect(user.dataset.ts).toBe('1100');
+    expect(laterUser.dataset.msgId).toBeUndefined();
+
+    context._syncRenderedGroupMessageIdentity(assistant, {
+      id: 'a1',
+      from: 'commander',
+      ts: 1200,
+    });
+    expect(container.children).toEqual([laterUser, user, assistant]);
+    expect(assistant.dataset.ts).toBe('1200');
+
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/conversation.js'),
+      'utf8',
+    );
+    const finalizeStart = source.indexOf('function _finalizeActorPlaceholder');
+    const finalizeEnd = source.indexOf('\nfunction ', finalizeStart + 1);
+    const finalizeBody = source.slice(finalizeStart, finalizeEnd);
+    expect(finalizeBody).toContain('_syncRenderedGroupMessageIdentity(ph, gm);');
+    expect(finalizeBody).toMatch(
+      /ph\.querySelector\('\.stream-process'\)\?\.remove\(\);[\s\S]*_renderPersistedProcess\(ph, gm\.process\);/,
+    );
+  });
+
+  it('moves a live AI bubble once after newer send-now user activity', () => {
+    const context = loadConversationRenderer();
+
+    function makeMsg(role: 'user' | 'assistant', dataset: Record<string, string>) {
+      const classes = new Set(['chat-message', role]);
+      const el: any = {
+        className: `chat-message ${role}`,
+        classList: { contains: (name: string) => classes.has(name) },
+        dataset: { ...dataset },
+        parentElement: null,
+        matches(selector: string) {
+          return selector === '.chat-message[data-ts]' && this.dataset.ts != null;
+        },
+      };
+      Object.defineProperty(el, 'previousElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx > 0 ? this.parentElement.children[idx - 1] : null;
+        },
+      });
+      Object.defineProperty(el, 'nextElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx >= 0 && idx < this.parentElement.children.length - 1
+            ? this.parentElement.children[idx + 1]
+            : null;
+        },
+      });
+      return el;
+    }
+
+    const assistant = makeMsg('assistant', { placeholder: '1', ts: '1000' });
+    const firstUser = makeMsg('user', { ts: '1100' });
+    const secondUser = makeMsg('user', { ts: '1200' });
+    let timestampScans = 0;
+    let domMoves = 0;
+    const container: any = {
+      children: [assistant, firstUser, secondUser],
+      querySelector(selector: string) {
+        if (selector === ':scope > .chat-scroll-spacer') return null;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        if (selector === ':scope > .chat-message[data-ts]') {
+          timestampScans += 1;
+          return this.children.filter((el: any) => el.dataset.ts != null);
+        }
+        return [];
+      },
+      insertBefore(el: any, ref: any) {
+        domMoves += 1;
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        const refIdx = this.children.indexOf(ref);
+        this.children.splice(refIdx >= 0 ? refIdx : this.children.length, 0, el);
+        el.parentElement = this;
+      },
+      appendChild(el: any) {
+        domMoves += 1;
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        this.children.push(el);
+        el.parentElement = this;
+      },
+    };
+    for (const el of container.children) el.parentElement = container;
+
+    // Coalesce multiple user inserts into the newest boundary. The first
+    // visible AI update crosses both rows with one timestamp scan/DOM move.
+    expect(context._markEarlierLiveMessagesForUser(container, firstUser)).toBe(1);
+    expect(context._markEarlierLiveMessagesForUser(container, secondUser)).toBe(1);
+    expect(assistant.dataset.activitySortFloor).toBe('1200');
+    expect(context._advanceStreamingMessageActivityPosition(assistant, 1150)).toBe(true);
+    expect(container.children).toEqual([firstUser, secondUser, assistant]);
+    expect(assistant.dataset.ts).toBe('1200');
+    expect(timestampScans).toBe(1);
+    expect(domMoves).toBe(1);
+
+    // Token updates after the row is current take the constant-time no-op path:
+    // no history scan, no DOM mutation, and no synthetic timestamp churn.
+    expect(context._advanceStreamingMessageActivityPosition(assistant, 1300)).toBe(false);
+    expect(assistant.dataset.ts).toBe('1200');
+    expect(timestampScans).toBe(1);
+    expect(domMoves).toBe(1);
+  });
+
+  it('moves a late-created live AI bubble after the existing send-now user on its next primary delta', () => {
+    const context = loadConversationRenderer();
+    const makeMsg = (role: 'user' | 'assistant', dataset: Record<string, string>) => {
+      const classes = new Set(['chat-message', role]);
+      const el: any = {
+        classList: { contains: (name: string) => classes.has(name) },
+        dataset: { ...dataset },
+        parentElement: null,
+        matches(selector: string) {
+          return selector === '.chat-message[data-ts]' && this.dataset.ts != null;
+        },
+      };
+      Object.defineProperties(el, {
+        previousElementSibling: {
+          get() {
+            const index = this.parentElement?.children.indexOf(this) ?? -1;
+            return index > 0 ? this.parentElement.children[index - 1] : null;
+          },
+        },
+        nextElementSibling: {
+          get() {
+            const index = this.parentElement?.children.indexOf(this) ?? -1;
+            return index >= 0 ? (this.parentElement.children[index + 1] || null) : null;
+          },
+        },
+      });
+      return el;
+    };
+    const firstUser = makeMsg('user', { ts: '900' });
+    const user = makeMsg('user', { ts: '1100' });
+    const assistant = makeMsg('assistant', { placeholder: '1', ts: '1200' });
+    const container: any = {
+      children: [firstUser, assistant, user],
+      querySelector: () => null,
+      querySelectorAll(selector: string) {
+        return selector === ':scope > .chat-message[data-ts]'
+          ? this.children.filter((el: any) => el.dataset.ts != null)
+          : [];
+      },
+      insertBefore(el: any, ref: any) {
+        const oldIndex = this.children.indexOf(el);
+        if (oldIndex >= 0) this.children.splice(oldIndex, 1);
+        const refIndex = this.children.indexOf(ref);
+        this.children.splice(refIndex >= 0 ? refIndex : this.children.length, 0, el);
+        el.parentElement = this;
+      },
+      appendChild(el: any) {
+        const oldIndex = this.children.indexOf(el);
+        if (oldIndex >= 0) this.children.splice(oldIndex, 1);
+        this.children.push(el);
+        el.parentElement = this;
+      },
+    };
+    for (const el of container.children) el.parentElement = container;
+    context._streamingAppendFinalDelta = vi.fn();
+
+    expect(container.children).toEqual([firstUser, assistant, user]);
+    context._handleStreamEvent('c1', assistant, {
+      type: 'delta',
+      text: 'next',
+      phase: 'commentary',
+    });
+
+    expect(container.children).toEqual([firstUser, user, assistant]);
+    expect(assistant.dataset.activitySortFloor).toBeUndefined();
+    expect(Number(assistant.dataset.activitySortAfter)).toBe(1100);
+    expect(context._streamingAppendFinalDelta)
+      .toHaveBeenCalledWith(assistant, 'next', 'commentary');
+
+    context._anchorPlaceholderToTurnStart(assistant, 1000);
+    expect(container.children).toEqual([firstUser, user, assistant]);
+    expect(Number(assistant.dataset.ts)).toBe(1100);
+
+    context._syncRenderedGroupMessageIdentity(assistant, { ts: 1000 });
+    expect(container.children).toEqual([firstUser, user, assistant]);
+    expect(Number(assistant.dataset.ts)).toBe(1100);
+  });
+});
+
+describe('conversation streaming math detection', () => {
+  it('reuses decoded inline image nodes across streaming markdown repaints', () => {
+    const context = loadConversationRenderer();
+    const src = 'chat-media://local/Users/test/preview.png';
+    const existingImage = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    const existingShell = {
+      className: 'chat-image-shell chat-md-img-shell is-loaded',
+      style: {
+        properties: new Map([
+          ['--chat-image-natural-width', '900px'],
+          ['--chat-image-aspect-ratio', '900 / 1600'],
+        ]),
+        getPropertyValue(name: string) { return this.properties.get(name) || ''; },
+      },
+      querySelector(selector: string) {
+        if (selector === 'img.chat-md-img[src]') return existingImage;
+        return null;
+      },
+    };
+    const freshImage = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    let replacement: unknown = null;
+    const freshShell = {
+      className: 'chat-image-shell chat-md-img-shell is-loading',
+      replaceWith(node: unknown) { replacement = node; },
+      querySelector(selector: string) {
+        if (selector === 'img.chat-md-img[src]') return freshImage;
+        return null;
+      },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-md-img-shell') return [freshShell];
+        if (selector === '.chat-md-video-shell' || selector === '.chat-md-audio-card') return [];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('image', src), [existingShell]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingShell);
+    expect(existingShell.className).toContain('is-loaded');
+    expect(existingShell.className).not.toContain('is-loading');
+    expect(existingShell.style.getPropertyValue('--chat-image-natural-width')).toBe('900px');
+    expect(existingShell.style.getPropertyValue('--chat-image-aspect-ratio')).toBe('900 / 1600');
+  });
+
+  it('reuses standalone dashboard and raw HTML media nodes', () => {
+    const context = loadConversationRenderer();
+    const src = 'https://example.test/dashboard-preview.png';
+    const existingImage = {
+      tagName: 'IMG',
+      attributes: [],
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+      closest() { return null; },
+    };
+    let replacement: unknown = null;
+    const freshImage = {
+      tagName: 'IMG',
+      attributes: [],
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+      closest() { return null; },
+      replaceWith(node: unknown) { replacement = node; },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === 'img[src], video[src], audio[src]') return [freshImage];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('image-node', src), [existingImage]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingImage);
+  });
+
+  it('reuses inline video nodes across streaming markdown repaints', () => {
+    const context = loadConversationRenderer();
+    const src = 'chat-media://local/Users/test/clip.mp4';
+    const existingVideo = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    const existingShell = {
+      querySelector(selector: string) {
+        if (selector === 'video.chat-md-video[src]') return existingVideo;
+        if (selector === 'video.chat-md-video[src], audio.chat-md-audio[src]') return existingVideo;
+        return null;
+      },
+    };
+    const freshVideo = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    let replacement: unknown = null;
+    const freshShell = {
+      replaceWith(node: unknown) { replacement = node; },
+      querySelector(selector: string) {
+        if (selector === 'video.chat-md-video[src]') return freshVideo;
+        if (selector === 'video.chat-md-video[src], audio.chat-md-audio[src]') return freshVideo;
+        return null;
+      },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-md-img-shell') return [];
+        if (selector === '.chat-md-video-shell') return [freshShell];
+        if (selector === '.chat-md-audio-card') return [];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('video', src), [existingShell]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingShell);
+  });
+
+  it('reuses a hydrated inline HTML frame across streaming markdown repaints', () => {
+    const context = loadConversationRenderer();
+    const src = 'chat-media://local/Users/test/poster.html';
+    const existingHost = {
+      dataset: { htmlEmbedHydrated: '1' },
+      getAttribute(name: string) { return name === 'data-html-src' ? src : ''; },
+    };
+    let replacement: unknown = null;
+    const freshHost = {
+      getAttribute(name: string) { return name === 'data-html-src' ? src : ''; },
+      replaceWith(node: unknown) { replacement = node; },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-md-html-embed') return [freshHost];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('html', src), [existingHost]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingHost);
+    expect(existingHost.dataset.htmlEmbedHydrated).toBe('1');
+  });
+
+  it('detects closed inline and display math while streaming', () => {
+    const context = loadConversationRenderer();
+
+    const sig = context._streamMathSignatureForText([
+      'inline $E=mc^2$',
+      'display:',
+      '$$',
+      '\\int_0^1 x^2 dx',
+      '$$',
+      'latex native \\(a+b\\) and \\[c=d\\]',
+    ].join('\n'));
+
+    expect(sig).toContain('$E=mc^2$');
+    expect(sig).toContain('$$\n\\int_0^1 x^2 dx\n$$');
+    expect(sig).toContain('\\(a+b\\)');
+    expect(sig).toContain('\\[c=d\\]');
+  });
+
+  it('ignores incomplete math, currency, and code examples', () => {
+    const context = loadConversationRenderer();
+
+    const sig = context._streamMathSignatureForText([
+      'still typing $E=mc',
+      'cost is $50 / $100',
+      '`$x+y$`',
+      '```md',
+      '$$hidden$$',
+      '```',
+    ].join('\n'));
+
+    expect(sig).toBe('');
+  });
+
+  it('paints non-math streaming markdown immediately without MathJax', () => {
+    const context = loadConversationRenderer();
+    let calls = 0;
+    context.renderMarkdownFull = (text: string) => `<p>${escapeHtml(text)}</p>`;
+    context.typesetMathHtml = async (html: string) => {
+      calls += 1;
+      return html;
+    };
+    const finalEl = { innerHTML: '', isConnected: true };
+    const msg = { dataset: {}, parentElement: null };
+
+    context._paintStreamingFinalMarkdown(msg, finalEl, 'plain text');
+
+    expect(calls).toBe(0);
+    expect(finalEl.innerHTML).toContain('<p>plain text</p>');
+    expect(msg.dataset.streamPaintedDisplay).toBe('plain text');
+  });
+
+  it('hydrates inline HTML outputs immediately after a streaming paint', () => {
+    const context = loadConversationRenderer();
+    const hydrate = vi.fn();
+    context._hydrateMarkdownHtmlEmbeds = hydrate;
+    context.renderMarkdownFull = () => '<span data-chat-md-html-embed="1"></span>';
+    const finalEl = { innerHTML: '', isConnected: true };
+    const msg = { dataset: {}, parentElement: null };
+
+    context._paintStreamingFinalMarkdown(msg, finalEl, '![poster](preview.html)');
+
+    expect(hydrate).toHaveBeenCalledOnce();
+    expect(hydrate).toHaveBeenCalledWith(finalEl);
+  });
+
+  it('does not paint raw TeX while streaming math is typeset offscreen', async () => {
+    const context = loadConversationRenderer();
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context.typesetMathHtml = async (html: string) => html.replace(
+      '\\(y=2x+b\\)',
+      '<mjx-container>y=2x+b</mjx-container>',
+    );
+    const finalEl = { innerHTML: '<div>previous</div>', isConnected: true };
+    const msg = { dataset: {}, parentElement: null };
+
+    context._paintStreamingFinalMarkdown(msg, finalEl, '公式 \\(y=2x+b\\)');
+
+    expect(finalEl.innerHTML).toBe('<div>previous</div>');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(finalEl.innerHTML).toContain('<mjx-container>y=2x+b</mjx-container>');
+    expect(finalEl.innerHTML).not.toContain('\\(y=2x+b\\)');
+  });
+
+  it('drops stale offscreen math paints when newer stream content arrives', async () => {
+    const context = loadConversationRenderer();
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    const pending: Array<(value: string) => void> = [];
+    context.typesetMathHtml = (html: string) => new Promise((resolve) => {
+      pending.push((value: string) => resolve(value || html));
+    });
+    const finalEl = { innerHTML: '<div>previous</div>', isConnected: true };
+    const msg = { dataset: {}, parentElement: null };
+
+    context._paintStreamingFinalMarkdown(msg, finalEl, '旧公式 \\(a+b\\)');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    context._paintStreamingFinalMarkdown(msg, finalEl, '新公式 \\(c+d\\)');
+
+    pending[0]('<mjx-container>old</mjx-container>');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(finalEl.innerHTML).toBe('<div>previous</div>');
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    pending[1]('<mjx-container>new</mjx-container>');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(finalEl.innerHTML).toBe('<mjx-container>new</mjx-container>');
+    expect(msg.dataset.streamPaintedDisplay).toBe('新公式 \\(c+d\\)');
+  });
+
+  it('coalesces streaming math paints to the latest text', async () => {
+    const context = loadConversationRenderer();
+    let calls = 0;
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context.typesetMathHtml = async (html: string) => {
+      calls += 1;
+      return html.replace(/\\\((.*?)\\\)/g, '<mjx-container>$1</mjx-container>');
+    };
+    const finalEl = { innerHTML: '<div>previous</div>', isConnected: true };
+    const msg = { dataset: {}, parentElement: null };
+
+    context._paintStreamingFinalMarkdown(msg, finalEl, '\\(a+b\\)');
+    context._paintStreamingFinalMarkdown(msg, finalEl, '\\(a+b\\) 和 \\(c+d\\)');
+
+    expect(calls).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(calls).toBe(1);
+    expect(finalEl.innerHTML).toContain('<mjx-container>a+b</mjx-container>');
+    expect(finalEl.innerHTML).toContain('<mjx-container>c+d</mjx-container>');
+  });
+});
+
+describe('conversation process read_file resource labels', () => {
+  it('distinguishes file metadata lookup from file content reading', () => {
+    const context = loadConversationRenderer();
+    const path = '/Users/test/private/Orkas PPT.pdf';
+
+    expect([
+      context._formatEventLine({
+        stream: 'tool',
+        data: { phase: 'start', name: 'stat_file', arguments: { path } },
+      }),
+      context._formatEventLine({
+        stream: 'tool',
+        data: { phase: 'end', name: 'stat_file', arguments: { path } },
+      }),
+      context._formatEventLine({
+        stream: 'tool',
+        data: { phase: 'start', name: 'read_file', arguments: { path } },
+      }),
+      context._formatEventLine({
+        stream: 'tool',
+        data: { phase: 'end', name: 'read_file', arguments: { path } },
+      }),
+    ]).toEqual([
+      'Started · Get file info · Orkas PPT.pdf',
+      'Get file info · Orkas PPT.pdf · Done',
+      'Started · Read file · Orkas PPT.pdf',
+      'Read file · Orkas PPT.pdf · Done',
+    ]);
+  });
+
+  it('names the open background task on an idle line instead of a bare wait', () => {
+    // Regression for run e79c7d5a1a72: a never-exiting background task holds
+    // the CLI turn open, so the only thing on screen is an unexplained wait.
+    const context = loadConversationRenderer();
+
+    const bare = context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'idle', stalledMs: 593322 },
+    });
+    expect(bare).toBe('Wait for agent response · 9m 53s');
+
+    const named = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'idle',
+        stalledMs: 593322,
+        waitingOn: [{ taskId: 'bz0apow42', label: 'Start Web dev server on :9000' }],
+      },
+    });
+    expect(named).toBe('Waiting on background task · Start Web dev server on :9000 · 9m 53s');
+
+    const several = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'idle',
+        stalledMs: 90000,
+        waitingOn: [
+          { taskId: 'a', label: 'Start Web dev server on :9000' },
+          { taskId: 'b', label: 'Run full unit test suite' },
+        ],
+      },
+    });
+    expect(several).toContain('+1');
+  });
+
+  it('formats read_file(agent.json) with the agent display name from event metadata', () => {
+    const context = loadConversationRenderer();
+
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: { path: '/tmp/agents/4430ca181349/agent.json' },
+        agent_id: '4430ca181349',
+        agent_name: '学习路径设计师',
+      },
+    });
+
+    expect(line).toBe('Started · View agent · 学习路径设计师');
+    expect(line).not.toContain('4430ca181349/agent.json');
+  });
+
+  it('falls back to _agentsCache when old events only carry an agent.json path', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [{ agent_id: '4430ca181349', name: '学习路径设计师' }];
+
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: {
+          path: '/Users/test/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
+        },
+      },
+    });
+
+    expect(line).toBe('Started · View agent · 学习路径设计师');
+  });
+
+  it('simplifies hidden system skill paths in legacy start events', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: {
+          path: '/Users/user/.orkas/data/u1/local/system/skills/agent-creator/SKILL.md',
+        },
+      },
+    });
+
+    expect(line).toBe('Started · View skill · agent-creator');
+    expect(line).not.toContain('/Users/user/.orkas');
+  });
+
+  it('uses system skill metadata instead of a persisted-output marker on completion', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        name: 'read_file',
+        skill_id: 'agent-creator',
+        skill_name: 'agent-creator',
+        skill_system: 'system',
+        skill_file: 'SKILL.md',
+        result_preview: '<persisted-output ref="read_file.deadbeef" tool="read_file" size="41420">',
+      },
+    });
+
+    expect(line).toBe('View skill · agent-creator · Done');
+    expect(line).not.toContain('persisted-output');
+  });
+
+  it('simplifies platform agent-private skill paths in legacy events', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: {
+          path: '/Users/user/.orkas/data/u1/local/marketplace/agents/79df9cc89f5f/skills/stage-plan/SKILL.md',
+        },
+      },
+    });
+
+    expect(line).toBe('Started · View skill · stage-plan');
+    expect(line).not.toContain('79df9cc89f5f/skills');
+  });
+
+  it('keeps Skill and Agent semantics for delete-file actions', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [{ agent_id: '4430ca181349', name: 'Data Analyst' }];
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', name: 'delete_file',
+        arguments: {
+          path: '/Users/test/.orkas/data/u1/local/system/skills/Product Design/SKILL.md',
+        },
+      },
+    })).toBe('Started · Delete skill · Product Design');
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', name: 'delete_file',
+        arguments: {
+          path: '/Users/test/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
+        },
+      },
+    })).toBe('Started · Delete agent · Data Analyst');
+  });
+
+  it('keeps project-relative file paths but reduces absolute paths to a filename', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'Read',
+        input: { file_path: 'src/app.ts' },
+      },
+    })).toBe('Read file · src/app.ts');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'Read',
+        input: { file_path: '/Users/test/private/project/src/app.ts' },
+      },
+    })).toBe('Read file · app.ts');
+  });
+
+  it('shows changed filenames from existing Codex file-change events and apply_patch inputs', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const cliFileChange = {
+      stream: 'cli',
+      data: {
+        type: 'file-change',
+        paths: ['src/app.ts', '/Users/test/private/project/src/theme.css'],
+      },
+    };
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'patch_apply',
+        callId: 'patch-1',
+      },
+    }, displayContext)).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'patch_apply',
+        callId: 'patch-1',
+      },
+    }, displayContext)).toBeNull();
+    const cliFileChangeLine = context._formatEventLine(cliFileChange, displayContext);
+    expect(cliFileChangeLine).toBe('Edit file · src/app.ts, theme.css · Done');
+    expect(context._eventProcessKind(cliFileChange, cliFileChangeLine)).toBe('patch');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'file-change',
+        paths: ['src/app.ts', '/Users/test/private/project/src/theme.css'],
+      },
+    }, displayContext)).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'file-change',
+        changes: [{ path: 'src/new-file.ts', kind: 'add' }],
+      },
+    }, displayContext)).toBe('Edit file · src/new-file.ts · Done');
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'apply_patch',
+        arguments: {
+          patch: [
+            '*** Begin Patch',
+            '*** Update File: src/settings.ts',
+            '@@',
+            '-old',
+            '+new',
+            '*** End Patch',
+          ].join('\n'),
+        },
+      },
+    })).toBe('Started · Edit file · src/settings.ts');
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'apply_patch',
+        arguments: {
+          patch: [
+            '*** Begin Patch',
+            '*** Update File: src/old-name.ts',
+            '*** Move to: src/new-name.ts',
+            '*** End Patch',
+          ].join('\n'),
+        },
+      },
+    })).toBe('Started · Edit file · src/old-name.ts, src/new-name.ts');
+  });
+
+  it('renders cumulative Codex file changes once in the live process rail', () => {
+    const context = loadConversationRenderer();
+    const rows: Array<{ line: string; kind: string }> = [];
+    context._streamingAppendProgress = (_msg: unknown, line: string, kind: string) => {
+      rows.push({ line, kind });
+    };
+    const msg = {};
+
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: { type: 'file-change', paths: ['src/app.ts'] },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: { type: 'file-change', paths: ['src/app.ts', 'src/theme.css'] },
+    });
+
+    expect(rows).toEqual([
+      { line: 'Edit file · src/app.ts · Done', kind: 'patch' },
+      { line: 'Edit file · src/theme.css · Done', kind: 'patch' },
+    ]);
+  });
+
+  it.each([
+    ['zh', '查看技能 · Product Design'],
+    ['en', 'View skill · Product Design'],
+    ['ja', 'スキルを確認 · Product Design'],
+    ['pt', 'Ver habilidade · Product Design'],
+  ])('localizes the action in %s without translating the Skill display name', (language, expected) => {
+    const context = loadConversationRenderer();
+    const locale = JSON.parse(fs.readFileSync(
+      path.join(__dirname, `../../src/renderer/locales/${language}.json`),
+      'utf8',
+    ));
+    context.t = (key: string, params: Record<string, unknown> = {}) => {
+      let value = String(locale[key] || key);
+      for (const [name, replacement] of Object.entries(params)) {
+        value = value.replaceAll(`{${name}}`, String(replacement ?? ''));
+      }
+      return value;
+    };
+    context._skillsCache = [{ id: 'product-design', name: 'Product Design' }];
+
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'Read',
+        callId: 'skill-read',
+        input: {
+          file_path: '/Users/test/.orkas/data/u1/cloud/skills/product-design/SKILL.md',
+        },
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).toBe(expected);
+  });
+});
+
+describe('conversation execution plan presentation', () => {
+  it('keeps a plan action visible when an adapter omits the plan details', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'plan-without-details',
+        name: 'manage_execution_plan',
+        arguments: { action: 'update' },
+      },
+    }, displayContext)).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'plan-without-details',
+        name: 'manage_execution_plan',
+        output: '{"ok":true}',
+      },
+    }, displayContext)).toBe('Update plan');
+    expect(context._formatEventLine({
+      stream: 'plan',
+      data: { phase: 'progress' },
+    }, displayContext)).toBe('Update plan');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'plan-updated' },
+    }, displayContext)).toBe('Update plan');
+  });
+
+  it('adds the concrete plan content to the existing process action', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const start = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'plan-visible',
+        name: 'manage_execution_plan',
+        arguments: {
+          action: 'update',
+          plan: [
+            { step: 'Inspect the existing process UI', status: 'completed' },
+            { step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        },
+      },
+    }, displayContext);
+    const result = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'plan-visible',
+        name: 'manage_execution_plan',
+        output: '{"ok":true}',
+      },
+    }, displayContext);
+
+    expect(start).toBe([
+      'Create plan',
+      'Inspect the existing process UI',
+      'Show the plan content on the action',
+    ].join('\n'));
+    expect(result).toBeNull();
+  });
+
+  it('reads plan content from the core input field used by alternate event adapters', () => {
+    const context = loadConversationRenderer();
+    const event = {
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'update_plan',
+        input: {
+          plan: [
+            { step: 'Inspect the existing process UI', status: 'completed' },
+            { step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        },
+      },
+    };
+
+    expect(context._formatEventLine(event, context._createProcessDisplayContext())).toBe([
+      'Create plan',
+      'Inspect the existing process UI',
+      'Show the plan content on the action',
+    ].join('\n'));
+    expect(context._isProcessPlanEvent(event)).toBe(true);
+  });
+
+  it('uses update plan only when an existing plan structure changes', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'manage_execution_plan',
+        arguments: {
+          action: 'update',
+          plan: [{ step: 'Inspect the existing process UI', status: 'in_progress' }],
+        },
+      },
+    }, displayContext);
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'manage_execution_plan',
+        arguments: {
+          action: 'update',
+          plan: [
+            { step: 'Inspect the existing process UI', status: 'completed' },
+            { step: 'Verify the result', status: 'in_progress' },
+          ],
+        },
+      },
+    }, displayContext)).toBe([
+      'Update plan',
+      'Inspect the existing process UI',
+      'Verify the result',
+    ].join('\n'));
+  });
+
+  it('shows the concrete plan when only the successful result event is available', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const result = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'plan-result-only',
+        name: 'manage_execution_plan',
+        output: JSON.stringify({
+          ok: true,
+          action: 'update',
+          steps: [
+            { id: 1, step: 'Inspect the existing process UI', status: 'completed' },
+            { id: 2, step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        }),
+      },
+    }, displayContext);
+
+    expect(result).toBe([
+      'Create plan',
+      'Inspect the existing process UI',
+      'Show the plan content on the action',
+    ].join('\n'));
+  });
+
+  it('recognizes a CLI tool_result containing a plan as plan content', () => {
+    const context = loadConversationRenderer();
+    const event = {
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'tool_result',
+        output: JSON.stringify({
+          ok: true,
+          action: 'update',
+          steps: [
+            { id: 1, step: 'Inspect the existing process UI', status: 'completed' },
+            { id: 2, step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        }),
+      },
+    };
+    const result = context._formatEventLine(event, context._createProcessDisplayContext());
+
+    expect(result).toBe([
+      'Create plan',
+      'Inspect the existing process UI',
+      'Show the plan content on the action',
+    ].join('\n'));
+    expect(context._eventProcessKind(event, result)).toBe('plan');
+  });
+
+  it('shows the real step text for a result-only status update', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        name: 'manage_execution_plan',
+        output: JSON.stringify({
+          ok: true,
+          action: 'set_status',
+          step_id: 2,
+          steps: [
+            { id: 1, step: 'Inspect the existing process UI', status: 'completed' },
+            { id: 2, step: 'Show the plan content on the action', status: 'completed' },
+          ],
+        }),
+      },
+    }, displayContext)).toBe('Execute plan\nShow the plan content on the action');
+  });
+
+  it('restores plan content from result_preview when full output is absent', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        name: 'manage_execution_plan',
+        result_preview: JSON.stringify({
+          ok: true,
+          action: 'set_status',
+          step_id: 2,
+          steps: [
+            { id: 1, step: 'Inspect the existing process UI', status: 'completed' },
+            { id: 2, step: 'Show the plan content on the action', status: 'completed' },
+          ],
+        }),
+      },
+    }, context._createProcessDisplayContext()))
+      .toBe('Execute plan\nShow the plan content on the action');
+  });
+
+  it('renders a result-only plan through normal separate process rows', () => {
+    const context = loadConversationRenderer();
+    const lines: Array<{ text: string; kind: string }> = [];
+    context._streamingAppendProgress = (_msg: unknown, text: string, kind: string) => {
+      lines.push({ text, kind });
+    };
+    context._streamingAppendToolResultRow = () => {
+      throw new Error('plan results must use normal process rows');
+    };
+
+    context._renderAgentEvent({ querySelector: () => null }, {
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        name: 'manage_execution_plan',
+        output: JSON.stringify({
+          ok: true,
+          action: 'update',
+          steps: [
+            { id: 1, step: 'Inspect the existing process UI', status: 'completed' },
+            { id: 2, step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        }),
+      },
+    });
+
+    expect(lines).toEqual([{
+      text: [
+        'Create plan',
+        'Inspect the existing process UI',
+        'Show the plan content on the action',
+      ].join('\n'),
+      kind: 'plan',
+    }]);
+  });
+
+  it('uses the step content instead of exposing an internal step number', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'plan-map',
+        name: 'manage_execution_plan',
+        arguments: {
+          action: 'update',
+          plan: [
+            { step: 'Inspect the existing process UI', status: 'completed' },
+            { step: 'Show the plan content on the action', status: 'in_progress' },
+          ],
+        },
+      },
+    }, displayContext);
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'manage_execution_plan',
+        arguments: { action: 'set_status', step_id: 2, status: 'completed' },
+      },
+    }, displayContext)).toBe('Execute plan\nShow the plan content on the action');
+  });
+
+  it('shows Codex plan contents as one normal live process row', () => {
+    const context = loadConversationRenderer();
+    const lines: string[] = [];
+    context._streamingAppendProgress = (_msg: unknown, line: string) => lines.push(line);
+    const msg: any = {};
+
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: {
+        type: 'status',
+        status: 'plan-updated',
+        explanation: 'Expose the active work',
+        steps: [
+          { step: 'Find the process renderer', status: 'completed' },
+          { step: 'Show readable plan details', status: 'in_progress' },
+        ],
+      },
+    });
+
+    expect(lines).toEqual([[
+      'Create plan',
+      'Find the process renderer',
+      'Show readable plan details',
+    ].join('\n')]);
+  });
+});
+
+describe('conversation process metadata formatting', () => {
+  const orkasBridgeCases: Array<[string, Record<string, unknown>, string]> = [
+    ['inner_browser', { operation: 'open', url: 'https://example.com/docs' }, 'Run action · inner_browser · open · https://example.com/docs'],
+    ['publish_outputs', { paths: ['reports/result.md'] }, 'Run action · publish_outputs · reports/result.md'],
+    ['orkas_list_skills', {}, 'View skill'],
+    ['orkas_read_skill', { id: 'pdf' }, 'View skill · pdf'],
+    ['orkas_run_skill', { skill: 'pdf' }, 'Use skill · pdf'],
+    ['orkas_list_connector_tools', {}, 'View connector'],
+    [
+      'orkas_call_connector_tool',
+      { connector_id: 'Notion', tool_name: 'search', args: { query: 'launch plan' } },
+      'Use connector · Notion · search · launch plan',
+    ],
+    ['library', { action: 'list' }, 'View reference'],
+    ['library', { action: 'search', query: 'launch plan' }, 'Search references · launch plan'],
+    ['library', { action: 'read', path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
+    [
+      'library_save',
+      { action: 'save', source_path: 'reports/summary.md' },
+      'Run action · library_save · save · reports/summary.md',
+    ],
+    ['project_instructions', { instructions: 'private project instructions' }, 'Run action · project_instructions'],
+    ['auto_tasks', { action: 'list' }, 'Run action · auto_tasks · list'],
+    ['todo_tasks', { action: 'list' }, 'Run action · todo_tasks · list'],
+    ['chat_history', { action: 'search', query: 'release checklist', scope: 'current' }, 'Search conversation · release checklist'],
+    ['chat_history', { action: 'read', scope: 'current', page: { mode: 'latest', count: 10 } }, 'View conversation'],
+    ['cross_session_memory', { action: 'list', target: 'agent' }, 'View memory · agent'],
+    [
+      'cross_session_memory',
+      { action: 'add', target: 'project', content: 'private durable detail' },
+      'Update memory · project',
+    ],
+    ['orkas_handoff_to_commander', { reason: 'needs orchestration' }, 'Hand off to Commander'],
+  ];
+  const orkasBridgeAliasCases = orkasBridgeCases.flatMap(([tool, input, expected]) => [
+    [tool, input, expected],
+    [`orkas.${tool}`, input, expected],
+    [`mcp__orkas__${tool}`, input, expected],
+  ] as Array<[string, Record<string, unknown>, string]>);
+
+  it('keeps historical split-tool events readable without registering those tools', () => {
+    const context = loadConversationRenderer();
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['browser', { operation: 'open', url: 'https://example.com/docs' }, 'Run action · browser · open · https://example.com/docs'],
+      ['orkas_kb_list', {}, 'View reference'],
+      ['orkas_kb_search', { query: 'launch plan' }, 'Search references · launch plan'],
+      ['orkas_kb_read', { path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
+      ['chat_search', { query: 'release checklist' }, 'Search conversation · release checklist'],
+      ['chat_read', { scope: 'current' }, 'View conversation'],
+    ];
+    for (const [tool, input, expected] of cases) {
+      expect(context._formatEventLine({
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'use', tool, input },
+      })).toBe(expected);
+    }
+  });
+
+  it('keeps the process-presentation matrix aligned with every registered Orkas bridge tool', () => {
+    const bridgeSource = fs.readFileSync(
+      path.join(__dirname, '../../bin/orkas-bridge.cjs'),
+      'utf8',
+    );
+    const registeredTools = (source: string) => [...source.matchAll(/(?:server\.(?:tool|registerTool)|\bregisterTool)\(\s*'([^']+)'/g)]
+      .map((match) => match[1])
+      .sort();
+    const presentedTools = [...new Set(orkasBridgeCases.map(([tool]) => tool))].sort();
+
+    expect(registeredTools(bridgeSource)).toEqual(presentedTools);
+    // An uncovered tool must invalidate the matrix through either SDK API or the input adapter.
+    for (const method of ['server.tool', 'server.registerTool', 'registerTool']) {
+      const extendedSource = `${bridgeSource}\n${method}('uncovered_tool', {}, () => {});`;
+      expect(registeredTools(extendedSource)).toEqual([...presentedTools, 'uncovered_tool'].sort());
+      expect(registeredTools(extendedSource)).not.toEqual(presentedTools);
+    }
+  });
+
+  it('resolves known Bridge Skill ids and keeps unknown ids readable', () => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'mcp__orkas__orkas_read_skill',
+        callId: 'bridge-skill-read',
+        input: { id: '5aa5286f3aee' },
+      },
+    }, context._createProcessDisplayContext())).toBe('View skill · Release Decision');
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'mcp__orkas__orkas_run_skill',
+        callId: 'bridge-skill-run',
+        input: { skill: '5aa5286f3aee', script: 'scripts/check-release.js' },
+      },
+    }, context._createProcessDisplayContext())).toBe(
+      'Use skill · Release Decision · scripts/check-release.js',
+    );
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'orkas_read_skill',
+        callId: 'bridge-unknown-skill-read',
+        input: { id: 'unknown-skill-id' },
+      },
+    }, context._createProcessDisplayContext())).toBe('View skill · unknown-skill-id');
+  });
+
+  it.each([
+    {
+      label: 'reading a Skill',
+      tool: 'mcp__orkas__orkas_read_skill',
+      input: { id: 'efb0fe5d9664' },
+      metadata: { skill_name: 'Release Decision' },
+      expected: 'View skill · Release Decision',
+      hiddenId: 'efb0fe5d9664',
+    },
+    {
+      label: 'running a Skill script',
+      tool: 'orkas.orkas_run_skill',
+      input: { skill: 'efb0fe5d9664', script: 'scripts/check-release.js' },
+      metadata: { skill_name: 'Release Decision' },
+      expected: 'Use skill · Release Decision · scripts/check-release.js',
+      hiddenId: 'efb0fe5d9664',
+    },
+    {
+      label: 'calling a Connector',
+      tool: 'mcp__orkas__orkas_call_connector_tool',
+      input: {
+        connector_id: 'connector-instance-91f0',
+        tool_name: 'search',
+        args: { query: 'release plan' },
+      },
+      metadata: { connector_name: 'Notion Workspace' },
+      expected: 'Use connector · Notion Workspace · search · release plan',
+      hiddenId: 'connector-instance-91f0',
+    },
+  ])('uses CLI event metadata when $label', ({ tool, input, metadata, expected, hiddenId }) => {
+    const context = loadConversationRenderer();
+    context._skillsCache = null;
+
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool,
+        callId: 'bridge-display-metadata-call',
+        input,
+        ...metadata,
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).toBe(expected);
+    expect(line).not.toContain(hiddenId);
+  });
+
+  it.each([
+    {
+      label: 'viewing an in-process Connector',
+      tool: 'list_connector_tools',
+      input: { connector_id: 'connector-instance-91f0' },
+      expected: 'Started · View connector · Notion Workspace',
+    },
+    {
+      label: 'calling an in-process Connector',
+      tool: 'call_connector_tool',
+      input: {
+        connector_id: 'connector-instance-91f0',
+        tool_name: 'search',
+        args: { query: 'release plan' },
+      },
+      expected: 'Started · Use connector · Notion Workspace · search · release plan',
+    },
+  ])('uses event metadata when $label', ({ tool, input, expected }) => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'in-process-connector-call',
+        name: tool,
+        arguments: input,
+        connector_name: 'Notion Workspace',
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).toBe(expected);
+    expect(line).not.toContain('connector-instance-91f0');
+  });
+
+  it('restores Skill display names for historical virtual reference reads', () => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'legacy-skill-reference-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee/references/release-decision.md' },
+      },
+    }, displayContext)).toBe(
+      'Started · View skill · Release Decision / references/release-decision.md',
+    );
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'legacy-skill-reference-read',
+        name: 'read_file',
+      },
+    }, displayContext)).toBe(
+      'View skill · Release Decision / references/release-decision.md · Done',
+    );
+  });
+
+  it('uses event metadata for current Skill entry and reference reads', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'skill-entry-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee' },
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'SKILL.md',
+      },
+    }, context._createProcessDisplayContext())).toBe(
+      'Started · View skill · Release Decision',
+    );
+
+    const displayContext = context._createProcessDisplayContext();
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'skill-reference-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee/references/release-decision.md' },
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'references/release-decision.md',
+      },
+    }, displayContext)).toBe(
+      'Started · View skill · Release Decision / references/release-decision.md',
+    );
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'skill-reference-read',
+        name: 'read_file',
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'references/release-decision.md',
+      },
+    }, displayContext)).toBe(
+      'View skill · Release Decision / references/release-decision.md · Done',
+    );
+  });
+
+  it.each([
+    '@skill/5aa5286f3aee/../secret.md',
+    '@skill/5aa5286f3aee/references//secret.md',
+    '@skill/5aa5286f3aee\\references\\secret.md',
+    '@skill/5aa5286f3aee\\SKILL.md',
+  ])('does not borrow a Skill display name for malformed virtual path %s', (requestedPath) => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'malformed-skill-reference-read',
+        name: 'read_file',
+        arguments: { path: requestedPath },
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).not.toContain('Release Decision');
+    expect(line).toContain('Read file');
+  });
+
+  it('keeps the file target across core start, progress, and failed result events', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'edit-1', name: 'edit_file',
+        arguments: { path: 'src/account.ts' },
+      },
+    }, displayContext)).toBe('Started · Edit file · src/account.ts');
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: { phase: 'progress', id: 'edit-1', name: 'edit_file' },
+    }, displayContext)).toBe('Started · Edit file · src/account.ts');
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: { phase: 'end', id: 'edit-1', name: 'edit_file', is_error: true },
+    }, displayContext)).toBe('Edit file · src/account.ts · Failed');
+  });
+
+  it('keeps the CLI target across tool use, progress, and result events', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'NotebookEdit', callId: 'notebook-1',
+        input: { notebook_path: 'analysis/model.ipynb' },
+      },
+    }, displayContext)).toBe('Edit file · analysis/model.ipynb');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'tool-progress', callId: 'notebook-1', elapsedSeconds: 2,
+      },
+    }, displayContext)).toBe('Edit file · analysis/model.ipynb · 2s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'notebook-1',
+        output: 'updated',
+      },
+    }, displayContext)).toBe('Edit file · analysis/model.ipynb · Done · 2s');
+  });
+
+  it('uses the same target correlation in the live CLI process rail', () => {
+    const context = loadConversationRenderer();
+    const lines: string[] = [];
+    context._streamingAppendProgress = (_msg: unknown, line: string) => lines.push(line);
+    const msg = {};
+
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'Read', callId: 'read-live',
+        input: { file_path: 'src/live.ts' },
+      },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'tool-progress', callId: 'read-live', elapsedSeconds: 1,
+      },
+    });
+
+    expect(lines).toEqual([
+      'Read file · src/live.ts',
+      'Read file · src/live.ts · 1s',
+    ]);
+  });
+
+  it.each(orkasBridgeAliasCases)(
+    'classifies Orkas bridge tool %s by its business action across use and result events',
+    (tool, input, expected) => {
+      const context = loadConversationRenderer();
+      const displayContext = context._createProcessDisplayContext();
+      const callId = `bridge-${tool}`;
+
+      expect(context._formatEventLine({
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'use', tool, callId, input },
+      }, displayContext)).toBe(expected);
+      expect(context._formatEventLine({
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'result', tool, callId, output: 'ok' },
+      }, displayContext)).toBe(`${expected} · Done`);
+    },
+  );
+
+  it.each([
+    'orkas.future_internal_tool',
+    'mcp__orkas__future_internal_tool',
+  ])('does not mislabel future Orkas bridge tool %s as a connector', (tool) => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'tool-event', phase: 'use', tool, input: {} },
+    })).toBe('Run action · future_internal_tool');
+  });
+
+  it.each([
+    ['MultiEdit', { file_path: 'src/app.ts' }, 'Edit file · src/app.ts'],
+    ['append_file', { path: 'notes/progress.md' }, 'Edit file · notes/progress.md'],
+    ['TodoWrite', { todos: [] }, null],
+    ['Task', { subagent_type: 'Explore' }, 'Call agent · Explore'],
+    ['WebFetch', { url: 'https://example.com/docs' }, 'View webpage · https://example.com/docs'],
+    ['process_start', { command: 'npm test' }, 'Run command · npm test'],
+    ['terminal', { command: 'git status' }, 'Run command · git status'],
+    ['create_docx', { path: 'reports/summary.docx' }, 'Create file · reports/summary.docx'],
+    ['office_check', { path: 'reports/summary.docx' }, 'Check file · reports/summary.docx'],
+    ['office_render', { path: 'reports/summary.docx' }, 'Render file · reports/summary.docx'],
+    ['pdf_render', { path: 'reports/summary.pdf' }, 'View file · reports/summary.pdf'],
+    ['generate_image', { output_path: 'images/cover.png' }, 'Generate image · images/cover.png'],
+    ['generate_video', { output_path: 'video/demo.mp4' }, 'Generate video · video/demo.mp4'],
+    ['generate_speech', { output_path: 'audio/voice.mp3' }, 'Generate audio · audio/voice.mp3'],
+    ['call_connector_tool', { connector_id: 'Notion' }, 'Use connector · Notion'],
+    ['add_custom_connector', { display_name: 'Internal Docs' }, 'Add connector · Internal Docs'],
+    ['mcp__Product_Design__review', {}, 'Use connector · Product_Design · review'],
+    [
+      'browser.navigate',
+      { url: 'https://example.com/docs/getting-started' },
+      'Use connector · browser · navigate · https://example.com/docs/getting-started',
+    ],
+    ['dispatch_to', { to: 'Data Analyst' }, 'Call agent · Data Analyst'],
+    ['custom_export', { outputPath: 'exports/result.bin' }, 'Run action · custom_export · exports/result.bin'],
+  ])('formats %s with a concise action and business target', (tool, input, expected) => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'tool-event', phase: 'use', tool, input },
+    })).toBe(expected);
+  });
+
+  it('labels directory inspection without exposing an internal workspace slug', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'root-list', name: 'list_files',
+        resource_scope: 'current_workspace',
+        arguments: { path: '/tmp/userWorkSpace/chat-2026-08-08-1' },
+      },
+    }, displayContext)).toBe(
+      'Started · View folder · Current task workspace',
+    );
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end', id: 'root-list', name: 'list_files', duration_ms: 8,
+      },
+    }, displayContext)).toBe('View folder · Current task workspace · Done · 8ms');
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'child-list', name: 'list_files',
+        arguments: { path: '/tmp/userWorkSpace/chat-2026-08-08-1/evidence' },
+      },
+    }, context._createProcessDisplayContext())).toBe('Started · View folder · evidence');
+  });
+
+  it.each([
+    ['zh', '开始查看目录 · 当前任务工作区'],
+    ['en', 'Started · View folder · Current task workspace'],
+    ['ja', '開始 · フォルダを確認 · 現在のタスクのワークスペース'],
+    ['pt', 'Iniciado · Ver pasta · Espaço de trabalho da tarefa atual'],
+  ])('localizes the current task workspace directory in %s', (language, expected) => {
+    const context = loadConversationRenderer();
+    const locale = JSON.parse(fs.readFileSync(
+      path.join(__dirname, `../../src/renderer/locales/${language}.json`),
+      'utf8',
+    ));
+    context.t = (key: string, params: Record<string, unknown> = {}) => {
+      let value = String(locale[key] || key);
+      for (const [name, replacement] of Object.entries(params)) {
+        value = value.replaceAll(`{${name}}`, String(replacement ?? ''));
+      }
+      return value;
+    };
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'root-list', name: 'list_files',
+        resource_scope: 'current_workspace',
+        arguments: { path: '/tmp/userWorkSpace/chat-2026-08-08-1' },
+      },
+    }, context._createProcessDisplayContext())).toBe(expected);
+  });
+
+  it('shows the concrete webpage URL while redacting credential carriers', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'WebFetch',
+        input: {
+          url: 'https://alice:private@example.com/org/repo/issues?tab=open&access_token=secret#latest',
+        },
+      },
+    })).toBe(
+      'View webpage · https://***@example.com/org/repo/issues?tab=open&access_token=***#latest',
+    );
+  });
+
+  it('keeps concrete Skill script, reference directory, and file-search scope', () => {
+    const context = loadConversationRenderer();
+
+    const cases = [
+      [
+        'orkas_run_skill',
+        { skill: 'pdf', script: 'scripts/render_pdf.py' },
+        'Use skill · pdf · scripts/render_pdf.py',
+      ],
+      [
+        'library',
+        { action: 'list', dir: 'launch/2026' },
+        'View reference · launch/2026',
+      ],
+      [
+        'search_files',
+        { query: 'processTool', path: 'src/renderer' },
+        'Search files · processTool · src/renderer',
+      ],
+    ];
+
+    for (const [tool, input, expected] of cases) {
+      expect(context._formatEventLine({
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'use', tool, input },
+      })).toBe(expected);
+    }
+  });
+
+  it('appends live operation rows into the existing compact group without rebuilding it', () => {
+    // Every appended operation used to re-create the trailing <details> and
+    // reparent all earlier rows (O(rows²) DOM moves on a busy CLI turn,
+    // 2026-08-28 review F-1). The group node must stay the same element and
+    // just grow.
+    const context = loadConversationRenderer();
+    const body = createProcessTestElement('div');
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+
+    context._appendProcessTextLines(body, 'Run · echo 1', 'tool', 'bash', 'cli:op-1');
+    context._appendProcessTextLines(body, 'Run · echo 2', 'tool', 'bash', 'cli:op-2');
+    expect(body.children).toHaveLength(1);
+    const group = body.children[0];
+    expect(group.dataset.processCompactGroup).toBe('operations');
+
+    for (let i = 3; i <= 8; i += 1) {
+      context._appendProcessTextLines(body, `Run · echo ${i}`, 'tool', 'bash', `cli:op-${i}`);
+    }
+    expect(body.children).toHaveLength(1);
+    expect(body.children[0]).toBe(group);
+    expect(group._processCompactBody.children).toHaveLength(8);
+    expect(group._processCompactSummary.innerHTML).toContain('Operations 8');
+  });
+
+  it('rescans a settled rail without re-reading the row list once per row', () => {
+    // Narration rows carry no compact-group key, so every tool row appended
+    // after one misses the trailing-group fast path and runs the general scan.
+    // That scan used to rebuild its `body.children` snapshot on each step,
+    // making one idempotent pass O(rows squared) and a whole replayed turn
+    // O(rows cubed): restoring a long CLI turn blocked the renderer for
+    // seconds, and scrolling or clicking during a live turn stuttered. A pass
+    // over a long rail must cost what a pass over a short one costs.
+    const context = loadConversationRenderer();
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+
+    function buildRail(operations: number) {
+      const body = createProcessTestElement('div');
+      const backing: any[] = [];
+      let reads = 0;
+      Object.defineProperty(body, 'children', { get() { reads += 1; return backing; } });
+      for (let i = 0; i < operations; i += 1) {
+        context._appendProcessTextLines(body, `Run · step ${i}`, 'tool', 'bash', `cli:op-${i}`);
+        // The agent narrates between calls; that row breaks the operation run.
+        context._appendProcessCommentaryToBody(body, `Checking result ${i}`);
+      }
+      return {
+        body,
+        topLevelRows: backing.length,
+        readsDuring(work: () => void) {
+          const before = reads;
+          work();
+          return reads - before;
+        },
+      };
+    }
+
+    const short = buildRail(4);
+    const long = buildRail(120);
+    // The rail really is a long alternating list, not one absorbed group.
+    expect(long.topLevelRows).toBeGreaterThan(200);
+
+    const shortReads = short.readsDuring(() => context._compactAdjacentProcessRows(short.body));
+    const longReads = long.readsDuring(() => context._compactAdjacentProcessRows(long.body));
+
+    expect(shortReads).toBeGreaterThan(0);
+    // 30x the rows must not mean 30x the row-list reads. Before the fix the
+    // long rail read the list once per top-level child.
+    expect(longReads).toBeLessThanOrEqual(shortReads + 2);
+  });
+
+  it('updates one process row across a tool call lifecycle', () => {
+    const context = loadConversationRenderer();
+    const body: any = {
+      children: [],
+      appendChild(node: any) { this.children.push(node); },
+    };
+    context.document.createElement = () => ({ dataset: {}, className: '', innerHTML: '' });
+
+    context._appendProcessTextLines(
+      body,
+      'View webpage · https://github.com/Orkas-AI/Orkas/issues',
+      'tool',
+      'WebFetch',
+      'cli:web-1',
+    );
+    context._appendProcessTextLines(
+      body,
+      'View webpage · https://github.com/Orkas-AI/Orkas/issues · 2s',
+      'tool',
+      '',
+      'cli:web-1',
+    );
+    context._appendProcessTextLines(
+      body,
+      'View webpage · https://github.com/Orkas-AI/Orkas/issues · Done',
+      'tool',
+      'tool_result',
+      'cli:web-1',
+      true,
+    );
+    context._appendProcessTextLines(
+      body,
+      'View webpage · https://github.com/Orkas-AI/Orkas/issues · 3s',
+      'tool',
+      '',
+      'cli:web-1',
+    );
+
+    expect(body.children).toHaveLength(1);
+    expect(body.children[0]).toMatchObject({
+      dataset: {
+        processCallId: 'cli:web-1',
+        processTerminal: '1',
+        processText: 'View webpage · https://github.com/Orkas-AI/Orkas/issues · Done',
+        eventName: 'WebFetch',
+      },
+    });
+    expect(body.children[0].className).toContain('stream-process-line kind-tool');
+  });
+
+  it('keeps interleaved and replayed live group tool completions on their original rows', () => {
+    const context = loadConversationRenderer();
+    const processRows: any[] = [];
+    const body: any = {
+      children: processRows,
+      scrollHeight: 0,
+      scrollTop: 0,
+      clientHeight: 0,
+      appendChild(node: any) {
+        processRows.push(node);
+        this.scrollHeight = processRows.length;
+      },
+      addEventListener() {},
+    };
+    const processContainer = { style: { display: 'none' } };
+    const msg: any = {
+      dataset: {},
+      isConnected: true,
+      parentElement: null,
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return processContainer;
+        if (selector === '[data-role="process"]') return body;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === '[data-role="process"] .stream-process-line'
+          ? processRows
+          : [];
+      },
+    };
+    context.document.createElement = () => ({
+      dataset: {},
+      className: '',
+      innerHTML: '',
+      title: '',
+    });
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+    context.__liveMsg = msg;
+    vm.runInContext(`
+      _ensureActorPlaceholder = function() { return __liveMsg; };
+    `, context);
+
+    const emitToolEvent = (data: Record<string, unknown>) => {
+      context._handleGroupBusEvent('c1', msg, {
+        type: 'process',
+        actor: 'researcher',
+        turn_id: 'turn-1',
+        seg: 0,
+        data: { type: 'event', event: { stream: 'tool', data } },
+      });
+    };
+
+    emitToolEvent({ phase: 'start', id: 'write-1', name: 'write_file' });
+    emitToolEvent({ phase: 'start', id: 'write-2', name: 'write_file' });
+    emitToolEvent({
+      phase: 'progress', id: 'write-1', name: 'write_file',
+      arguments: { path: 'first.html', content: '<main>first</main>' },
+    });
+    emitToolEvent({
+      phase: 'progress', id: 'write-2', name: 'write_file',
+      arguments: { path: 'second.html', content: '<main>second</main>' },
+    });
+    // Parallel tools may complete in a different order from their starts.
+    emitToolEvent({
+      phase: 'end', id: 'write-2', name: 'write_file', duration_ms: 7,
+    });
+    emitToolEvent({
+      phase: 'end', id: 'write-1', name: 'write_file', duration_ms: 8,
+    });
+    // Reconnect/observer replay is at-least-once. Replaying terminal events
+    // must neither add a row nor erase the target and duration already shown.
+    emitToolEvent({
+      phase: 'end', id: 'write-2', name: 'write_file', duration_ms: 7,
+    });
+    // A stale non-terminal update delivered after completion must not regress
+    // or retarget the terminal row.
+    emitToolEvent({
+      phase: 'progress', id: 'write-2', name: 'write_file',
+      arguments: { path: 'wrong.html', content: 'late' },
+    });
+
+    expect(processRows.map((row) => row.dataset.processText)).toEqual([
+      'Edit file · first.html · Done · 8ms',
+      'Edit file · second.html · Done · 7ms',
+    ]);
+    expect(processRows.map((row) => row.dataset.processCallId)).toEqual([
+      'tool:write-1',
+      'tool:write-2',
+    ]);
+  });
+
+  it('restores replayed tool completions with the same informative rows as live rendering', () => {
+    const context = loadConversationRenderer();
+    const body = createProcessTestElement('div');
+    const runtime = { textContent: '', hidden: true };
+    const details = createProcessTestElement('details');
+    details.matches = (selector: string) => selector === '.stream-process';
+    details.querySelector = (selector: string) => {
+      if (selector === '.stream-process-body') return body;
+      if (selector === '.stream-process-runtime') return runtime;
+      return null;
+    };
+    const bubble: any = {
+      firstChild: null,
+      inserted: null,
+      insertBefore(node: any) { this.inserted = node; },
+    };
+    const msgDiv = {
+      querySelector: (selector: string) => selector === '.chat-bubble' ? bubble : null,
+    };
+    let createdOuterDetails = false;
+    context.document.createElement = (tag: string) => {
+      if (tag === 'details' && !createdOuterDetails) {
+        createdOuterDetails = true;
+        return details;
+      }
+      return createProcessTestElement(tag);
+    };
+
+    const process = [
+      {
+        phase: 'start', id: 'stat-1', name: 'stat_file',
+        arguments: { path: 'chat-2026-08-08-1' },
+      },
+      {
+        phase: 'start', id: 'read-1', name: 'read_file',
+        arguments: { path: '@skill/deep-research' },
+      },
+      { phase: 'end', id: 'read-1', name: 'read_file', duration_ms: 7 },
+      { phase: 'end', id: 'stat-1', name: 'stat_file', duration_ms: 8 },
+      { phase: 'end', id: 'read-1', name: 'read_file', duration_ms: 7 },
+      { phase: 'end', id: 'stat-1', name: 'stat_file', duration_ms: 8 },
+    ].map((data) => ({
+      type: 'event',
+      event: { stream: 'tool', data },
+    }));
+
+    context._renderPersistedProcess(msgDiv, process);
+
+    expect(bubble.inserted).toBe(details);
+    expect(body.children).toHaveLength(0);
+
+    details.open = true;
+    details.dispatchEvent({ type: 'toggle' });
+
+    expect(body.children).toHaveLength(1);
+    const compactGroup = body.children[0];
+    expect(compactGroup.dataset.processCompactGroup).toBe('operations');
+    expect(compactGroup.open).toBe(false);
+    expect(compactGroup._processCompactSummary.innerHTML).toContain('Operations 2');
+    expect(compactGroup._processCompactBody.children.map((row: any) => row.dataset.processText)).toEqual([
+      'Get file info · chat-2026-08-08-1 · Done · 8ms',
+      'View skill · deep-research · Done · 7ms',
+    ]);
+  });
+
+  it('restores a result-only row that click, Enter, and Space can open and close', async () => {
+    const context = loadConversationRenderer();
+    const processRows: any[] = [];
+    const listeners: Record<string, Function> = {};
+    const body: any = {
+      children: processRows,
+      appendChild(node: any) { processRows.push(node); },
+      addEventListener(type: string, listener: Function) { listeners[type] = listener; },
+      get childElementCount() { return processRows.length; },
+    };
+    const runtime = { textContent: '', hidden: true };
+    const details: any = {
+      className: '',
+      dataset: {},
+      classList: { add() {} },
+      matches: (selector: string) => selector === '.stream-process',
+      querySelector(selector: string) {
+        if (selector === '.stream-process-body') return body;
+        if (selector === '.stream-process-runtime') return runtime;
+        return null;
+      },
+      set innerHTML(_value: string) {},
+    };
+    const bubble: any = {
+      firstChild: null,
+      inserted: null,
+      insertBefore(node: any) { this.inserted = node; },
+    };
+    const msgDiv = {
+      querySelector: (selector: string) => selector === '.chat-bubble' ? bubble : null,
+    };
+    context.document.createElement = (tag: string) => {
+      if (tag === 'details') return details;
+      const attributes = new Map<string, string>();
+      const node: any = {
+        dataset: {},
+        className: '',
+        innerHTML: '',
+        textContent: '',
+        title: '',
+        setAttribute(name: string, value: string) { attributes.set(name, value); },
+        getAttribute(name: string) { return attributes.get(name) ?? null; },
+        removeAttribute(name: string) { attributes.delete(name); },
+        closest(selector: string) {
+          return selector === '.stream-process-line.is-expandable'
+              && this.classList.contains('stream-process-line')
+              && this.classList.contains('is-expandable')
+            ? this
+            : null;
+        },
+        insertAdjacentElement(position: string, sibling: any) {
+          expect(position).toBe('afterend');
+          const index = processRows.indexOf(this);
+          processRows.splice(index + 1, 0, sibling);
+          return sibling;
+        },
+        remove() {
+          const index = processRows.indexOf(this);
+          if (index >= 0) processRows.splice(index, 1);
+        },
+      };
+      node.classList = {
+        contains(name: string) { return node.className.split(/\s+/).includes(name); },
+      };
+      Object.defineProperty(node, 'nextElementSibling', {
+        get() {
+          const index = processRows.indexOf(node);
+          return index >= 0 ? (processRows[index + 1] || null) : null;
+        },
+      });
+      return node;
+    };
+
+    const readToolResult = vi.fn(async () => ({
+      ok: true,
+      content: 'full created snake output',
+      truncated: false,
+    }));
+    context.window.orkas = { invoke: readToolResult };
+    context._renderPersistedProcess(msgDiv, [{
+      type: 'event',
+      event: {
+        stream: 'cli',
+        data: {
+          type: 'tool-event', phase: 'result', tool: 'write', callId: 'write-result',
+          input: { filePath: '/Users/test/Private/snake.html', content: 'private body' },
+          output: 'created snake.html',
+          outputRef: 'write.0123456789abcdef',
+        },
+      },
+    }]);
+
+    expect(bubble.inserted).toBe(details);
+    expect(processRows).toHaveLength(1);
+    expect(processRows[0].dataset.processText).toBe('Edit file · snake.html · Done');
+    expect(processRows[0].className).toContain('is-expandable');
+    expect(processRows[0]._fullOutput).toBe('created snake.html');
+    expect(processRows[0].dataset.toolResultRef).toBe('write.0123456789abcdef');
+    expect(processRows[0].dataset.toolResultPath).toBeUndefined();
+    expect(processRows[0].title).toBe('Click to view full output');
+    expect(processRows[0].innerHTML).toContain('stream-process-expand-hint');
+    expect(processRows[0].innerHTML).toMatch(
+      /stream-process-expandable-content[\s\S]*stream-process-text[\s\S]*stream-process-expand-hint/,
+    );
+    expect(processRows[0].getAttribute('role')).toBe('button');
+    expect(processRows[0].getAttribute('tabindex')).toBe('0');
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('false');
+    expect(listeners.click).toBeTypeOf('function');
+    expect(listeners.keydown).toBeTypeOf('function');
+
+    await listeners.click({ target: processRows[0] });
+    expect(processRows).toHaveLength(2);
+    expect(processRows[1]).toMatchObject({
+      className: 'stream-process-line-full',
+      textContent: 'full created snake output',
+    });
+    expect(readToolResult).toHaveBeenCalledWith(
+      'localAgents.readToolResult',
+      { ref: 'write.0123456789abcdef' },
+    );
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('true');
+
+    let prevented = 0;
+    await listeners.keydown({
+      target: processRows[0],
+      key: 'Enter',
+      preventDefault: () => { prevented += 1; },
+    });
+    expect(processRows).toHaveLength(1);
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('false');
+
+    await listeners.keydown({
+      target: processRows[0],
+      key: ' ',
+      preventDefault: () => { prevented += 1; },
+    });
+    expect(processRows).toHaveLength(2);
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('true');
+    expect(prevented).toBe(2);
+
+    await listeners.click({ target: processRows[0] });
+    expect(processRows).toHaveLength(1);
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('mounts a live expandable result with the same keyboard button contract', () => {
+    const context = loadConversationRenderer();
+    const processRows: any[] = [];
+    const listeners: Record<string, Function> = {};
+    const body: any = {
+      children: processRows,
+      scrollHeight: 0,
+      scrollTop: 0,
+      clientHeight: 0,
+      appendChild(node: any) { processRows.push(node); },
+      addEventListener(type: string, listener: Function) { listeners[type] = listener; },
+    };
+    const processContainer = { style: { display: 'none' } };
+    const msg: any = {
+      parentElement: null,
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return processContainer;
+        if (selector === '[data-role="process"]') return body;
+        return null;
+      },
+    };
+    context.document.createElement = () => {
+      const attributes = new Map<string, string>();
+      const node: any = {
+        dataset: {},
+        className: '',
+        innerHTML: '',
+        title: '',
+        setAttribute(name: string, value: string) { attributes.set(name, value); },
+        getAttribute(name: string) { return attributes.get(name) ?? null; },
+        removeAttribute(name: string) { attributes.delete(name); },
+      };
+      node.classList = {
+        contains(name: string) { return node.className.split(/\s+/).includes(name); },
+      };
+      return node;
+    };
+
+    context._streamingAppendToolResultRow(
+      msg,
+      'Run command · npm test · Done',
+      '',
+      '',
+      '42 tests passed',
+      'tool',
+      'exec_command',
+      'cli:command-1',
+      true,
+    );
+
+    expect(processContainer.style.display).toBe('');
+    expect(processRows).toHaveLength(1);
+    expect(processRows[0].getAttribute('role')).toBe('button');
+    expect(processRows[0].getAttribute('tabindex')).toBe('0');
+    expect(processRows[0].getAttribute('aria-expanded')).toBe('false');
+    expect(listeners.click).toBeTypeOf('function');
+    expect(listeners.keydown).toBeTypeOf('function');
+  });
+
+  it('does not append a fallback duplicate after a post-render scroll failure', () => {
+    const context = loadConversationRenderer();
+    const processRows: any[] = [];
+    const body: any = {
+      children: processRows,
+      scrollHeight: 0,
+      clientHeight: 0,
+      appendChild(node: any) {
+        processRows.push(node);
+        this.scrollHeight = processRows.length;
+      },
+      addEventListener() {},
+    };
+    Object.defineProperty(body, 'scrollTop', {
+      get: () => 0,
+      set: () => { throw new Error('simulated scroll failure after append'); },
+    });
+    const processContainer = { style: { display: 'none' } };
+    const msg: any = {
+      dataset: {},
+      isConnected: true,
+      parentElement: null,
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return processContainer;
+        if (selector === '[data-role="process"]') return body;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === '[data-role="process"] .stream-process-line'
+          ? processRows
+          : [];
+      },
+    };
+    context.document.createElement = () => ({
+      dataset: {},
+      className: '',
+      innerHTML: '',
+      title: '',
+    });
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+    context.__liveMsg = msg;
+    vm.runInContext(`
+      _ensureActorPlaceholder = function() { return __liveMsg; };
+    `, context);
+
+    context._handleGroupBusEvent('c1', msg, {
+      type: 'process',
+      actor: 'researcher',
+      turn_id: 'turn-1',
+      seg: 0,
+      data: {
+        type: 'event',
+        event: {
+          stream: 'tool',
+          data: {
+            phase: 'start', id: 'read-1', name: 'read_file',
+            arguments: { path: 'src/process.ts' },
+          },
+        },
+      },
+    });
+
+    expect(processRows.map((row) => row.dataset.processText)).toEqual([
+      'Started · Read file · src/process.ts',
+    ]);
+    expect(processRows[0].dataset.processCallId).toBe('tool:read-1');
+  });
+
+  it('correlates CLI start, progress, and result events to the same visible row', () => {
+    const context = loadConversationRenderer();
+    const events = [
+      {
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'use', tool: 'WebFetch', callId: 'web-1' },
+      },
+      {
+        stream: 'cli',
+        data: { type: 'status', status: 'tool-progress', callId: 'web-1' },
+      },
+      {
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'web-1' },
+      },
+    ];
+  });
+
+  it('refuses to correlate lifecycle rows when a call id is absent', () => {
+    const context = loadConversationRenderer();
+    expect(context._processToolLifecycle({
+      stream: 'tool',
+      data: { phase: 'start', name: 'write_file' },
+    })).toBeNull();
+    expect(context._processToolLifecycle({
+      stream: 'tool',
+      data: { phase: 'end', name: 'write_file' },
+    })).toBeNull();
+  });
+
+  it('exposes safe generic operation details without requiring a tool-specific case', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'custom_pipeline',
+        input: {
+          operation: 'compile',
+          project_dir: 'overconstraint-carousel/01-cover',
+          format: 'png',
+          quality: 90,
+          access_token: 'super-secret',
+          prompt: 'private prompt',
+        },
+      },
+    });
+
+    expect(line).toBe(
+      'Run action · custom_pipeline · compile · overconstraint-carousel/01-cover · format=png · quality=90',
+    );
+    expect(line).not.toContain('super-secret');
+    expect(line).not.toContain('private prompt');
+  });
+
+  it('keeps generic tool details across start/end rows and exposes a safe failure reason', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const expected = 'Run action · image_studio · project.inspect · overconstraint-carousel/01-cover';
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'inspect-cover', name: 'image_studio',
+        arguments: {
+          op: 'project.inspect',
+          project_dir: 'overconstraint-carousel/01-cover',
+          access_token: 'super-secret',
+        },
+      },
+    }, displayContext)).toBe(`Started · ${expected}`);
+
+    const resultPreview = JSON.stringify({
+      ok: false,
+      inspection: {
+        blockers: [{
+          code: 'E_MANIFEST_REGION_BOUNDS',
+          message: 'visual_plan.regions[0].bounds must be normalized and stay inside the canvas.',
+        }],
+      },
+    });
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end', id: 'inspect-cover', name: 'image_studio', isError: true,
+        result_preview: resultPreview,
+      },
+    }, displayContext)).toBe(
+      `${expected} · Failed · E_MANIFEST_REGION_BOUNDS: visual_plan.regions[0].bounds must be normalized and stay inside the canvas.`,
+    );
+  });
+
+  it('prefers localized structured VideoStudio timing failures over raw protocol prose', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'narration-fit', name: 'video_studio',
+        arguments: {
+          op: 'composition.materialize_narration',
+          composition_dir: 'project/composition',
+        },
+      },
+    }, displayContext);
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end', id: 'narration-fit', name: 'video_studio', isError: true,
+        result_preview: JSON.stringify({
+          ok: false,
+          errorCode: 'E_NARRATION_TIMING_USER_DECISION_REQUIRED',
+          message: 'This internal protocol prose should stay out of the compact row.',
+          measured_duration_sec: 52,
+          min_duration_sec: 40,
+          max_duration_sec: 50,
+        }),
+      },
+    }, displayContext);
+
+    expect(line).toContain('Narration 52s still outside 40-50s; decide next step');
+    expect(line).not.toContain('internal protocol prose');
+  });
+
+  it('keeps a safe command summary across use, progress, and result rows', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'exec_command', callId: 'cmd-1',
+        input: { command: 'git add OpenSource/ORKAS_PR_TRACKING.md' },
+      },
+    }, displayContext)).toBe('Run command · git add OpenSource/ORKAS_PR_TRACKING.md');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'tool-progress', callId: 'cmd-1', elapsedSeconds: 2,
+      },
+    }, displayContext)).toBe('Run command · git add OpenSource/ORKAS_PR_TRACKING.md · 2s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cmd-1',
+        output: 'staged',
+      },
+    }, displayContext)).toBe('Run command · git add OpenSource/ORKAS_PR_TRACKING.md · Done · 2s');
+  });
+
+  it('uses safe result-only command and file inputs without exposing private details', () => {
+    const context = loadConversationRenderer();
+    const command = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'Bash', callId: 'result-command',
+        input: {
+          command: 'OPENAI_API_KEY=super-secret head -60 /Users/test/Private/CLAUDE.md\nprintf private-body',
+        },
+        output: 'private command output',
+      },
+    }, context._createProcessDisplayContext());
+    const write = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'write', callId: 'result-write',
+        input: {
+          filePath: '/Users/test/Private/snake.html',
+          content: '<main>private body</main>',
+        },
+        output: 'created',
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(command).toBe('Run command · OPENAI_API_KEY=*** head -60 CLAUDE.md · Done');
+    expect(command).not.toContain('/Users/alice');
+    expect(command).not.toContain('private-body');
+    expect(write).toBe('Edit file · snake.html · Done');
+    expect(write).not.toContain('/Users/alice');
+    expect(write).not.toContain('private body');
+  });
+
+  it('keeps repeated CLI step-start bookkeeping out of the work timeline', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const running = () => context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'running' },
+    }, displayContext);
+
+    expect([running(), running(), running()]).toEqual([null, null, null]);
+  });
+
+  it('retains the latest elapsed time on failed CLI tool results', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'exec_command', callId: 'cmd-failed',
+        input: { command: 'npm run verify' },
+      },
+    }, displayContext);
+    context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'tool-progress', callId: 'cmd-failed', elapsedSeconds: 3,
+      },
+    }, displayContext);
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cmd-failed',
+        isError: true, error: 'command exited with code 1',
+      },
+    }, displayContext)).toBe(
+      'Run command · npm run verify · Failed · 3s · command exited with code 1',
+    );
+  });
+
+  it.each([
+    ['isError', { isError: true }],
+    ['error detail', { error: 'command exited with code 1' }],
+  ])('projects a CLI result carrying %s with error semantics', (_label, failure) => {
+    const context = loadConversationRenderer();
+    const projection = context._projectProcessRow({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'exec_command',
+        input: { command: 'npm run verify' },
+        output: 'verification failed',
+        ...failure,
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(projection).toMatchObject({
+      kind: 'err',
+      expandable: true,
+    });
+    expect(projection.text).toContain('Failed');
+  });
+
+  it('prefers an exact result duration over the last progress estimate', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'web_fetch', callId: 'web-duration',
+        input: { url: 'https://example.com/docs/timing' },
+      },
+    }, displayContext);
+    context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'tool-progress', callId: 'web-duration', elapsedSeconds: 9,
+      },
+    }, displayContext);
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'web-duration',
+        durationMs: 1_250, output: 'ok',
+      },
+    }, displayContext)).toBe(
+      'View webpage · https://example.com/docs/timing · Done · 1s',
+    );
+  });
+
+  it('redacts command secrets, absolute paths, and multiline script bodies', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'Bash',
+        input: {
+          command: 'OPENAI_API_KEY=super-secret AWS_SECRET_ACCESS_KEY=another-secret curl -H "Authorization: Bearer sk-proj-abcdefghijklmnop" /Users/test/Private/report.md <<\'EOF\'\nprivate body',
+        },
+      },
+    });
+
+    expect(line).toBe('Run command · OPENAI_API_KEY=*** AWS_SECRET_ACCESS_KEY=*** curl -H "Authorization: ***" report.md <<\'EOF\'');
+    expect(line).not.toContain('super-secret');
+    expect(line).not.toContain('another-secret');
+    expect(line).not.toContain('/Users/alice');
+    expect(line).not.toContain('private body');
+  });
+
+  it('keeps the CLI process bootstrap out of the work timeline', () => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'process-info', cmd: 'codex', argCount: 7 },
+    })).toBeNull();
+  });
+
+  it('shows a bounded redacted failure summary for a failed command', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'exec_command', callId: 'cmd-failed',
+        input: { command: 'npm test' },
+      },
+    }, displayContext);
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cmd-failed',
+        is_error: true,
+        error: 'Could not open /Users/test/Private/test.log with GITHUB_TOKEN=private-token',
+      },
+    }, displayContext);
+
+    expect(line).toBe('Run command · npm test · Failed · Could not open test.log with GITHUB_TOKEN=***');
+    expect(line).not.toContain('/Users/alice');
+    expect(line).not.toContain('private-token');
+  });
+
+  it('uses a localized web-search action and keeps the query across start/result rows', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    const start = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'search-1',
+        name: 'web_search',
+        arguments: { query: 'pricing' },
+      },
+    }, displayContext);
+    const result = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'search-1',
+        name: 'web_search',
+        display_name: 'External Search',
+        result_preview: 'Search results for: "pricing" (via External Search) 1. Official pricing',
+      },
+    }, displayContext);
+
+    expect(start).toBe('Started · Search the web · pricing');
+    expect(result).toBe('Search the web · pricing · Done');
+    expect(result).not.toContain('Search results');
+  });
+
+  it('correlates Claude tool_result with its original business object without persisting display fields', () => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: 'writing-plans', name: 'Writing Plans' }];
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'Read',
+        callId: 'read-1',
+        input: {
+          file_path: '/Users/test/.orkas/data/u1/cloud/skills/writing-plans/SKILL.md',
+        },
+      },
+    }, displayContext)).toBe('View skill · Writing Plans');
+
+    const resultEvent = {
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'tool_result',
+        callId: 'read-1',
+        output: '# Writing Plans\nprivate body',
+      },
+    };
+    expect(context._formatEventLine(resultEvent, displayContext))
+      .toBe('View skill · Writing Plans · Done');
+    expect(resultEvent.data).not.toHaveProperty('objectType');
+    expect(resultEvent.data).not.toHaveProperty('objectName');
+  });
+
+  it('keeps raw multiline tool output out of the concise CLI process row', () => {
+    const context = loadConversationRenderer();
+
+    expect(Array.from(context._processTextLines('first line\r\nsecond line\n\nthird line')))
+      .toEqual(['first line', 'second line', 'third line']);
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'exec_command',
+        output: 'tests: 3 passed\ncoverage: 91%',
+      },
+    });
+    expect(line).toBe('Run command · Done');
+    expect(line).not.toContain('tests: 3 passed');
+  });
+
+  it('never mistakes a spilled result archive for the tool business target', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'result', tool: 'tool_result',
+        outputPath: '/Users/test/private/events/tool-results/result.txt',
+      },
+    });
+
+    expect(line).toBe('Run action · Done');
+    expect(line).not.toContain('result.txt');
+  });
+
+  it('keeps a short hidden CLI result available through the existing expansion row', () => {
+    const context = loadConversationRenderer();
+    let captured: any[] | null = null;
+    context._streamingAppendToolResultRow = (...args: any[]) => { captured = args; };
+    context._streamingAppendProgress = () => {
+      throw new Error('a recorded result body must use the expandable row');
+    };
+    const msg: any = { querySelector: () => null };
+
+    context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'exec_command',
+        output: 'ok',
+      },
+    });
+
+    expect(captured?.[1]).toBe('Run command · Done');
+    expect(captured?.[4]).toBe('ok');
+  });
+
+  it('renders multiline process output as distinct DOM rows with aligned continuations', () => {
+    const context = loadConversationRenderer();
+    const children: any[] = [];
+    context.document.createElement = () => ({
+      className: '',
+      dataset: {},
+      innerHTML: '',
+    });
+    const body = {
+      appendChild(node: any) {
+        children.push(node);
+      },
+    };
+
+    const count = context._appendProcessTextLines(
+      body,
+      'tests: 3 passed\n● coverage: 91%\nfinished',
+      'tool',
+      'exec_command',
+    );
+
+    expect(count).toBe(3);
+    expect(children.map(child => child.dataset.processText)).toEqual([
+      'tests: 3 passed',
+      '● coverage: 91%',
+      'finished',
+    ]);
+    expect(children[0].className).toBe('stream-process-line kind-tool');
+    expect(children[1].className).toContain('is-continuation');
+    expect(children[2].className).toContain('is-continuation');
+    expect(children.every(child => child.dataset.eventName === 'exec_command')).toBe(true);
+    expect(children[0].innerHTML).toContain('stream-process-icon');
+    expect(children[1].innerHTML).not.toContain('stream-process-icon');
+  });
+
+  it('merges adjacent operation kinds without sorting or semantic subgroups', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+
+    context._appendProcessTextLines(body, 'Thinking · Inspect the code', 'think');
+    context._appendProcessTextLines(body, 'Thinking · Check the tests', 'think');
+    context._appendProcessTextLines(body, 'Run command · rg process', 'tool', 'exec_command');
+    context._appendProcessTextLines(body, 'View file · style.css', 'tool', 'read_file');
+    context._appendProcessTextLines(body, 'Thinking · Verify the result', 'think');
+
+    expect(body.children).toHaveLength(1);
+    const group = body.children[0];
+    expect(group.dataset.processCompactGroup).toBe('operations');
+    expect(group.open).toBe(false);
+    expect(group._processCompactSummary.innerHTML).toContain('Operations 5');
+    expect(group._processCompactBody.children.map((line: any) => line.dataset.processText)).toEqual([
+      'Thinking · Inspect the code',
+      'Thinking · Check the tests',
+      'Run command · rg process',
+      'View file · style.css',
+      'Thinking · Verify the result',
+    ]);
+    expect(group._processCompactBody.children.map((line: any) => line.className)).toEqual([
+      'stream-process-line kind-think',
+      'stream-process-line kind-think',
+      'stream-process-line kind-tool',
+      'stream-process-line kind-tool',
+      'stream-process-line kind-think',
+    ]);
+  });
+
+  it('collapses every operation run without crossing process prose', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+    const appendCommentary = (text: string) => context._appendProjectedProcessRowToBody(body, {
+      text,
+      kind: 'think',
+      eventName: '',
+      lifecycleKey: '',
+      lifecycleTerminal: false,
+      expandable: false,
+      commentary: true,
+    });
+    const appendCommand = (text: string, id: string, kind = 'tool') => (
+      context._appendProjectedProcessRowToBody(body, {
+        text,
+        kind,
+        eventName: 'exec_command',
+        lifecycleKey: id,
+        lifecycleTerminal: true,
+        expandable: false,
+        commentary: false,
+      })
+    );
+
+    appendCommentary('Inspect the implementation.');
+    appendCommand('Run command · rg process', 'cmd-1');
+    expect(body.children[1].className).toBe('stream-process-compact-group');
+    expect(body.children[1].open).toBe(false);
+    expect(body.children[1]._processCompactSummary.innerHTML).toContain('Operations 1');
+    appendCommand('Run command · sed -n 1,200p', 'cmd-2');
+    appendCommentary('The first pass found the renderer boundary.');
+    appendCommand('Run command · failing check', 'cmd-failed', 'err');
+    appendCommand('Run command · npm test -- renderer', 'cmd-3');
+    appendCommand('Run command · git diff --check', 'cmd-4');
+
+    expect(body.children.map((node: any) => node.className)).toEqual([
+      'stream-process-commentary',
+      'stream-process-compact-group',
+      'stream-process-commentary',
+      'stream-process-compact-group',
+    ]);
+    const groups = body.children.filter((node: any) => (
+      node.className === 'stream-process-compact-group'
+    ));
+    expect(groups).toHaveLength(2);
+    expect(groups.every((group: any) => group.open === false)).toBe(true);
+    expect(groups[0]._processCompactSummary.innerHTML).toContain('Operations 2');
+    expect(groups[0]._processCompactBody.children.map((node: any) => node.dataset.processText)).toEqual([
+      'Run command · rg process',
+      'Run command · sed -n 1,200p',
+    ]);
+    expect(groups[1]._processCompactBody.children.map((node: any) => node.dataset.processText)).toEqual([
+      'Run command · failing check',
+      'Run command · npm test -- renderer',
+      'Run command · git diff --check',
+    ]);
+
+    // A user-opened group stays open when the next adjacent command joins it.
+    groups[1].open = true;
+    appendCommand('Run command · node --check', 'cmd-5');
+    const lastGroup = body.children[body.children.length - 1];
+    expect(lastGroup.className).toBe('stream-process-compact-group');
+    expect(lastGroup.open).toBe(true);
+    expect(lastGroup._processCompactSummary.innerHTML).toContain('Operations 4');
+
+    // Lifecycle replacement changes the detail in place without splitting the
+    // generic operation group by status or tool semantics.
+    appendCommand('Run command · git diff failed', 'cmd-4', 'err');
+    const updatedGroup = body.children[body.children.length - 1];
+    expect(updatedGroup.className).toBe('stream-process-compact-group');
+    expect(updatedGroup._processCompactSummary.innerHTML).toContain('Operations 4');
+    expect(updatedGroup._processCompactBody.children[2]).toMatchObject({
+      className: 'stream-process-line kind-err',
+      dataset: expect.objectContaining({ processText: 'Run command · git diff failed' }),
+    });
+  });
+
+  it('uses one generic group for adjacent reads, searches, and commands', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+    const append = (text: string, eventName: string, id: string) => (
+      context._appendProjectedProcessRowToBody(body, {
+        text,
+        kind: 'tool',
+        eventName,
+        lifecycleKey: id,
+        lifecycleTerminal: true,
+        expandable: false,
+        commentary: false,
+      })
+    );
+
+    append('Read file · conversation.js', 'read_files', 'read-1');
+    append('Search files · process group', 'search_files', 'search-1');
+    append('Run command · npm test', 'exec_command', 'cmd-1');
+    append('Run command · git diff --check', 'exec_command', 'cmd-2');
+
+    expect(body.children).toHaveLength(1);
+    expect(body.children[0].dataset.processCompactGroup).toBe('operations');
+    expect(body.children[0].open).toBe(false);
+    expect(body.children[0]._processCompactSummary.innerHTML).toContain('Operations 4');
+  });
+
+  it('keeps live operations in the collapsed operation group and updates them in place', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+    body.className = 'stream-process-body';
+    const details = createProcessTestElement('details');
+    details.className = 'stream-process';
+    details.dataset.processState = 'active';
+    details.matches = (selector: string) => selector === '.stream-process';
+    details.appendChild(body);
+    const append = (text: string, terminal: boolean) => (
+      context._appendProjectedProcessRowToBody(body, {
+        text,
+        kind: 'tool',
+        eventName: 'exec_command',
+        lifecycleKey: 'live-command',
+        lifecycleTerminal: terminal,
+        expandable: false,
+        commentary: false,
+      })
+    );
+
+    append('Run command · rg process', false);
+    expect(body.children).toHaveLength(1);
+    const group = body.children[0];
+    expect(group.className).toBe('stream-process-compact-group');
+    expect(group.open).toBe(false);
+    expect(group._processCompactSummary.innerHTML).toContain('Operations 1');
+    expect(group._processCompactBody.children[0].dataset.processText)
+      .toBe('Run command · rg process');
+
+    append('Run command · Done', true);
+    expect(body.children).toEqual([group]);
+    expect(group._processCompactSummary.innerHTML).toContain('Operations 1');
+    expect(group._processCompactBody.children).toHaveLength(1);
+    expect(group._processCompactBody.children[0].dataset.processText)
+      .toBe('Run command · Done');
+
+  });
+
+  it('places live commentary and commands in one chronological process stream', async () => {
+    const context = loadConversationRenderer();
+    const body = createProcessTestElement('div');
+    body.className = 'stream-process-body';
+    const container = createProcessTestElement('details');
+    container.className = 'stream-process';
+    container.dataset.processState = 'active';
+    container.style = { display: 'none' };
+    container.appendChild(body);
+    const thinking = { style: { display: '' } };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return container;
+        if (selector === '[data-role="process"]') return body;
+        if (selector === '[data-role="thinking"]') return thinking;
+        return null;
+      },
+    };
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    context._bindProcessStickToBottom = () => {};
+    context._stickProcessBottomIfPinned = () => {};
+    context._stickBottomFromMsg = () => {};
+    context._stripSkillCreateBlocksForStream = (value: string) => value;
+    context._stripAgentCreateBlocksForStream = (value: string) => value;
+    context._stripAutoTaskBlocksForStream = (value: string) => value;
+    context._stripAgentFormBlockForStream = (value: string) => value;
+    context._stripDashboardBlocksForStream = (value: string) => value;
+    context._stripSkillFileBlocksForStream = (value: string) => value;
+    context._stripSkillEditProtocolBlocksForStream = (value: string) => value;
+
+    context._streamingAppendCommentaryDelta(msg, 'Inspect ');
+    context._streamingAppendCommentaryDelta(msg, 'the code');
+    context._sealStreamingCommentary(msg);
+    context._appendProcessTextLines(body, 'Run command · rg process', 'tool', 'exec_command');
+    context._streamingAppendCommentaryDelta(msg, 'Verify the result');
+    // Live commentary repaints are frame-coalesced; let the harness rAF
+    // (setTimeout 0) fire so the trailing unsealed row is painted.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container).toMatchObject({ open: true, style: { display: '' } });
+    expect(thinking.style.display).toBe('none');
+    expect(body.children.map((line: any) => line.className)).toEqual([
+      'stream-process-commentary',
+      'stream-process-compact-group',
+      'stream-process-commentary stream-process-commentary-live',
+    ]);
+    expect(body.children[0].dataset.processText).toBe('Inspect the code');
+    expect(body.children[1].open).toBe(false);
+    expect(body.children[1]._processCompactSummary.innerHTML).toContain('Operations 1');
+    expect(body.children[1]._processCompactBody.children[0].dataset.processText)
+      .toBe('Run command · rg process');
+    expect(body.children[2].dataset.processText).toBe('Verify the result');
+    expect(body.children[0].innerHTML).not.toContain('stream-process-icon');
+    expect(body.children[1]._processCompactSummary.innerHTML).toContain('stream-process-icon');
+    expect(body.children[2].innerHTML).not.toContain('stream-process-icon');
+  });
+
+  it('paints draft text before phase resolution and moves each round into process only once', async () => {
+    const context = loadConversationRenderer();
+    // This scenario exercises cancellation of a queued preview paint. Match
+    // the browser's paired request/cancel API, absent from the minimal shim.
+    context.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
+    context.cancelAnimationFrame = (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle);
+    context.document.createElement = (tag: string) => createProcessTestElement(tag);
+    const body = createProcessTestElement('div');
+    const container = createProcessTestElement('details');
+    container.dataset.processState = 'active';
+    container.open = true;
+    container.style = { display: '' };
+    const finalEl: any = { style: { display: 'none' }, innerHTML: '', querySelector: () => null };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        if (selector === '[data-role="process"]') return body;
+        if (selector === '[data-role="process-container"]' || selector === '.stream-process') return container;
+        return null;
+      },
+    };
+    context._bindProcessStickToBottom = () => {};
+    context._stickProcessBottomIfPinned = () => {};
+    context._stickBottomFromMsg = () => {};
+    context._streamingDisplayText = (text: string) => text;
+    context._paintStreamingFinalMarkdown = (_msg: any, el: any, text: string) => { el.innerHTML = text; };
+    context._attachAssistantActions = () => {};
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    for (const text of ['Inspect sources.', 'Verify results.']) {
+      context._streamingAppendFinalDelta(msg, text, 'pending');
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(finalEl.innerHTML).toBe(text);
+      expect(container.dataset.processState).toBe('active');
+      context._streamingFinalizeCommentary(msg, text);
+      context._streamingFinalizeCommentary(msg, text);
+      expect(finalEl.style.display).toBe('none');
+      expect(msg.dataset.streamBuf).toBe('');
+    }
+    expect(body.children.map((line: any) => line.dataset.processText))
+      .toEqual(['Inspect sources.', 'Verify results.']);
+    context._streamingAppendFinalDelta(msg, 'Delivered.', 'pending');
+    context._streamingSetFinal(msg, 'Delivered.');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(finalEl.innerHTML).toBe('Delivered.');
+    expect(body.children).toHaveLength(2);
+  });
+
+  it('renders commentary through the markdown pipeline and keeps the raw source text', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    context.renderMarkdownFull = (text: string) => `<p data-md="1">${escapeHtml(text)}</p>`;
+    const body = createProcessTestElement('div');
+    const source = '## 核心判断\n\n**不要打**大词';
+
+    context._appendProjectedProcessRowToBody(body, {
+      text: source,
+      kind: 'think',
+      eventName: '',
+      lifecycleKey: '',
+      lifecycleTerminal: false,
+      expandable: false,
+      commentary: true,
+    });
+
+    const line = body.children[0];
+    expect(line.className).toBe('stream-process-commentary');
+    // Raw text survives as the comparison/copy source; paragraph breaks are
+    // not collapsed on the way into the markdown renderer.
+    expect(line.dataset.processText).toBe(source);
+    expect(line.innerHTML).toContain('stream-process-commentary-text markdown-body');
+    expect(line.innerHTML).toContain('data-md="1"');
+  });
+
+  it('falls back to escaped plain text when the markdown pipeline is unavailable', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+
+    context._appendProjectedProcessRowToBody(body, {
+      text: '**bold** stays literal',
+      kind: 'think',
+      eventName: '',
+      lifecycleKey: '',
+      lifecycleTerminal: false,
+      expandable: false,
+      commentary: true,
+    });
+
+    const line = body.children[0];
+    expect(line.dataset.processText).toBe('**bold** stays literal');
+    expect(line.innerHTML).toContain('**bold** stays literal');
+    expect(line.innerHTML).not.toContain('markdown-body');
+  });
+
+  it('replays persisted commentary and commands as the same ordered item timeline', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+
+    const commentary = (text: string) => context._projectProcessRow(
+      { stream: 'assistant', data: { phase: 'commentary' } },
+      context._createProcessDisplayContext(),
+      text,
+    );
+    context._appendProjectedProcessRowToBody(body, commentary('Inspect the code.'));
+    context._appendProjectedProcessRowToBody(body, {
+      text: 'Run command · rg process',
+      kind: 'tool',
+      eventName: 'exec_command',
+      lifecycleKey: '',
+      lifecycleTerminal: true,
+      expandable: false,
+      commentary: false,
+    });
+    context._appendProjectedProcessRowToBody(body, commentary('Verify the result.'));
+
+    expect(body.children.map((line: any) => line.className)).toEqual([
+      'stream-process-commentary',
+      'stream-process-compact-group',
+      'stream-process-commentary',
+    ]);
+    expect(body.children[0].dataset.processText).toBe('Inspect the code.');
+    expect(body.children[1]._processCompactSummary.innerHTML).toContain('Operations 1');
+    expect(body.children[1]._processCompactBody.children[0].dataset.processText)
+      .toBe('Run command · rg process');
+    expect(body.children[2].dataset.processText).toBe('Verify the result.');
+  });
+
+  it('keeps plan steps as detail rows inside one collapsed operation', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    const body = createProcessTestElement('div');
+
+    context._appendProcessTextLines(
+      body,
+      [
+        'Update plan · Inspect the existing process UI',
+        'Update plan · Show the plan content',
+        'Update plan · Verify the result',
+      ].join('\n'),
+      'plan',
+      'update_plan',
+    );
+
+    expect(body.children).toHaveLength(1);
+    const group = body.children[0];
+    expect(group.open).toBe(false);
+    expect(group._processCompactSummary.innerHTML).toContain('Operations 1');
+    const children = group._processCompactBody.children;
+    expect(children).toHaveLength(3);
+    expect(children[0].className).toBe('stream-process-line kind-plan');
+    expect(children.slice(1).every(child => (
+      child.className === 'stream-process-line kind-plan is-continuation'
+    ))).toBe(true);
+    expect(children[0].innerHTML).toContain('stream-process-icon');
+    expect(children.slice(1).every(child => !child.innerHTML.includes('stream-process-icon'))).toBe(true);
+    expect(children.map(child => child.dataset.processText)).toEqual([
+      'Update plan · Inspect the existing process UI',
+      'Update plan · Show the plan content',
+      'Update plan · Verify the result',
+    ]);
+  });
+
+  it('fixes main-task AI replies at the existing 80% message cap', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const message = onlyCssDeclarations(style, '.chat-history > .chat-message.assistant');
+    const bubble = onlyCssDeclarations(style, '.chat-history > .chat-message.assistant > .chat-bubble');
+
+    expect(message).toMatchObject({ width: '80%', 'max-width': '80%' });
+    expect(bubble).toMatchObject({ width: '100%', 'box-sizing': 'border-box' });
+  });
+
+  it('uses the group-chat message presentation in Agent and Skill edit chats', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+
+    for (const container of ['.agents-chat-messages', '.skills-chat-messages']) {
+      expect(onlyCssDeclarations(style, container)).toMatchObject({ gap: '16px' });
+      expect(onlyCssDeclarations(style, `${container} > .chat-message.assistant`))
+        .toMatchObject({ width: '80%', 'max-width': '80%' });
+      expect(onlyCssDeclarations(style, `${container} > .chat-message.assistant > .chat-bubble`))
+        .toMatchObject({ width: '100%', 'box-sizing': 'border-box' });
+      expect(cssDeclarationsForSelector(style, `${container} .chat-message`)).toEqual([]);
+      expect(cssDeclarationsForSelector(style, `${container} .chat-bubble`)).toEqual([]);
+      expect(cssDeclarationsForSelector(style, `${container} .chat-meta`)).toEqual([]);
+    }
+  });
+
+  it('keeps created-resource chips inside the bubble and outside hover actions', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/conversation.js'),
+      'utf8',
+    );
+    const createdResource = onlyCssDeclarations(style, '.chat-msg-created-agent');
+    const bubbleActions = cssDeclarationsForSelector(style, '.chat-bubble-actions')
+      .find((declarations) => Object.prototype.hasOwnProperty.call(declarations, 'order'));
+
+    expect(createdResource).toMatchObject({ display: 'flex', 'margin-top': '8px' });
+    expect(bubbleActions).toMatchObject({ position: 'relative', order: '-1' });
+    expect(source).toContain(
+      '<div class="chat-bubble">${planAnnHtml}${referencesHtml}${contentHtml}${attachmentsHtml}${createdAgentHtml}${createdSkillHtml}</div>',
+    );
+    expect(source).toContain(
+      '<div class="chat-msg-actions" data-role="msg-actions"></div>',
+    );
+    expect(style).not.toContain('.chat-msg-actions > .chat-msg-created-agent');
+
+    const agentMount = source.slice(
+      source.indexOf('function _mountCreatedAgentChip'),
+      source.indexOf('function _mountCreatedSkillChip'),
+    );
+    const skillMount = source.slice(
+      source.indexOf('function _mountCreatedSkillChip'),
+      source.indexOf('// `_splitMarkdownProseCode`'),
+    );
+    for (const mount of [agentMount, skillMount]) {
+      expect(mount).toContain("const bubble = msg.querySelector('.chat-bubble')");
+      expect(mount).not.toContain('msg-actions');
+    }
+  });
+
+  it('shows a warning toast without a modal or navigation for a stale created-agent chip', async () => {
+    const context = loadConversationRenderer();
+    const clicks: Array<{ name: string; payload: unknown }> = [];
+    let clickHandler: (() => Promise<void>) | null = null;
+    const chip = {
+      dataset: { agentId: 'missing-agent' },
+      addEventListener(type: string, handler: () => Promise<void>) {
+        if (type === 'click') clickHandler = handler;
+      },
+    };
+    const msgDiv = {
+      querySelectorAll: (selector: string) => (
+        selector === '.chat-msg-created-agent-chip[data-agent-id]' ? [chip] : []
+      ),
+    };
+
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: false, error: 'agent not found' }),
+    });
+    context.uiAlert = vi.fn();
+    context.uiToast = vi.fn();
+    context.openAgentDetail = vi.fn();
+    context.selectAgent = vi.fn();
+    context.Monitor = {
+      click: (name: string, payload: unknown) => clicks.push({ name, payload }),
+    };
+    context.window.Monitor = context.Monitor;
+
+    context._hydrateMessageCreatedAgentChip(msgDiv);
+    expect(clickHandler).toBeTruthy();
+    await clickHandler!();
+
+    expect(context.uiToast).toHaveBeenCalledWith('agents.agent_not_found', { variant: 'warning' });
+    expect(context.uiAlert).not.toHaveBeenCalled();
+    expect(context.openAgentDetail).not.toHaveBeenCalled();
+    expect(context.selectAgent).not.toHaveBeenCalled();
+  });
+
+  it('alerts instead of silently ignoring a stale created-skill chip', async () => {
+    const context = loadConversationRenderer();
+    context.setView = vi.fn();
+    const alerts: string[] = [];
+    const clicks: Array<{ name: string; payload: unknown }> = [];
+    let clickHandler: (() => Promise<void>) | null = null;
+    const chip = {
+      dataset: { skillId: 'missing-skill' },
+      addEventListener(type: string, handler: () => Promise<void>) {
+        if (type === 'click') clickHandler = handler;
+      },
+    };
+    const msgDiv = {
+      querySelectorAll: (selector: string) => (
+        selector === '.chat-msg-created-agent-chip[data-skill-id]' ? [chip] : []
+      ),
+    };
+
+    context.loadRendererFeature = async () => {};
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: false, error: 'skill not found' }),
+    });
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context.openSkillDetail = vi.fn();
+    context.Monitor = {
+      click: (name: string, payload: unknown) => clicks.push({ name, payload }),
+    };
+    context.window.Monitor = context.Monitor;
+
+    context._hydrateMessageCreatedSkillChip(msgDiv);
+    expect(clickHandler).toBeTruthy();
+    await clickHandler!();
+
+    expect(alerts).toEqual(['skills.skill_not_found']);
+    expect(context.openSkillDetail).not.toHaveBeenCalled();
+  });
+
+  it('ships a missing-skill alert in every renderer locale', () => {
+    for (const locale of ['en', 'zh', 'ja', 'pt']) {
+      const messages = JSON.parse(fs.readFileSync(
+        path.join(__dirname, `../../src/renderer/locales/${locale}.json`),
+        'utf8',
+      ));
+      expect(messages['skills.skill_not_found']).toBeTruthy();
+    }
+  });
+
+  it('leaves user messages content-sized up to the shared 80% cap', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const genericMessage = onlyCssDeclarations(style, '.chat-message');
+    const genericBubble = onlyCssDeclarations(style, '.chat-bubble');
+    const userMessage = onlyCssDeclarations(style, '.chat-message.user');
+    const userBubble = onlyCssDeclarations(style, '.chat-message.user .chat-bubble');
+
+    expect(genericMessage['max-width']).toBe('80%');
+    expect(genericMessage).not.toHaveProperty('width');
+    expect(genericBubble).not.toHaveProperty('width');
+    expect(userMessage).not.toHaveProperty('width');
+    expect(userBubble).not.toHaveProperty('width');
+    expect(cssDeclarationsForSelector(style, '.chat-history > .chat-message')).toEqual([]);
+    expect(cssDeclarationsForSelector(style, '.chat-history > .chat-message.user')).toEqual([]);
+    expect(cssDeclarationsForSelector(style, '.chat-history > .chat-message.user > .chat-bubble')).toEqual([]);
+  });
+
+  it('lays expanded process content out fully without an internal viewport', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const body = onlyCssDeclarations(style, '.stream-process-body');
+
+    expect(body).toMatchObject({
+      'max-height': 'none',
+      'overflow-x': 'visible',
+      'overflow-y': 'visible',
+    });
+    expect(body).not.toHaveProperty('overflow');
+    expect(cssDeclarationsForSelector(style, '.stream-process-body::-webkit-scrollbar')).toEqual([]);
+    expect(cssDeclarationsForSelector(style, '.stream-process-body::-webkit-scrollbar-thumb')).toEqual([]);
+  });
+
+  it('keeps process and operation disclosures borderless', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const process = onlyCssDeclarations(style, '.stream-process');
+    const activeExpandedProcess = cssDeclarationsForSelector(
+      style,
+      '.stream-process[open]:not(.runtime-only)',
+    );
+    const completedExpandedProcess = cssDeclarationsForSelector(
+      style,
+      '.stream-process[data-process-state="complete"][open]:not(.runtime-only)',
+    );
+    const operationGroup = onlyCssDeclarations(style, '.stream-process-compact-group');
+    const expandedOperationGroup = cssDeclarationsForSelector(
+      style,
+      '.stream-process-compact-group[open]',
+    );
+
+    expect(process).not.toHaveProperty('border-bottom');
+    expect(activeExpandedProcess).toEqual([]);
+    expect(operationGroup).not.toHaveProperty('border-bottom');
+    expect(completedExpandedProcess).toEqual([]);
+    expect(expandedOperationGroup).toEqual([]);
+  });
+
+  it('renders process content as a Codex-style work disclosure inside the existing bubble', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const process = onlyCssDeclarations(style, '.stream-process');
+    const summary = onlyCssDeclarations(style, '.stream-process-summary');
+    const summaryDivider = cssDeclarationsForSelector(style, '.stream-process-summary::after');
+    const body = onlyCssDeclarations(style, '.stream-process-body');
+    const activeSummary = onlyCssDeclarations(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-summary',
+    );
+    const activeProcess = cssDeclarationsForSelector(
+      style,
+      '.stream-process[data-process-state="active"]',
+    );
+
+    expect(process).toMatchObject({ margin: '0' });
+    expect(process).not.toHaveProperty('border-left');
+    expect(process).not.toHaveProperty('padding-left');
+    expect(summary).toMatchObject({
+      display: 'flex',
+      'align-items': 'center',
+      gap: '5px',
+    });
+    expect(summaryDivider).toEqual([]);
+    expect(body).toMatchObject({
+      margin: '8px 0 0 2px',
+      padding: '0 0 0 12px',
+      'border-left': '2px solid var(--surface-3)',
+      'font-family': 'inherit',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-body > :last-child')).toMatchObject({
+      'margin-bottom': '0',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-commentary')).toMatchObject({
+      margin: '6px 0',
+      color: 'var(--text-2)',
+      'font-size': '13.5px',
+      'line-height': '1.62',
+    });
+    const compactSummary = onlyCssDeclarations(style, '.stream-process-compact-summary');
+    expect(compactSummary).toMatchObject({
+      display: 'inline-flex',
+      'align-items': 'center',
+      gap: '6px',
+      color: 'var(--stream-process-operation-color)',
+      cursor: 'pointer',
+      'list-style': 'none',
+    });
+    // Resting state stays quiet: no box or fill (a bordered chip repeated
+    // between every paragraph reads as noise); feedback lives on hover only.
+    expect(compactSummary).not.toHaveProperty('border');
+    expect(compactSummary).not.toHaveProperty('background');
+    expect(onlyCssDeclarations(style, '.stream-process-compact-summary:hover')).toMatchObject({
+      background: 'var(--surface-2)',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-compact-group')).toMatchObject({
+      '--stream-process-operation-color': 'var(--muted)',
+    });
+    expect(onlyCssDeclarations(
+      style,
+      '.stream-process-compact-body .stream-process-line:not(.kind-warn):not(.kind-err)',
+    )).toMatchObject({
+      color: 'var(--stream-process-operation-color)',
+    });
+    expect(onlyCssDeclarations(
+      style,
+      '.stream-process-compact-body .stream-process-line:not(.kind-warn):not(.kind-err):hover',
+    )).toMatchObject({
+      color: 'var(--text)',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-compact-label')).toMatchObject({
+      flex: '0 1 auto',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-compact-caret')).toMatchObject({
+      'margin-top': '0',
+    });
+    expect(onlyCssDeclarations(
+      style,
+      '.stream-process-compact-summary .stream-process-compact-icon',
+    )).toMatchObject({
+      'margin-top': '0',
+      width: '11px',
+      height: '11px',
+      flex: '0 0 11px',
+    });
+    expect(onlyCssDeclarations(style, '.stream-process-compact-body')).toMatchObject({
+      margin: '4px 0 6px 12px',
+    });
+    expect(activeProcess).toEqual([]);
+    expect(onlyCssDeclarations(style, '.stream-process-loading')).toMatchObject({
+      display: 'none',
+      'margin-top': '6px',
+    });
+    expect(onlyCssDeclarations(
+      style,
+      '.chat-message[data-activity-start]:not([data-activity-done="1"]) > .chat-bubble > .stream-process-loading',
+    )).toMatchObject({ display: 'flex' });
+    expect(cssDeclarationsForSelector(style, '.stream-activity')).toEqual([]);
+  });
+
+  it('uses body-style live prose while keeping operation typography compact', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const liveBody = onlyCssDeclarations(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-body',
+    );
+    const liveCommentary = onlyCssDeclarations(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-commentary',
+    );
+    const liveParagraph = onlyCssDeclarations(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-commentary .markdown-body p',
+    );
+    const liveOperations = onlyCssDeclarations(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-compact-body',
+    );
+
+    expect(liveBody).toMatchObject({
+      margin: '8px 0 0',
+      padding: '0',
+      'border-left': '0',
+      'font-size': 'inherit',
+      'line-height': 'inherit',
+      color: 'var(--text)',
+    });
+    expect(liveCommentary).toMatchObject({
+      margin: '0.4em 0',
+      color: 'var(--text)',
+      'font-size': 'inherit',
+      'line-height': 'inherit',
+    });
+    expect(liveParagraph).toMatchObject({ margin: '0.4em 0' });
+    expect(cssDeclarationsForSelector(
+      style,
+      '.stream-process[data-process-state="active"] .stream-process-compact-summary',
+    )).toEqual([]);
+    expect(liveOperations).toMatchObject({
+      'font-size': '12.5px',
+      'line-height': '1.55',
+    });
+    // Keep live/completed color differences and semantic row colors owned by
+    // the existing commentary/kind rules; this override is typography-only.
+    expect(liveOperations).not.toHaveProperty('color');
+
+    // Completed/history disclosures still use the base rail styling above;
+    // no completed-state override is allowed to erase that presentation.
+    expect(cssDeclarationsForSelector(
+      style,
+      '.stream-process[data-process-state="complete"] .stream-process-body',
+    )).toEqual([]);
+    expect(onlyCssDeclarations(
+      style,
+      '.stream-process:not([data-process-state="active"]) .stream-process-commentary .markdown-body p',
+    )).toMatchObject({ margin: '6px 0', 'text-wrap': 'pretty' });
+  });
+
+  it.each([
+    ['ordinary process rows', '.stream-process-text'],
+    ['multiline continuation rows', '.stream-process-line.is-continuation .stream-process-text'],
+  ])('wraps %s within the process viewport', (_label, selector) => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const declarations = onlyCssDeclarations(style, selector);
+
+    expect(declarations['white-space']).toBe('pre-wrap');
+    expect(declarations['overflow-wrap']).toBe('anywhere');
+    expect(declarations['white-space']).not.toBe('nowrap');
+  });
+
+  it('wraps expanded full output while retaining vertical overflow', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const fullOutput = onlyCssDeclarations(style, '.stream-process-line-full');
+
+    expect(fullOutput).toMatchObject({
+      'white-space': 'pre-wrap',
+      'word-break': 'break-all',
+      'max-height': '320px',
+      'overflow-x': 'hidden',
+      'overflow-y': 'auto',
+    });
+    expect(fullOutput).not.toHaveProperty('overflow');
+  });
+
+  it('keeps the expandable caret beside the final wrapped line of process copy', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const hint = onlyCssDeclarations(style, '.stream-process-expand-hint');
+    const expandableRow = onlyCssDeclarations(style, '.stream-process-line.is-expandable');
+    const expandableProcessIcon = cssDeclarationsForSelector(
+      style,
+      '.stream-process-line.is-expandable .stream-process-icon',
+    );
+    const expandableContent = onlyCssDeclarations(
+      style,
+      '.stream-process-expandable-content',
+    );
+    const expandableText = onlyCssDeclarations(
+      style,
+      '.stream-process-expandable-content .stream-process-text',
+    );
+    const icon = onlyCssDeclarations(style, '.stream-process-expand-icon');
+    const focus = onlyCssDeclarations(style, '.stream-process-line.is-expandable:focus-visible');
+    const expandedIcon = onlyCssDeclarations(
+      style,
+      '.stream-process-line.is-expandable[aria-expanded="true"] .stream-process-expand-icon',
+    );
+
+    expect(hint).toMatchObject({
+      display: 'inline-flex',
+      flex: '0 0 auto',
+      'margin-left': '5px',
+      'margin-top': '0',
+      'vertical-align': '-1px',
+      opacity: '0.48',
+    });
+    expect(expandableRow).toMatchObject({ 'align-items': 'flex-start' });
+    expect(expandableProcessIcon).toEqual([]);
+    expect(expandableContent).toMatchObject({
+      flex: '0 1 auto',
+      'white-space': 'pre-wrap',
+      'overflow-wrap': 'anywhere',
+      'word-break': 'break-word',
+    });
+    expect(expandableText).toMatchObject({ display: 'inline' });
+    expect(icon).toMatchObject({ width: '11px', height: '11px' });
+    expect(focus).toMatchObject({
+      outline: '2px solid color-mix(in srgb, var(--primary) 48%, transparent)',
+      'outline-offset': '2px',
+    });
+    expect(expandedIcon).toMatchObject({ transform: 'rotate(90deg)' });
+  });
+
+  it('keeps the process caret visible and fixed-width for runtime-only summaries', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/conversation.js'),
+      'utf8',
+    );
+
+    expect(style).toMatch(/\.stream-process-caret\s*\{[^}]*flex:\s*0 0 16px;/s);
+    expect(style).not.toMatch(
+      /\.stream-process\.runtime-only \.stream-process-caret\s*\{[^}]*(?:display:\s*none|visibility:\s*hidden|opacity:\s*0)/s,
+    );
+    const summaries = Array.from(source.matchAll(
+      /<summary class="stream-process-summary">([\s\S]*?)<\/summary>/g,
+    ));
+    expect(summaries).toHaveLength(2);
+    for (const summary of summaries) {
+      expect(summary[1].indexOf('stream-process-label'))
+        .toBeLessThan(summary[1].indexOf('stream-process-runtime'));
+      expect(summary[1].indexOf('stream-process-runtime'))
+        .toBeLessThan(summary[1].indexOf('stream-process-caret'));
+    }
+  });
+
+  it('formats retry, background, and tool-progress protocol statuses', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status',
+        status: 'retrying',
+        attempt: 2,
+        maxRetries: 4,
+        retryDelayMs: 2_000,
+        error: 'network unavailable',
+      },
+    })).toBe('Temporary model service error · Retry 2/4 · Continue in 2s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status',
+        status: 'background-running',
+        message: 'indexing files',
+      },
+    })).toBe('Background task running · indexing files');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status',
+        status: 'tool-progress',
+        tool: 'Bash',
+        elapsedSeconds: 3,
+      },
+    })).toBe('Run command · 3s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status',
+        status: 'failed',
+        error: 'Command failed at /Users/test/Private/build.log with API_KEY=private-token',
+      },
+    })).toBe('Failed · Command failed at build.log with API_KEY=***');
+    expect(context._eventProcessKind({
+      stream: 'cli',
+      data: { type: 'status', status: 'retrying' },
+    }, '')).toBe('warn');
+    expect(context._eventProcessKind({
+      stream: 'cli',
+      data: { type: 'status', status: 'background-failed' },
+    }, '')).toBe('err');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'thinking', chars: 0 },
+    })).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'thinking', chars: 32, summary: 'Reviewing the event parser' },
+    })).toBe('Reviewing the event parser');
+    expect(context._eventProcessKind({
+      stream: 'cli',
+      data: { type: 'thinking', chars: 0 },
+    }, '')).toBe('think');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'start', id: 'reasoning-1', chars: 0 },
+    })).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'end', id: 'reasoning-1', chars: 0 },
+    })).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: {
+        phase: 'progress', id: 'reasoning-1', chars: 16, summary: 'Reviewing the event parser',
+      },
+    })).toBe('Reviewing the event parser');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: {
+        phase: 'end', id: 'reasoning-1', chars: 32, summary: 'Reviewing the event parser',
+      },
+    })).toBe('Reviewing the event parser');
+    const longReasoning = `BEGIN_${'x'.repeat(3_000)}_END`;
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-long', summary: longReasoning },
+    })).toBe(longReasoning);
+    expect(context._eventProcessKind({
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-1', chars: 16, heartbeat: true },
+    }, '')).toBe('think');
+    expect([
+      { phase: 'start' },
+      { phase: 'progress' },
+      { phase: 'end' },
+    ].map(({ phase }) => context._processToolLifecycle({
+      stream: 'reasoning',
+      data: { phase, id: 'reasoning-1' },
+    }))).toEqual([
+      { key: 'reasoning:reasoning-1', terminal: false },
+      { key: 'reasoning:reasoning-1', terminal: false },
+      { key: 'reasoning:reasoning-1', terminal: true },
+    ]);
+  });
+
+  it('classifies stable retry reasons and uses a safe fallback for unknown provider errors', () => {
+    const context = loadConversationRenderer();
+    const retry = (data: Record<string, unknown>) => context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'retrying', attempt: 1, maxRetries: 10,
+        retryDelayMs: 1_000,
+        ...data,
+      },
+    });
+
+    expect(retry({ errorStatus: 429, error: 'provider wording may change' }))
+      .toBe('Request rate limited · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 529, error: 'overloaded' }))
+      .toBe('Model service is busy · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 503, error: 'service unavailable' }))
+      .toBe('Model service is temporarily unavailable · Retry 1/10 · Continue in 1s');
+    expect(retry({ error: 'ECONNRESET while connecting' }))
+      .toBe('Temporary model service error · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 418, error: 'new-provider-error private detail' }))
+      .toBe('Temporary model service error · Retry 1/10 · Continue in 1s');
+  });
+
+  it('merges one retry series into one row and closes it with the terminal outcome', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const body: any = {
+      children: [],
+      appendChild(node: any) { this.children.push(node); },
+    };
+    context.document.createElement = () => ({ dataset: {}, className: '', innerHTML: '' });
+    const append = (data: Record<string, unknown>) => {
+      const projection = context._projectProcessRow({ stream: 'cli', data }, displayContext);
+      context._appendProjectedProcessRowToBody(body, projection);
+      return projection;
+    };
+
+    append({
+      type: 'status', status: 'retrying', attempt: 1, maxRetries: 10,
+      retryDelayMs: 1_000, errorStatus: 529, error: 'overloaded',
+    });
+    const latestRetry = append({
+      type: 'status', status: 'retrying', attempt: 7, maxRetries: 10,
+      retryDelayMs: 38_000, errorStatus: 529, error: 'overloaded',
+    });
+
+    expect(body.children).toHaveLength(1);
+    expect(latestRetry).toMatchObject({
+      lifecycleKey: 'cli-retry:1',
+      lifecycleTerminal: false,
+    });
+    expect(body.children[0].dataset.processText)
+      .toBe('Model service is busy · Retry 7/10 · Continue in 38s');
+
+    const completed = append({ type: 'status', status: 'result' });
+    expect(body.children).toHaveLength(1);
+    expect(completed).toMatchObject({
+      lifecycleKey: 'cli-retry:1',
+      lifecycleTerminal: true,
+      text: 'Task complete',
+    });
+    expect(body.children[0].dataset).toMatchObject({
+      processCallId: 'cli-retry:1',
+      processTerminal: '1',
+      processText: 'Task complete',
+    });
+
+    const nextSeries = append({
+      type: 'status', status: 'retrying', attempt: 1, error: 'unknown',
+    });
+    expect(body.children).toHaveLength(2);
+    expect(nextSeries.lifecycleKey).toBe('cli-retry:2');
+
+    const failed = append({ type: 'status', status: 'failed', error: 'overloaded' });
+    expect(body.children).toHaveLength(2);
+    expect(failed).toMatchObject({
+      lifecycleKey: 'cli-retry:2',
+      lifecycleTerminal: true,
+      kind: 'err',
+      text: 'Failed · overloaded',
+    });
+    expect(body.children[1].dataset).toMatchObject({
+      processCallId: 'cli-retry:2',
+      processTerminal: '1',
+      processText: 'Failed · overloaded',
+    });
+  });
+
+  it('updates one row for a continuous agent-response wait and replaces it when stopped', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const body: any = {
+      children: [],
+      appendChild(node: any) { this.children.push(node); },
+    };
+    context.document.createElement = () => ({ dataset: {}, className: '', innerHTML: '' });
+    const append = (data: Record<string, unknown>) => {
+      const projection = context._projectProcessRow({ stream: 'cli', data }, displayContext);
+      context._appendProjectedProcessRowToBody(body, projection);
+      return projection;
+    };
+
+    append({ type: 'idle', stalledMs: 289_000 });
+    expect(append({ type: 'log', level: 'debug', message: 'internal pulse' })).toBeNull();
+    const latestWait = append({ type: 'idle', stalledMs: 709_000 });
+
+    expect(body.children).toHaveLength(1);
+    expect(latestWait).toMatchObject({
+      lifecycleKey: 'cli-idle:1',
+      lifecycleTerminal: false,
+      text: 'Wait for agent response · 11m 49s',
+    });
+    expect(body.children[0].dataset.processText)
+      .toBe('Wait for agent response · 11m 49s');
+
+    const stopped = append({ type: 'status', status: 'cancelled' });
+    expect(body.children).toHaveLength(1);
+    expect(stopped).toMatchObject({
+      lifecycleKey: 'cli-idle:1',
+      lifecycleTerminal: true,
+      kind: 'warn',
+      text: 'Stopped',
+    });
+    expect(body.children[0].dataset).toMatchObject({
+      processCallId: 'cli-idle:1',
+      processTerminal: '1',
+      processText: 'Stopped',
+    });
+  });
+
+  it('starts a new wait row after genuine CLI activity resumes', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    const firstWait = context._projectProcessRow({
+      stream: 'cli', data: { type: 'idle', stalledMs: 90_000 },
+    }, displayContext);
+    const activity = context._projectProcessRow({
+      stream: 'cli',
+      data: {
+        type: 'tool-event', phase: 'use', tool: 'web_fetch', callId: 'fetch-1',
+        input: { url: 'https://example.com' },
+      },
+    }, displayContext);
+    const secondWait = context._projectProcessRow({
+      stream: 'cli', data: { type: 'idle', stalledMs: 120_000 },
+    }, displayContext);
+
+    expect(firstWait.lifecycleKey).toBe('cli-idle:1');
+    expect(activity.lifecycleKey).toBe('cli:fetch-1');
+    expect(secondWait.lifecycleKey).toBe('cli-idle:2');
+  });
+
+  it('keeps safe duration and error details without exposing credentials or absolute paths', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+
+    context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start', id: 'edit-duration', name: 'edit_file',
+        arguments: { path: 'src/process.ts' },
+      },
+    }, displayContext);
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end', id: 'edit-duration', name: 'edit_file',
+        duration_ms: 37,
+        end_to_end_duration_ms: 1_640,
+      },
+    }, displayContext)).toBe('Edit file · src/process.ts · Done · 2s');
+
+    expect(context._formatEventLine({
+      stream: 'lifecycle',
+      data: {
+        phase: 'error',
+        error: 'Failed at /Users/test/Private/run.log with API_KEY=private-token',
+      },
+    })).toBe('Thinking failed · Failed at run.log with API_KEY=***');
+
+    expect(context._formatEventLine({
+      stream: 'approval',
+      data: {
+        prompt: 'Run /Users/test/Private/deploy.sh with ACCESS_TOKEN=private-token?',
+      },
+    })).toBe('Awaiting confirmation: Run deploy.sh with ACCESS_TOKEN=***');
+  });
+
+  it('retains safe details for waiting, rate-limit, timeout, and compaction statuses', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'waiting-input',
+        message: 'Choose config at /Users/test/Private/settings.json',
+      },
+    })).toBe('Awaiting input · Choose config at settings.json');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'rate-limit', retryAfterMs: 12_000 },
+    })).toBe('Current usage limit reached · retrying in 12s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'timeout', timeoutMs: 30_000 },
+    })).toBe('Response timed out · 30s');
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'compacted',
+        tokens_before: 12_000, tokens_after: 2_500,
+      },
+    })).toBe('Conversation organized · 12000 → 2500 tokens');
+  });
+
+  it.each([
+    ['rejected', 'Current usage limit reached'],
+    ['allowed', null],
+    ['allowed_warning', null],
+    ['unexpected', null],
+  ])('renders persisted provider rate-limit status %s only when it blocks use', (
+    rateLimitStatus,
+    expected,
+  ) => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'rate-limit', rateLimitStatus },
+    })).toBe(expected);
+  });
+
+  it.each([
+    [
+      'core runtime retry',
+      { stream: 'runtime', data: { phase: 'retrying', attempt: 2 } },
+      'warn',
+    ],
+    [
+      'CLI retry',
+      { stream: 'cli', data: { type: 'status', status: 'retrying', attempt: 2 } },
+      'warn',
+    ],
+    [
+      'CLI process metadata',
+      { stream: 'cli', data: { type: 'process-info', cmd: 'codex' } },
+      'bound',
+    ],
+    [
+      'CLI thinking',
+      { stream: 'cli', data: { type: 'thinking', summary: 'Inspecting files' } },
+      'think',
+    ],
+    [
+      'CLI tool call',
+      { stream: 'cli', data: { type: 'tool-event', tool: 'exec_command', phase: 'use' } },
+      'tool',
+    ],
+    [
+      'CLI tool progress',
+      { stream: 'cli', data: { type: 'status', status: 'tool-progress', tool: 'exec_command' } },
+      'tool',
+    ],
+    [
+      'CLI running milestone',
+      { stream: 'cli', data: { type: 'status', status: 'running' } },
+      'bound',
+    ],
+    [
+      'CLI failure',
+      { stream: 'cli', data: { type: 'status', status: 'failed' } },
+      'err',
+    ],
+    [
+      'CLI stderr',
+      { stream: 'cli', data: { type: 'stderr-line', line: 'temporary warning' } },
+      'warn',
+    ],
+    [
+      'CLI info log',
+      { stream: 'cli', data: { type: 'log', level: 'info', message: 'connected' } },
+      'meta',
+    ],
+    [
+      'CLI warning log',
+      { stream: 'cli', data: { type: 'log', level: 'warn', message: 'slow response' } },
+      'warn',
+    ],
+    [
+      'CLI error log',
+      { stream: 'cli', data: { type: 'log', level: 'error', message: 'connection failed' } },
+      'err',
+    ],
+    [
+      'CLI raw diagnostic',
+      { stream: 'cli', data: { type: 'raw-line', line: 'connection recovered' } },
+      'meta',
+    ],
+    [
+      'CLI denied permission',
+      { stream: 'cli', data: { type: 'permission-request', autoDecided: 'deny' } },
+      'info',
+    ],
+    [
+      'CLI response wait',
+      { stream: 'cli', data: { type: 'idle', stalledMs: 30_000 } },
+      'wait',
+    ],
+    [
+      'provider fallback',
+      { stream: 'provider', data: { phase: 'fallback', reason: 'auth' } },
+      'warn',
+    ],
+    [
+      'native patch',
+      { stream: 'patch', data: { path: 'src/app.ts' } },
+      'patch',
+    ],
+    [
+      'CLI file change',
+      { stream: 'cli', data: { type: 'file-change', paths: ['src/app.ts'] } },
+      'patch',
+    ],
+    [
+      'skipped attachment',
+      { stream: 'attachment', data: { phase: 'skipped', items: [{ name: 'large.zip' }] } },
+      'err',
+    ],
+  ])('assigns %s an explicit semantic process style', (_label, event, expectedKind) => {
+    const context = loadConversationRenderer();
+
+    expect(context._eventProcessKind(event, 'localized process text')).toBe(expectedKind);
+  });
+
+  it('renders ordinary CLI response waiting as a restrained neutral status', () => {
+    const context = loadConversationRenderer();
+    const event = { stream: 'cli', data: { type: 'idle', stalledMs: 95_000 } };
+    const text = context._formatEventLine(event);
+    const kind = context._eventProcessKind(event, text);
+    const line: any = { dataset: {}, innerHTML: '' };
+
+    context._setProcessLineContent(line, text, kind);
+
+    expect(text).toBe('Wait for agent response · 1m 35s');
+    expect(kind).toBe('wait');
+    expect(line.innerHTML).toContain('data-icon="clock"');
+    expect(line.innerHTML).not.toContain('data-icon="warning"');
+
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const wait = onlyCssDeclarations(style, '.stream-process-line.kind-wait');
+    expect(wait.color).toBe('var(--muted)');
+    expect(wait).not.toHaveProperty('font-weight');
+  });
+
+  it.each([
+    [
+      { status: 'plan-updated', steps: [{ step: 'inspect' }, { step: 'test' }] },
+      'Create plan\ninspect\ntest',
+    ],
+    [{ status: 'compacting' }, 'Organize conversation'],
+    [{ status: 'compacted' }, 'Conversation organized'],
+    [{ status: 'waiting-approval' }, 'Awaiting confirmation'],
+    [{ status: 'waiting-input' }, 'Awaiting input'],
+    [
+      { status: 'model-rerouted', fromModel: 'gpt-old', toModel: 'gpt-new' },
+      'Switch model · gpt-old → gpt-new',
+    ],
+    [{ status: 'authenticating' }, 'Verify identity'],
+    [{ status: 'rate-limit' }, 'Current usage limit reached'],
+    [{ status: 'background-completed', message: 'index ready' }, 'Background task · index ready · Done'],
+    [{ status: 'background-failed', message: '/tmp/index failed: EIO' }, 'Background task · Failed · index failed: EIO'],
+    [{ status: 'background-running', taskType: 'Explore', message: '/tmp/private' }, 'Background task running · Explore'],
+    [{ status: 'background-stopped' }, 'Background task · Stopped'],
+  ])('formats CLI status payload %j', (data, expected) => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', ...data },
+    })).toBe(expected);
+  });
+
+  it('keeps elapsed time in the process summary without duplicating event status text', () => {
+    const context = loadConversationRenderer();
+    const runtimeText = { textContent: '', hidden: true };
+    const label = { textContent: '' };
+    const processContainer = {
+      dataset: { processState: 'active' },
+      style: { display: 'none' },
+      matches: (selector: string) => selector === '.stream-process',
+      querySelector: (selector: string) => (
+        selector === '.stream-process-runtime' ? runtimeText
+          : selector === '.stream-process-label' ? label
+            : null
+      ),
+    };
+    const msg: any = {
+      dataset: {},
+      isConnected: true,
+      querySelector(selector: string) {
+        if (selector === '[data-role="activity"]') {
+          throw new Error('a second live activity row must not be queried');
+        }
+        if (selector === '[data-role="process-container"]' || selector === '.stream-process') {
+          return processContainer;
+        }
+        return null;
+      },
+    };
+
+    context._streamingUpdateActivityFromEvent(msg, {
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'retrying', attempt: 7, maxRetries: 10,
+        retryDelayMs: 38_000, errorStatus: 529, error: 'overloaded',
+      },
+    });
+    expect(processContainer.style.display).toBe('');
+    expect(runtimeText.hidden).toBe(false);
+    expect(label.textContent).toBe('Duration');
+    context._streamingStopActivity(msg);
+  });
+
+  it('ships the active background state in every renderer locale', () => {
+    const expected = {
+      en: 'Background task running{detail}',
+      zh: '后台任务执行中{detail}',
+      ja: 'バックグラウンドタスクを実行中{detail}',
+      pt: 'Tarefa em segundo plano em execução{detail}',
+    };
+    for (const [locale, copy] of Object.entries(expected)) {
+      const table = JSON.parse(fs.readFileSync(
+        path.join(__dirname, `../../src/renderer/locales/${locale}.json`),
+        'utf8',
+      ));
+      expect(table['chat.stream.background_running']).toBe(copy);
+    }
+  });
+
+  it('ships execution-state labels and adjacent compact-group summaries', () => {
+    for (const language of ['en', 'zh', 'ja', 'pt']) {
+      const table = JSON.parse(fs.readFileSync(
+        path.join(__dirname, `../../src/renderer/locales/${language}.json`),
+        'utf8',
+      ));
+      expect(table['chat.process_working_for']).toBeTruthy();
+      expect(table['chat.process_worked_for']).toBeTruthy();
+      expect(table['chat.process_duration']).toBeTruthy();
+      expect(table['chat.process.group_operations']).toBeTruthy();
+    }
+    const zh = JSON.parse(fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/locales/zh.json'),
+      'utf8',
+    ));
+    expect(zh['chat.process_duration']).toBe('耗时');
+    expect(zh['chat.process_working']).toBe('执行中');
+    expect(zh['chat.process.group_operations']).toBe('执行操作 {n}');
+  });
+
+  it('uses CLI and model-reasoning heartbeats without appending duplicate process rows', () => {
+    const context = loadConversationRenderer();
+    const msg = {
+      querySelector() {
+        throw new Error('heartbeat should not touch the process DOM');
+      },
+    };
+
+    expect(() => context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: { type: 'thinking', chars: 0, heartbeat: true },
+    })).not.toThrow();
+    expect(() => context._renderAgentEvent(msg, {
+      stream: 'cli',
+      data: { type: 'status', status: 'tool-progress', heartbeat: true },
+    })).not.toThrow();
+    expect(() => context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+    })).not.toThrow();
+  });
+
+  it('projects every detail heartbeat and completion onto one reasoning lifecycle identity', () => {
+    const context = loadConversationRenderer();
+    const msg = {};
+    const firstSummary = 'Inspecting the selected files';
+    const completeSummary = 'Inspecting the relevant files and constraints';
+    const rows: Array<{
+      line: string;
+      kind: string;
+      lifecycleKey: string;
+      lifecycleTerminal: boolean;
+    }> = [];
+    context._streamingAppendProgress = (
+      _msg: unknown,
+      line: string,
+      kind: string,
+      _eventName: string,
+      lifecycleKey: string,
+      lifecycleTerminal: boolean,
+    ) => rows.push({ line, kind, lifecycleKey, lifecycleTerminal });
+
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: { phase: 'start', id: 'reasoning-1', chars: 0 },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'progress',
+        id: 'reasoning-1',
+        chars: 128,
+        summary_from: 0,
+        summary_delta: firstSummary,
+        heartbeat: true,
+      },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'progress',
+        id: 'reasoning-1',
+        chars: 192,
+        summary_from: 'Inspecting the '.length,
+        summary_delta: 'relevant files and constraints',
+        heartbeat: true,
+      },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'end',
+        id: 'reasoning-1',
+        chars: 192,
+        summary: completeSummary,
+      },
+    });
+
+    expect(rows).toEqual([
+      {
+        line: 'Inspecting the selected files',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: false,
+      },
+      {
+        line: 'Inspecting the relevant files and constraints',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: false,
+      },
+      {
+        line: 'Inspecting the relevant files and constraints',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: true,
+      },
+    ]);
+  });
+
+  it('buffers bounded process milestones while a conversation is off-view', () => {
+    const context = loadConversationRenderer();
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: { stream: 'cli', data: { type: 'thinking', chars: 0 } },
+          },
+        },
+      },
+    };
+    const deltaEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: { type: 'process', data: { type: 'delta', text: 'token' } },
+      },
+    };
+
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', processEvent)).toBe(true);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', deltaEvent)).toBe(false);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'reasoning',
+              data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+            },
+          },
+        },
+      },
+    })).toBe(false);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'reasoning',
+              data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+            },
+          },
+        },
+      },
+    })).toBe(false);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'cli',
+              data: { type: 'thinking', chars: 0, heartbeat: true },
+            },
+          },
+        },
+      },
+    })).toBe(false);
+    expect(context._takeOffViewGroupProcessEvents('cid-off-view')).toEqual([processEvent]);
+    expect(context._takeOffViewGroupProcessEvents('cid-off-view')).toEqual([]);
+  });
+
+  it('caps off-view process replay at the newest 300 milestones and clears terminal buffers', () => {
+    const context = loadConversationRenderer();
+    const processEvent = (index: number) => ({
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'cli',
+              data: { type: 'log', level: 'info', message: `milestone-${index}` },
+            },
+          },
+        },
+      },
+    });
+
+    for (let index = 0; index < 305; index += 1) {
+      expect(context._bufferOffViewGroupProcessEvent('cid-bounded', processEvent(index))).toBe(true);
+    }
+    const buffered = context._takeOffViewGroupProcessEvents('cid-bounded');
+    expect(buffered).toHaveLength(300);
+    expect(buffered[0].event.data.data.event.data.message).toBe('milestone-5');
+    expect(buffered[299].event.data.data.event.data.message).toBe('milestone-304');
+
+    context._bufferOffViewGroupProcessEvent('cid-terminal', processEvent(999));
+    context._clearOffViewGroupProcessEvents('cid-terminal');
+    expect(context._takeOffViewGroupProcessEvents('cid-terminal')).toEqual([]);
+  });
+
+  it('replays off-view milestones only after the pending bubble is reattached', () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'cli', data: { type: 'log', message: 'running tests' } },
+          },
+        },
+      },
+    };
+    const msg = { isConnected: false };
+    context.currentCid = 'c1';
+    context._handleStreamEvent = (...args: any[]) => rendered.push(args);
+    context._bufferOffViewGroupProcessEvent('c1', processEvent);
+
+    expect(context._replayOffViewGroupProcessEvents('c1', msg, { archive: true })).toBe(0);
+    expect(rendered).toHaveLength(0);
+
+    msg.isConnected = true;
+    expect(context._replayOffViewGroupProcessEvents('c1', msg, { archive: true })).toBe(1);
+    expect(rendered).toEqual([['c1', msg, processEvent, { archive: true }]]);
+    expect(context._takeOffViewGroupProcessEvents('c1')).toEqual([]);
+  });
+
+  it('clears the conversation busy state from a terminal state snapshot', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'cli-cid';
+    context.groupBusyConvs.set('cli-cid', true);
+
+    context._handleGroupBusEvent('cli-cid', null, {
+      type: 'state_changed',
+      state: { status: 'idle', in_flight: [], active_recipient: '' },
+      active_turns: [],
+    });
+
+    expect(context.groupBusyConvs.has('cli-cid')).toBe(false);
+  });
+
+  it('hides CLI protocol noise and localizes a known actionable diagnostic', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'log',
+        level: 'info',
+        source: 'codex',
+        message: 'item<path>: {"threadId":"t1","turnId":"r1","itemId":"exec-1","delta":"."}',
+      },
+    })).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'log',
+        level: 'debug',
+        source: 'codex',
+        message: 'account/rateLimits/updated: {}',
+      },
+    })).toBeNull();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'log',
+        level: 'info',
+        source: 'codex',
+        message: 'connection recovered',
+      },
+    })).toBeNull();
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'stderr-line',
+        line: 'rpc response id=42 payload={"status":"busy"}',
+      },
+    })).toBeNull();
+
+    expect(context._formatEventLine({
+      stream: 'error',
+      data: { message: 'rpc failed at /Users/test/private/file.ts' },
+    })).toBe('Error: rpc failed at file.ts');
+  });
+
+  it('formats every semantic context phase through localized renderer copy', () => {
+    const context = loadConversationRenderer();
+    const phases = [
+      ['history_summary_start', 'Organize conversation history'],
+      ['history_summary_done', 'Conversation history organized'],
+      ['history_summary_failed', 'Could not organize conversation history'],
+      ['active_process_compaction_start', 'Organize current task progress'],
+      ['active_process_compaction_done', 'Current task progress organized'],
+      ['active_process_compaction_failed', 'Could not organize current task progress'],
+    ];
+
+    for (const [phase, expected] of phases) {
+      expect(context._formatEventLine({
+        stream: 'context',
+        data: { phase, message: '不应显示的底层文案' },
+      })).toBe(expected);
+    }
+  });
+
+  it('formats compaction and total runtime events for the process pane', () => {
+    const context = loadConversationRenderer();
+
+    const compaction = context._formatEventLine({
+      stream: 'compaction',
+      data: { tokensBefore: 20000, tokensAfter: 3000 },
+    });
+    const runtime = context._formatEventLine({
+      stream: 'runtime',
+      data: { duration_ms: 65_000 },
+    });
+    const runtimeWithBreakdown = context._formatEventLine({
+      stream: 'runtime',
+      data: {
+        duration_ms: 65_000,
+        provider_ms: 40_000,
+        tool_ms: 5_000,
+        compaction_ms: 15_000,
+        retry_wait_ms: 5_000,
+      },
+    });
+    const segmentedRuntime = context._formatEventLine({
+      stream: 'runtime',
+      data: {
+        duration_ms: 180_000,
+        bubble_duration_ms: 12_000,
+        provider_ms: 80_000,
+        tool_ms: 100_000,
+      },
+    });
+    const tool = context._formatEventLine({
+      stream: 'tool',
+      data: { phase: 'end', name: 'manage_execution_plan', duration_ms: 17 },
+    });
+
+    expect(compaction).toBe('Conversation organized · 20000 → 3000 tokens');
+    expect(runtime).toBe('Total time 1m 5s');
+    expect(runtimeWithBreakdown).toBe('Total time 1m 5s');
+    expect(segmentedRuntime).toBe('Total time 12s');
+    expect(tool).toBe('Update plan');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
+      { type: 'progress', text: 'Total time 1m 5s', event: { stream: 'runtime', data: { duration_ms: 65_000 } } },
+    ])).toBe('1m 5s');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'event', event: { stream: 'runtime', data: { durationMs: 1_234 } } },
+    ])).toBe('1s');
+    expect(context._processSummaryRuntimeFromItems([
+      {
+        type: 'event',
+        event: {
+          stream: 'runtime',
+          data: { duration_ms: 180_000, bubble_duration_ms: 12_000 },
+        },
+      },
+    ])).toBe('12s');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
+    ])).toBe('');
+    expect(context._eventProcessKind({ stream: 'context', data: {} }, 'Context prepared')).toBe('context');
+    expect(context._eventProcessKind({ stream: 'compaction', data: {} }, compaction)).toBe('context');
+    expect(context._eventProcessKind({ stream: 'runtime', data: {} }, runtime)).toBe('bound');
+  });
+
+  it('keeps duration events out of persisted process rows while retaining retry progress', () => {
+    const context = loadConversationRenderer();
+    const segmentRuntime = {
+      type: 'event',
+      event: {
+        stream: 'runtime',
+        data: { phase: 'segment_end', duration_ms: 20, bubble_duration_ms: 0 },
+      },
+    };
+    const retry = {
+      type: 'progress',
+      text: 'Retrying',
+      event: { stream: 'runtime', data: { phase: 'retrying', attempt: 2 } },
+    };
+    const tool = {
+      type: 'event',
+      event: { stream: 'tool', data: { phase: 'end', name: 'read_file', duration_ms: 6 } },
+    };
+    const finalRuntime = {
+      type: 'event',
+      event: { stream: 'runtime', data: { phase: 'end', duration_ms: 40_000 } },
+    };
+
+    const displayed = context._processItemsForDisplay([
+      segmentRuntime,
+      tool,
+      retry,
+      finalRuntime,
+    ]);
+
+    expect(displayed).toHaveLength(2);
+    expect(displayed[0]).toEqual(tool);
+    expect(displayed[1]).toEqual(retry);
+    expect(displayed.filter((item: any) => (
+      item.event?.stream === 'runtime'
+      && item.event?.data?.duration_ms != null
+    ))).toHaveLength(0);
+    expect(context._processSummaryRuntimeFromItems([
+      segmentRuntime,
+      tool,
+      retry,
+      finalRuntime,
+    ])).toBe('40s');
+    expect(context._formatEventLine(retry.event)).toBeNull();
+  });
+
+  it('updates only the summary clock and freezes the final value', () => {
+    const context = loadConversationRenderer();
+    const summary = { textContent: '', hidden: true };
+    const label = { textContent: '' };
+    const summaryAttrs = new Map<string, string>();
+    const disclosureSummary = {
+      setAttribute(name: string, value: string) { summaryAttrs.set(name, value); },
+      removeAttribute(name: string) { summaryAttrs.delete(name); },
+      getAttribute(name: string) { return summaryAttrs.get(name) ?? null; },
+    };
+    const container = {
+      style: { display: 'none' },
+      dataset: { processState: 'active' } as Record<string, string>,
+      open: false,
+      querySelector(selector: string) {
+        if (selector === '.stream-process-runtime') return summary;
+        if (selector === '.stream-process-label') return label;
+        if (selector === '.stream-process-summary') return disclosureSummary;
+        return null;
+      },
+    };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return container;
+        if (selector === '.stream-process') return container;
+        return null;
+      },
+    };
+
+    context._setProcessSummaryState(msg, 'active');
+    expect(container.open).toBe(true);
+    expect(disclosureSummary.getAttribute('aria-disabled')).toBe('true');
+    expect(disclosureSummary.getAttribute('tabindex')).toBe('-1');
+
+    context._updateStreamingRuntimeSummary(msg, {
+      stream: 'runtime',
+      data: { phase: 'segment_end', duration_ms: 5, bubble_duration_ms: 0 },
+    });
+    context._updateStreamingRuntimeSummary(msg, null, 40_000);
+
+    expect(summary.textContent).toBe('40s');
+    expect(label.textContent).toBe('Duration');
+    expect(container.dataset.runtimeDurationMs).toBe('40000');
+
+    context._updateStreamingRuntimeSummary(msg, {
+      stream: 'runtime',
+      data: { phase: 'end', duration_ms: 42_000 },
+    });
+    context._updateStreamingRuntimeSummary(msg, null, 50_000);
+
+    expect(summary.textContent).toBe('42s');
+    expect(container.dataset.runtimeDurationMs).toBe('42000');
+
+    context._setProcessSummaryState(msg, 'complete');
+    expect(label.textContent).toBe('Duration');
+    expect(container.dataset.processState).toBe('complete');
+    expect(disclosureSummary.getAttribute('aria-disabled')).toBeNull();
+    expect(disclosureSummary.getAttribute('tabindex')).toBeNull();
+  });
+
+  it('places the execution indicator below the final body outside the process disclosure', () => {
+    const context = loadConversationRenderer();
+    context.document.createElement = createProcessTestElement;
+    context.formatTime = () => '12:00';
+    context._appendBeforeSpacer = () => {};
+    const msg = context._createStreamingAssistantMessage({ querySelector: () => null });
+
+    // This order keeps the indicator visible when the process is collapsed
+    // and places it after the growing answer, including answers without tools.
+    expect(msg.innerHTML).toMatch(/<\/details>\s*<div[^>]*data-role="final"[^>]*><\/div>\s*<div[^>]*data-role="process-loading"/);
+  });
+
+  it.each(['completed', 'failed', 'cancelled'])(
+    'folds the first reply delta while timing subsequent work until the turn is %s', (terminal) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-09-09T09:00:00Z'));
+      try {
+        const context = loadConversationRenderer();
+        const details = createProcessTestElement('details');
+        details.className = 'stream-process';
+        details.style = { display: '' };
+        const runtime = createProcessTestElement('span');
+        runtime.className = 'stream-process-runtime';
+        const summary = createProcessTestElement('summary');
+        summary.className = 'stream-process-summary';
+        const label = createProcessTestElement('span');
+        label.className = 'stream-process-label';
+        const body = createProcessTestElement('div');
+        body.className = 'stream-process-body';
+        for (const node of [runtime, summary, label, body]) details.appendChild(node);
+        const finalEl = createProcessTestElement('div');
+        finalEl.style = { display: 'none' };
+        const msg: any = {
+          dataset: {},
+          isConnected: true,
+          querySelector(selector: string) {
+            if (selector === '[data-role="process-container"]' || selector === '.stream-process') return details;
+            if (selector === '[data-role="process"]') return body;
+            if (selector === '[data-role="final"]') return finalEl;
+            return null;
+          },
+        };
+        context.currentCid = 'live-cid';
+        context.groupBusyConvs.set('live-cid', true);
+        context._ensureActorPlaceholder = () => msg;
+        context._advanceStreamingMessageActivityPosition = () => {};
+        context._paintStreamingFinalMarkdown = (_msg: any, target: any, text: string) => {
+          target.innerHTML = text;
+        };
+        context.renderMarkdownFull = escapeHtml;
+        context._attachAssistantActions = () => {};
+        context._attachFailedAssistantActions = () => {};
+        context._attachInterruptedAssistantActions = () => {};
+        context.document.createElement = createProcessTestElement;
+        context._stickProcessBottomIfPinned = () => {};
+        context._stickBottomFromMsg = () => {};
+        const processEvent = (data: any) => context._handleGroupBusEvent('live-cid', msg, {
+          type: 'process', actor: 'codex', turn_id: 'live-turn', data,
+        });
+
+        context._setProcessSummaryState(msg, 'active');
+        context._streamingUpdateActivity(msg);
+        vi.advanceTimersByTime(38_000);
+        expect(runtime.textContent).toBe('38s');
+        expect(msg.dataset.activityStart).toBeTruthy();
+        expect(msg.dataset.activityDone).toBeUndefined();
+
+        // Codex delivers asynchronous questions as final_answer text before
+        // continuing the same turn. Ordinary answer deltas are nonterminal too.
+        const text = terminal === 'completed' ? 'The results are ' : 'Which source should I use?';
+        processEvent({ type: 'delta', phase: 'final_answer', text });
+        vi.advanceTimersByTime(12_000);
+        expect(finalEl.innerHTML).toBe(text);
+        expect(runtime.textContent).toBe('50s');
+        expect(details.open).toBeFalsy();
+        expect(details.dataset.processState).toBe('complete');
+        expect(msg.dataset.activityDone).toBeUndefined();
+        expect(summary['aria-disabled']).toBeUndefined();
+        expect(summary.tabindex).toBeUndefined();
+
+        if (terminal === 'completed') {
+          // Reading the process while the rest of the answer streams must not
+          // be interrupted by another automatic collapse on every token.
+          details.open = true;
+          processEvent({ type: 'delta', phase: 'final_answer', text: 'ready.' });
+          expect(details.open).toBe(true);
+        } else {
+          // The incident continued with commentary after the async question.
+          // That reopens the details even if an earlier delta stopped liveness.
+          processEvent({ type: 'delta', phase: 'commentary', text: 'Continuing the search.' });
+          processEvent({ type: 'event', event: {
+            stream: 'cli', data: { type: 'status', status: 'tool-progress', heartbeat: true },
+          } });
+          expect(body.children).toHaveLength(1);
+          expect(details.open).toBe(true);
+        }
+        vi.advanceTimersByTime(15_000);
+        expect(runtime.textContent).toBe('1m 5s');
+        expect(context.groupBusyConvs.has('live-cid')).toBe(true);
+
+        // Disclosure state is not an execution terminal. Preserve a folded
+        // process while the clock advances, including after row reattachment.
+        details.open = false;
+        vi.advanceTimersByTime(10_000);
+        expect(runtime.textContent).toBe('1m 15s');
+        expect(details.open).toBe(false);
+        msg.isConnected = false;
+        vi.advanceTimersByTime(1_000);
+        expect(vi.getTimerCount()).toBe(0);
+        msg.isConnected = true;
+        context._startPlaceholderActivity(msg, Date.parse('2026-09-09T09:00:00Z'));
+        vi.advanceTimersByTime(4_000);
+        expect(runtime.textContent).toBe('1m 20s');
+        expect(details.open).toBe(false);
+        expect(msg.dataset.activityDone).toBeUndefined();
+
+        processEvent({ type: 'event', event: {
+          stream: 'runtime', data: { phase: 'end', duration_ms: 79_000 },
+        } });
+        if (terminal === 'completed') context._streamingSetFinal(msg, 'The results are ready.');
+        else if (terminal === 'failed') context._streamingSetError(msg, 'Could not finish.');
+        else context._streamingMarkAborted(msg);
+
+        expect(runtime.textContent).toBe('1m 19s');
+        expect(details.open).toBeFalsy();
+        expect(details.dataset.processState).toBe('complete');
+        expect(msg.dataset.activityDone).toBe('1');
+        expect(vi.getTimerCount()).toBe(0);
+        const terminalBody = finalEl.innerHTML;
+        vi.advanceTimersByTime(20_000);
+        context._streamingUpdateActivityFromEvent(msg);
+        expect(runtime.textContent).toBe('1m 19s');
+        expect(finalEl.innerHTML).toBe(terminalBody);
+        expect(msg.dataset.activityDone).toBe('1');
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('collapses and unlocks process details when the turn finishes', () => {
+    const context = loadConversationRenderer();
+    const attributes = new Map<string, string>([['aria-disabled', 'true'], ['tabindex', '-1']]);
+    const summary = {
+      setAttribute(name: string, value: string) { attributes.set(name, value); },
+      removeAttribute(name: string) { attributes.delete(name); },
+    };
+    const label = { textContent: '' };
+    const body = { childElementCount: 2, children: [{}, {}] };
+    const details: any = {
+      dataset: { processState: 'active', runtimeDuration: '12s' },
+      style: { display: '' },
+      open: true,
+      querySelector(selector: string) {
+        if (selector === '.stream-process-summary') return summary;
+        if (selector === '.stream-process-label') return label;
+        if (selector === '.stream-process-body') return body;
+        return null;
+      },
+      removeAttribute(name: string) {
+        if (name === 'open') this.open = false;
+      },
+    };
+    const msg: any = {
+      dataset: { activityDone: '1' },
+      querySelector: (selector: string) => selector === '.stream-process' ? details : null,
+    };
+    context._sealStreamingCommentary = () => {};
+
+    context._completeProcessDisclosure(msg);
+
+    expect(details.open).toBe(false);
+    expect(details.dataset.processState).toBe('complete');
+    expect(details.style.display).toBe('');
+    expect(label.textContent).toBe('Duration');
+    expect(attributes.has('aria-disabled')).toBe(false);
+    expect(attributes.has('tabindex')).toBe(false);
+  });
+});
+
+describe('conversation auto recipient', () => {
+  it('mirrors the server conversation floor into the input recipient', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
+
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ id: 'a1', name: '交互老师' });
+  });
+
+  it('does not infer a recipient from in-flight actors when the server floor is empty', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _latestInFlight.set("c1", ["a1"]);
+      _serverFloorByCid.set("c1", "");
+    `, context);
+
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
+  });
+
+  it('clears the auto recipient when the server floor clears', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ id: 'a1', name: '交互老师' });
+
+    vm.runInContext('_serverFloorByCid.set("c1", "")', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
+  });
+
+  it('suppresses the floor and prefixes @commander when the user explicitly returns to commander', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ id: 'a1', name: '交互老师' });
+
+    context.setChatRecipient('conversation', { kind: 'commander' });
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
+    // Keep the explicit reset in the payload until the floor write is confirmed.
+    expect(context.applyRecipientPrefix('先回到你这里', 'conversation'))
+      .toBe('@commander 先回到你这里');
+  });
+
+  it('prefixes from a send-time recipient snapshot instead of a later chip state', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'OtherTutor' },
+    ];
+    vm.runInContext(`
+      currentCid = "c1";
+      setChatRecipient("conversation", { kind: "agent", id: "a1", name: "FamilyTutor" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+      setChatRecipient("conversation", { kind: "agent", id: "a2", name: "OtherTutor" });
+    `, context);
+
+    expect(context.applyRecipientPrefix('继续', 'conversation', { recipientSnapshot: context.__snap }))
+      .toBe('@FamilyTutor 继续');
+  });
+
+  it('stores the commander floor reset in the send-time snapshot', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _serverFloorByCid.set("c1", "a1");
+      setChatRecipient("conversation", { kind: "commander" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+      __stillPending = _pendingFloorResetByCid.has("c1");
+    `, context);
+
+    expect(context.__snap).toMatchObject({ kind: 'commander', resetFloor: true });
+    expect(context.__stillPending).toBe(false);
+    expect(context.applyRecipientPrefix('回来', 'conversation', { recipientSnapshot: context.__snap }))
+      .toBe('@commander 回来');
+  });
+
+  it('keeps the commander floor-reset marker in transport but hides it in the user bubble', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _serverFloorByCid.set("c1", "a1");
+      setChatRecipient("conversation", { kind: "commander" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+    `, context);
+
+    const outbound = context.applyRecipientPrefix(
+      '你看下怎么处理',
+      'conversation',
+      { recipientSnapshot: context.__snap },
+    );
+
+    expect(outbound).toBe('@commander 你看下怎么处理');
+    expect(context._stripCommanderRoutingMentionsForDisplay(outbound))
+      .toBe('你看下怎么处理');
+  });
+
+  it('previews only resolvable inline mentions on the chip (D9 routing preview)', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'Writing Helper' },
+    ];
+    let composerText = '';
+    context.document.getElementById = (id: string) => (
+      id === 'chat-input' ? { value: composerText } : null
+    );
+
+    // Known agents (multi-word included) + commander alias, deduped, in
+    // order. The vm t() stub echoes the key for the commander label.
+    composerText = '@FamilyTutor do a then @Writing Helper polish, @FamilyTutor again @指挥官 wrap up';
+    expect(context._mentionPreviewLabels()).toEqual(['FamilyTutor', 'Writing Helper', 'chat.recipient_commander']);
+
+    // Unknown tokens and email look-alikes never enter the preview — they
+    // don't route, so previewing them would lie about the dispatch.
+    composerText = 'ping a@b and @nobody about it';
+    expect(context._mentionPreviewLabels()).toEqual([]);
+
+    // Mention-less text keeps the chip on the floor indicator.
+    composerText = 'plain message';
+    expect(context._mentionPreviewLabels()).toEqual([]);
+  });
+
+  it('previews the mentions each composer carries, quoted lines excluded', () => {
+    // Scenario value: the chip is the user's only preview of where a send
+    // goes. All three group-chat composers accept inline mentions, so a chip
+    // that keeps showing the picked recipient while the text addresses two
+    // agents mis-states the dispatch on the very surface the user reads.
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'Writing Helper' },
+    ];
+    const values: Record<string, string> = {
+      'chat-input': 'plain message',
+      'new-chat-input': '@FamilyTutor 写提纲 @Writing Helper 润色',
+      'project-chat-input': '> 引用 @Writing Helper 的话\n@FamilyTutor 继续',
+    };
+    context.document.getElementById = (id: string) => (
+      id in values ? { value: values[id] } : null
+    );
+
+    expect(context._mentionPreviewLabels('new-chat')).toEqual(['FamilyTutor', 'Writing Helper']);
+    // A quoted line is context the user pulled in, not dispatch — the bus
+    // router drops those lines, so the preview must drop them too.
+    expect(context._mentionPreviewLabels('project')).toEqual(['FamilyTutor']);
+    expect(context._mentionPreviewLabels()).toEqual([]);
+  });
+
+  it('shows recipient names without repeating the inline mention syntax', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'cli1', name: 'Orkas Codex', runtime: { kind: 'cli' } },
+      { agent_id: 'cli2', name: 'Orkas Claude', runtime: { kind: 'cli' } },
+    ];
+    const input = { value: '@Orkas Codex @Orkas Claude check this' };
+    const label = { textContent: '', removeAttribute() {} };
+    context.document.getElementById = (id: string) => ({
+      'new-chat-input': input,
+      'new-chat-recipient-name': label,
+    }[id] || null);
+
+    context._renderRecipientChip('new-chat');
+
+    expect(label.textContent).toBe('Orkas Codex, Orkas Claude');
+    expect(input.value).toBe('@Orkas Codex @Orkas Claude check this');
+  });
+
+  it.each([
+    ['new-chat', 'new-chat-input'], ['conversation', 'chat-input'], ['project', 'project-chat-input'],
+  ])('synchronizes panel toggles and explicit mentions without losing message content in %s', (target, inputId) => {
+    const context = loadConversationRenderer();
+    context.Event = class { constructor(public type: string) {} };
+    context._agentsCache = [
+      { agent_id: 'a', name: 'Writing Helper' }, { agent_id: 'b', name: 'Reviewer' },
+    ];
+    const a = { kind: 'agent', id: 'a', name: 'Writing Helper' };
+    const b = { kind: 'agent', id: 'b', name: 'Reviewer' };
+    const input = { value: 'review this', selectionStart: 0,
+      dispatchEvent: () => context._syncComposerRecipientInput(target), setSelectionRange() {} };
+    context.document.getElementById = (id: string) => id === inputId ? input : null;
+    context.autoGrow = () => {};
+    vm.runInContext('currentCid = "recipient-draft";', context);
+
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('@Writing Helper review this');
+    input.value += ' @Reviewer check sources';
+    context._syncComposerRecipientInput(target);
+    expect(context._composerSelectedRecipients(target).map((r: any) => r.id)).toEqual(['a', 'b']);
+    expect(context._recipientSnapshotForSend(target).recipients.map((r: any) => r.id)).toEqual(['a', 'b']);
+
+    input.value += '\n> @Writing Helper original quote\nemail@Reviewer';
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('review this @Reviewer check sources\n> @Writing Helper original quote\nemail@Reviewer');
+    expect(context._composerSelectedRecipients(target).map((r: any) => r.id)).toEqual(['', 'b']);
+    context._toggleComposerRecipient(target, b);
+    expect(input.value).toBe('review this check sources\n> @Writing Helper original quote\nemail@Reviewer');
+    expect(context.getChatRecipient(target).kind).toBe('commander');
+    expect(context._composerSelectedRecipients(target).map((r: any) => r.kind)).toEqual(['commander']);
+
+    context.setChatRecipient(target, a);
+    input.value = '@Reviewer new request';
+    context._syncComposerRecipientInput(target);
+    expect(context._recipientSnapshotForSend(target)).toMatchObject({ kind: 'agent', id: 'b' });
+    input.value = 'new request';
+    context._syncComposerRecipientInput(target);
+    expect(context.getChatRecipient(target).kind).toBe('commander');
+  });
+
+  it('keeps code mentions literal and freezes the chosen fallback for an unknown mention', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [{ agent_id: 'a', name: 'Writer' }, { agent_id: 'b', name: 'Reviewer' }];
+    const input = { value: '@unknown inspect `@Reviewer`\n```xml\n@Reviewer\n```' };
+    context.document.getElementById = (id: string) => id === 'new-chat-input' ? input : null;
+    context.setChatRecipient('new-chat', { kind: 'agent', id: 'a', name: 'Writer' });
+    expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['a']);
+    const snapshot = context._recipientSnapshotForSend('new-chat');
+    expect(context._applyRecipientPrefixWithSnapshot(input.value, snapshot)).toBe('@Writer ' + input.value);
+    expect(context._composerDispatchShape(input.value, context._agentsCache)).toEqual({ segments: 0, groups: 0 });
+  });
+
+  it('keeps editable selections but excludes empty trailing recipients from the send snapshot', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [{ agent_id: 'a', name: 'Writer' }, { agent_id: 'b', name: 'Reviewer' }];
+    const input = { value: '@Writer @Writer inspect @Reviewer' };
+    context.document.getElementById = (id: string) => id === 'new-chat-input' ? input : null;
+    expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['a', 'b']);
+    expect(context._recipientSnapshotForSend('new-chat')).toMatchObject({ kind: 'agent', id: 'a' });
+    expect(context._applyRecipientPrefixWithSnapshot(input.value, context._recipientSnapshotForSend('new-chat'))).toBe(input.value);
+  });
+
+  it('cancels the default Agent without moving the remaining Agent or its description', () => {
+    const context = loadConversationRenderer();
+    context.Event = class { constructor(public type: string) {} };
+    context._agentsCache = [{ agent_id: 'a', name: 'Writer' }, { agent_id: 'b', name: 'Reviewer' }];
+    const input = { value: '@Writer draft @Reviewer inspect', selectionStart: 0, dispatchEvent() {}, setSelectionRange() {} };
+    context.document.getElementById = (id: string) => id === 'new-chat-input' ? input : null;
+    context.setChatRecipient('new-chat', { kind: 'agent', id: 'a', name: 'Writer' });
+    context._toggleComposerRecipient('new-chat', { kind: 'agent', id: 'a', name: 'Writer' });
+    expect(input.value).toBe('draft @Reviewer inspect');
+    expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['', 'b']);
+  });
+
+  it('ignores a replayed old floor after a newer user choice was confirmed', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext('currentCid = "floor-replay";', context);
+    context._rememberServerFloor('floor-replay', { active_recipient: 'new-agent', active_recipient_revision: 3 });
+    context._rememberServerFloor('floor-replay', { active_recipient: 'old-agent', active_recipient_revision: 2 });
+    await context._evaluateAutoRecipient('floor-replay');
+    expect(context.getChatRecipient('conversation').id).toBe('new-agent');
+    context._rememberServerFloor('floor-replay', { active_recipient_revision: 4 });
+    context._rememberServerFloor('floor-replay', { active_recipient: 'new-agent', active_recipient_revision: 3 });
+    await context._evaluateAutoRecipient('floor-replay');
+    expect(context.getChatRecipient('conversation').kind).toBe('commander');
+  });
+
+  it('discards legacy multi defaults while retaining explicitly addressed queued messages', async () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a', name: 'Writer' }, { agent_id: 'b', name: 'Reviewer' },
+    ];
+    const input = { value: '' };
+    const label = { textContent: '', setAttribute() {}, removeAttribute() {} };
+    context.document.getElementById = (id: string) => id === 'chat-input' ? input : id === 'chat-recipient-name' ? label : null;
+    vm.runInContext('currentCid = "recipient-restored"; _serverFloorByCid.set(currentCid, _serverFloorFromState({ active_recipients: ["a", "b"] }));', context);
+    await context._evaluateAutoRecipient('recipient-restored');
+    expect(context.getChatRecipient('conversation').kind).toBe('commander');
+    const snapshot = context._recipientSnapshotForSend('conversation');
+    expect(context._applyRecipientPrefixWithSnapshot('continue', snapshot)).toBe('continue');
+    expect(context._applyRecipientPrefixWithSnapshot('@commander new topic', snapshot)).toBe('@commander new topic');
+  });
+
+  it.each([
+    ['new-chat', 'new-chat-input'], ['conversation', 'chat-input'], ['project', 'project-chat-input'],
+  ])('inserts panel recipients at the selection and shows the inherited first owner in %s', (target, inputId) => {
+    const context = loadConversationRenderer();
+    context.Event = class { constructor(public type: string) {} };
+    context._agentsCache = [
+      { agent_id: 'a', name: 'Writing Helper' }, { agent_id: 'b', name: 'Reviewer' },
+    ];
+    const a = { kind: 'agent', id: 'a', name: 'Writing Helper' };
+    const b = { kind: 'agent', id: 'b', name: 'Reviewer' };
+    const input = { value: '你好，继续', selectionStart: 3, selectionEnd: 3,
+      dispatchEvent: () => context._syncComposerRecipientInput(target),
+      setSelectionRange(start: number, end: number) { this.selectionStart = start; this.selectionEnd = end; } };
+    context.document.getElementById = (id: string) => id === inputId ? input : null;
+    context.autoGrow = () => {};
+    vm.runInContext('currentCid = "recipient-caret";', context);
+
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('你好， @Writing Helper 继续');
+    context._toggleComposerRecipient(target, b);
+    expect(input.value).toBe('你好， @Writing Helper @Reviewer 继续');
+    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Writing Helper', 'Reviewer']);
+    expect(input.selectionStart).toBe(input.value.indexOf('继续'));
+
+    // Removing an earlier chip keeps the insertion point beside the remaining chip.
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('你好， @Reviewer 继续');
+    expect(input.selectionStart).toBe(input.value.indexOf('继续'));
+    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer']);
+
+    // A new cursor selection replaces text there, preserving the rest of the draft.
+    input.setSelectionRange(input.value.indexOf('继续'), input.value.length);
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('你好， @Reviewer @Writing Helper ');
+
+    // Commander remains the fallback owner; cancellation must not move chips.
+    context._toggleComposerRecipient(target, { kind: 'commander', id: '' });
+    expect(input.value).toBe('你好， @Reviewer @Writing Helper ');
+    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer', 'Writing Helper']);
+
+    input.value = '@commander first @Reviewer second';
+    context._toggleComposerRecipient(target, { kind: 'commander', id: '' });
+    expect(input.value).toBe('first @Reviewer second');
+    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer']);
+
+    input.value = 'before after';
+    input.setSelectionRange(0, 0);
+    context.setChatRecipient(target, b);
+    context._toggleComposerRecipient(target, a);
+    expect(input.value).toBe('@Writing Helper before after');
+    expect(context._mentionPreviewLabels(target)).toEqual(['Writing Helper']);
+  });
+
+  it.each([
+    ['new-chat', 'new-chat-input', 'new-chat-recipient-name'],
+    ['conversation', 'chat-input', 'chat-recipient-name'],
+    ['project', 'project-chat-input', 'project-chat-recipient-name'],
+  ])('follows effective recipients for model selection in %s', (target, inputId, labelId) => {
+    const context = loadConversationRenderer();
+    vm.runInContext(fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/composer-model-picker.js'), 'utf8',
+    ), context);
+    context._agentsCache = [
+      { agent_id: 'cli1', name: 'Orkas Codex', runtime: { kind: 'cli' } },
+      { agent_id: 'cli2', name: 'Orkas Claude', runtime: { kind: 'cli' } },
+      { agent_id: 'writer', name: 'Writing Helper', runtime: { kind: 'llm' } },
+    ];
+    vm.runInContext('currentCid = "c1";', context);
+    const input = { value: '' };
+    const label = { textContent: '', setAttribute() {}, removeAttribute() {} };
+    const modelChip = { disabled: false, hidden: false };
+    context.document.getElementById = (id: string) => (
+      id === inputId ? input : (id === labelId ? label : null)
+    );
+    context.document.querySelector = (selector: string) => (
+      selector === `[data-composer-model-chip="${target}"]` ? modelChip : null
+    );
+    const render = (text: string) => {
+      input.value = text;
+      context._renderRecipientChip(target);
+    };
+
+    render('@Orkas Codex check this');
+    expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+    render('@Orkas Codex @Orkas Claude check this');
+    expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+
+    render('plan this @Orkas Codex implement');
+    expect(modelChip).toMatchObject({ hidden: false, disabled: false });
+    // Only an explicitly addressed model-backed leg needs the model control.
+    for (const text of [
+      '@Orkas Codex check this @Writing Helper summarize',
+      '@指挥官 plan this @Orkas Codex implement',
+      '',
+    ]) {
+      render(text);
+      expect(modelChip).toMatchObject({ hidden: false, disabled: false });
+    }
+
+    context.setChatRecipient(target, { kind: 'agent', id: 'cli1', name: 'Orkas Codex' });
+    expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+    render('@Writing Helper summarize');
+    expect(modelChip).toMatchObject({ hidden: false, disabled: false });
+    // Removing the explicit addressee restores the selected CLI. Quoted
+    // mentions and unresolved names must not replace that default.
+    for (const text of ['', '> @Writing Helper quoted context\ncontinue', 'ask @nobody']) {
+      render(text);
+      expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+    }
+    context.setChatRecipient(target, { kind: 'commander' });
+    expect(modelChip).toMatchObject({ hidden: false, disabled: false });
+  });
+
+  it('freezes the first instruction owner and lets leading mentions override it', () => {
+    // Scenario value: on the new-chat / project composers the picked
+    // recipient is synthesized into the outgoing text. When the user has
+    // already named their assignees inline, adding that prefix silently turns
+    // a deliberate two-agent send into a three-way broadcast.
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'PptMaker' },
+    ];
+    vm.runInContext(`
+      setChatRecipient("new-chat", { kind: "agent", id: "a1", name: "FamilyTutor" });
+      setChatRecipient("project", { kind: "agent", id: "a1", name: "FamilyTutor" });
+      __snap = _recipientSnapshotForSend("new-chat");
+    `, context);
+
+    // The mention starts mid-prose on purpose: a body that OPENS with a
+    // mention was already left alone, so only a mid-text mention proves the
+    // prefix is suppressed by real routing rather than by position.
+    const twoTargets = '先出个提纲 @PptMaker 做成ppt，素材找 @FamilyTutor 要';
+    expect(context.applyRecipientPrefix(twoTargets, 'new-chat', { recipientSnapshot: context.__snap }))
+      .toBe('@FamilyTutor ' + twoTargets);
+    expect(context.applyRecipientPrefix(twoTargets, 'project')).toBe('@FamilyTutor ' + twoTargets);
+
+    // Negative control: tokens that do NOT route must not swallow the prefix,
+    // or the message lands on the commander while the chip says FamilyTutor.
+    expect(context.applyRecipientPrefix('请 @nobody 看一下', 'project'))
+      .toBe('@FamilyTutor 请 @nobody 看一下');
+    expect(context.applyRecipientPrefix('> 引用 @PptMaker 的话\n接着写', 'project'))
+      .toBe('@FamilyTutor\n> 引用 @PptMaker 的话\n接着写');
+    // Mention-less text still routes by the picked recipient.
+    expect(context.applyRecipientPrefix('接着写', 'project'))
+      .toBe('@FamilyTutor 接着写');
+  });
+
+  it('surfaces the order choice for every multi-segment send with the shape default (D23)', () => {
+    // Scenario value: the user asked for the serial/parallel choice to be
+    // visible on EVERY multi-agent send. An adjacent group used to run
+    // parallel with no way to chain it; a wrong default here silently
+    // changes execution order.
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'OtherTutor' },
+    ];
+    const shape = (text: string) => context._composerDispatchShape(text, context._agentsCache);
+    const mode = (text: string) => context._composerDispatchDefaultMode(shape(text));
+
+    // Adjacent mentions: ONE group but TWO segments → toggle shows, default
+    // stays today's all-parallel semantics.
+    expect(shape('@FamilyTutor @OtherTutor check this')).toEqual({ segments: 2, groups: 1 });
+    expect(mode('@FamilyTutor @OtherTutor check this')).toBe('parallel');
+    // Multi-group: written order chains by default.
+    expect(shape('@FamilyTutor write it @OtherTutor make a ppt')).toEqual({ segments: 2, groups: 2 });
+    expect(mode('@FamilyTutor write it @OtherTutor make a ppt')).toBe('serial');
+    // The unaddressed first instruction is its own ordered segment.
+    expect(shape('写一个登录页 @FamilyTutor 出视觉稿')).toEqual({ segments: 2, groups: 2 });
+    // Same agent twice = two segments (no dedup), one target each span.
+    expect(shape('@FamilyTutor a @FamilyTutor b')).toEqual({ segments: 2, groups: 2 });
+    expect(shape('@FamilyTutor @FamilyTutor check @OtherTutor')).toEqual({ segments: 1, groups: 1 });
+    expect(shape('@FamilyTutor @OtherTutor')).toEqual({ segments: 0, groups: 0 });
+    // Single mention / plain text → no choice to offer.
+    expect(shape('@FamilyTutor 单独做')).toEqual({ segments: 1, groups: 1 });
+    expect(shape('no mentions at all')).toEqual({ segments: 0, groups: 0 });
+  });
+
+  it('keeps a flipped order override for the send and drops it when the text stops qualifying', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'OtherTutor' },
+    ];
+    let text = '@FamilyTutor @OtherTutor check this';
+    const btn = { hidden: true, textContent: '', title: '' };
+    context.document.getElementById = (id: string) => (
+      id === 'chat-input' ? { value: text }
+        : id === 'chat-seq-toggle' ? btn
+          : null
+    );
+
+    context._updateComposerSeqToggle('conversation');
+    expect(btn.hidden).toBe(false);
+    expect(context._composerEffectiveDispatchMode('conversation')).toBe('parallel');
+
+    // Flip: adjacent group can now chain serially for this one send.
+    // (script-scope const — reach it from inside the vm context)
+    vm.runInContext("_composerDispatchOverride.set('conversation', 'serial')", context);
+    context._updateComposerSeqToggle('conversation');
+    expect(context._composerEffectiveDispatchMode('conversation')).toBe('serial');
+    expect(btn.textContent).toBe('chat.multi_dispatch_serial');
+
+    // Text stops qualifying → toggle hides and the override is forgotten.
+    text = '@FamilyTutor 单独做';
+    context._updateComposerSeqToggle('conversation');
+    expect(btn.hidden).toBe(true);
+    expect(vm.runInContext("_composerDispatchOverride.has('conversation')", context)).toBe(false);
+  });
+
+  it('normalizes commander routing markers on replay without hiding agent mentions', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._stripCommanderRoutingMentionsForDisplay('@指挥官\n> 引用内容'))
+      .toBe('> 引用内容');
+    expect(context._stripCommanderRoutingMentionsForDisplay('请让 @commander 看一下'))
+      .toBe('请让 看一下');
+    expect(context._stripCommanderRoutingMentionsForDisplay('@FamilyTutor 继续'))
+      .toBe('@FamilyTutor 继续');
+    expect(context._stripCommanderRoutingMentionsForDisplay('Explain `@commander`\n```xml\n@指挥官\n```'))
+      .toBe('Explain `@commander`\n```xml\n@指挥官\n```');
+  });
+
+  it('preserves authored Commander mentions while distinguishing an injected default prefix', () => {
+    const context = loadConversationRenderer();
+    const commander = { kind: 'commander' };
+    expect(context._commanderMentionDisplayForSend('@指挥官 check this', commander))
+      .toEqual({ commander_mention_display: 'preserve' });
+    expect(context._commanderMentionDisplayForSend('first instruction @commander second', commander))
+      .toEqual({ commander_mention_display: 'hide_generated_prefix' });
+    expect(context._commanderMentionDisplayForSend('just a follow-up', { ...commander, resetFloor: true }))
+      .toEqual({});
+    expect(context._commanderMentionDisplayForSend('Explain `@commander` and email@commander', commander))
+      .toEqual({});
+
+    const message = context._groupMsgToLegacy({
+      id: 'authored-commander', from: 'user', to: ['commander', 'codex'],
+      text: '@Codex check this', display_text: '@指挥官 @Codex check this',
+    });
+    expect(context._userMessageDisplayContent(message)).toBe('@指挥官 @Codex check this');
+    expect(message.content).toBe('@Codex check this');
+    expect(context._userMessageDisplayContent({ content: '@commander ordinary follow-up' }))
+      .toBe('ordinary follow-up');
+  });
+
+  it.each([false, true])('keeps an admitted send in A and preserves B while attachment preparation awaits (busy=%s)', async busy => {
+    const context = loadConversationRenderer();
+    context._DRAFT_KEY = (cid: string) => `draft:${cid}`;
+    const input = { value: 'message for A', dataset: {}, dispatchEvent() {} };
+    const sends: any[] = [];
+    const clearedDrafts: string[] = [];
+    let release: (value: any) => void;
+    const attachments = new Promise(resolve => { release = resolve; });
+    context.performance = performance;
+    context.currentCid = 'conversation-a';
+    context.document.getElementById = (id: string) => id === 'chat-input' ? input : null;
+    context.ensureModelConfigured = () => true;
+    context._chatAttachSnapshotForSend = () => attachments;
+    context._recipientSnapshotForSend = () => ({ kind: 'agent', id: context.currentCid, name: context.currentCid });
+    context.getChatRecipient = context._recipientSnapshotForSend;
+    context._applyRecipientPrefixWithSnapshot = (text: string, recipient: any) => `@${recipient.id} ${text}`;
+    context._commanderMentionDisplayForSend = () => ({});
+    context.transformWithChatUse = (text: string) => text;
+    context._clearDraft = (cid: string) => clearedDrafts.push(cid);
+    context._clearQuotes = () => {};
+    context._rememberSentComposerSnapshot = () => {};
+    context.autoGrow = () => {};
+    context._updateComposerSeqToggle = () => {};
+    context.isConvPending = (cid: string) => busy && cid === 'conversation-a';
+    context.apiFetch = async (url: string, options: any) => {
+      sends.push({ cid: url.split('/')[3], content: JSON.parse(options.body).content });
+      return { json: async () => ({ ok: true }) };
+    };
+    context.sendInConversation = async (cid: string, content: string) => { sends.push({ cid, content }); };
+    context._saveDraft('conversation-a');
+    const pending = context.handleChatSubmit();
+    context.currentCid = 'conversation-b';
+    input.value = 'unsent draft in B';
+    input.dataset.commanderResourceId = 'b-template';
+    release!({ ok: true, items: [], names: [] });
+    await pending;
+    expect(sends).toEqual([{ cid: 'conversation-a', content: '@conversation-a message for A' }]);
+    expect(input.value).toBe('unsent draft in B');
+    expect(input.dataset.commanderResourceId).toBe('b-template');
+    expect(clearedDrafts).toEqual(['conversation-a']);
+  });
+
+  it('sends directly to the backend while busy (queue absorption) with attachments cleared', async () => {
+    // Queue absorption: a busy conversation's new message goes straight to
+    // /send (the scheduler queues it as a visible board task) instead of
+    // parking in the renderer-local queue.
+    const context = loadConversationRenderer();
+    const input = { value: 'review this', dispatchEvent() {} };
+    const queued: any[] = [];
+    const cleared: string[] = [];
+    const sent: any[] = [];
+    context.performance = { now: () => 10 };
+    context.currentCid = 'c1';
+    context.messageQueues = new Map();
+    context.document.getElementById = (id: string) => (id === 'chat-input' ? input : null);
+    context.ensureModelConfigured = () => true;
+    context.enqueueMessage = (...args: any[]) => queued.push(args);
+    context._chatAttachClear = (cid: string) => cleared.push(cid);
+    context._clearDraft = () => {};
+    context.autoGrow = () => {};
+    context.uiAlert = async () => {};
+    context.transformWithChatUse = (t: string) => t;
+    context.apiFetch = async (url: string, opts: any) => {
+      if (url.endsWith('/attachments')) {
+        return { json: async () => ({
+          ok: true,
+          items: [
+            { name: 'brief.pdf', kind: 'pdf', bytes: 10 },
+            { name: 'chart.png', kind: 'image', bytes: 10 },
+          ],
+        }) };
+      }
+      sent.push({ url, body: JSON.parse(opts.body) });
+      return { json: async () => ({ ok: true }) };
+    };
+    vm.runInContext(`
+      _chatAttachments.set("c1", [
+        { name: "brief.pdf", status: "ready" },
+        { name: "chart.png", status: "ready" },
+      ]);
+      pendingConvs.set("c1", { loadingEl: null, aborted: false });
+    `, context);
+
+    await context.handleChatSubmit();
+
+    expect(queued).toHaveLength(0); // never the local queue
+    expect(sent).toHaveLength(1);
+    expect(sent[0].url).toContain('/api/conversations/c1/send');
+    expect(sent[0].body.content).toBe('review this');
+    expect(sent[0].body.attachments).toEqual(['brief.pdf', 'chart.png']);
+    expect(sent[0].body.steer_active_turn).toBeUndefined(); // default send never steers
+    expect(cleared).toEqual(['c1']);
+    expect(input.value).toBe('');
+  });
+
+});
+
+function setupConversationStatusController(context: any, cid = 'c1', options = {}) {
+  let hooks: any = null;
+  const cleanups: string[] = [];
+  context.createChatController = (config: any) => {
+    hooks = config.hooks;
+    return { abort() {} };
+  };
+  context._finishStreamingMsg = (finishedCid: string) => cleanups.push(finishedCid);
+  context._updateConvSendUI = () => {};
+  context._updateConvSidebarBadge = () => {};
+  context.startPolling = () => {};
+  context._startRuntimeActorRecovery = () => {};
+  context._observeConversationRunFromPlanAction = () => {};
+
+  const ctrl = context._makeConvChatController(cid, options);
+  context.__ctrl = ctrl;
+  context.__cid = cid;
+  vm.runInContext('_convChatCtrls.set(__cid, __ctrl)', context);
+  const msg = { dataset: {} };
+  hooks.onAssistantStart(msg, cid);
+  return { hooks, msg, cleanups };
+}
+
+describe('conversation controller settlement', () => {
+  it('restores a rejected send before snapshot cleanup and ignores stale controllers', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg } = setupConversationStatusController(context, 'c1', { restoreComposerOnFailure: true });
+    let snapshot = 'unsent description';
+    let draft = '';
+    context._restoreSentComposerSnapshot = () => { if (snapshot) draft = snapshot; };
+    context._finishStreamingMsg = () => { snapshot = ''; };
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    expect(draft).toBe('unsent description');
+    expect(snapshot).toBe('');
+    snapshot = 'newer send'; draft = '';
+    vm.runInContext('_convChatCtrls.set("c1", {})', context);
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    expect(draft).toBe('');
+    expect(snapshot).toBe('newer send');
+  });
+
+  it('notifies programmatic creation only after the stream accepts the request', () => {
+    const context = loadConversationRenderer();
+    let hooks: any;
+    context.createChatController = (config: any) => { hooks = config.hooks; return { abort() {} }; };
+    const accepted = vi.fn();
+    context._makeConvChatController('c1', { onAccepted: accepted });
+    hooks.onStreamEvent({ type: 'text_delta', text: 'not a receipt' });
+    expect(accepted).not.toHaveBeenCalled();
+    hooks.onStreamEvent({ type: 'send_accepted' });
+    expect(accepted).toHaveBeenCalledOnce();
+  });
+
+  it('keeps main-conversation user bubbles off the transcript until the bus persists them', async () => {
+    const context = loadConversationRenderer();
+    const createChatController = context.createChatController;
+    let mainConfig: any = null;
+    context.createChatController = (config: any) => {
+      mainConfig = config;
+      return { abort() {} };
+    };
+    context._makeConvChatController('c1');
+    expect(mainConfig?.features?.optimisticUserBubble).toBe(false);
+    context.createChatController = createChatController;
+
+    // Exercise the shared controller flag directly: a queued stream may emit
+    // task-board state but no persisted user `message` event yet, so the send
+    // path itself must append nothing. Edit chats keep the default optimistic
+    // behavior and are covered by the second controller below.
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-08-31T12:00:00';
+    context._createStreamingAssistantMessage = () => ({ dataset: {} });
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context.apiFetch = async () => ({
+      ok: true,
+      body: { getReader: () => ({ read: async () => ({ done: true }) }) },
+    });
+    const appended: any[] = [];
+    const makeController = (optimisticUserBubble: boolean | undefined) => context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'c1',
+      streamEndpoint: () => '/stream',
+      features: {
+        bindInput: false,
+        scrollPin: false,
+        actorIdentity: true,
+        ...(optimisticUserBubble === undefined ? {} : { optimisticUserBubble }),
+      },
+      hooks: {
+        appendHistoryMessage: (message: any) => {
+          appended.push(message);
+          return { dataset: {} };
+        },
+      },
+    });
+
+    await makeController(false).send('queued fifth message');
+    expect(appended).toEqual([]);
+    await makeController(undefined).send('edit-chat style message');
+    expect(appended.map((message) => message.content)).toEqual(['edit-chat style message']);
+  });
+
+  it('hands a busy-conversation programmatic send to the backend board instead of a local queue', async () => {
+    // Form replays and failed-turn retries go through sendInConversation. With
+    // 2-3 agents running in parallel the conversation stays busy for a long
+    // time; the message must reach the bus NOW (form resume re-enters its
+    // parked task, the scheduler queues the rest as board rows) instead of
+    // parking invisibly in the renderer until every agent finishes.
+    const context = loadConversationRenderer();
+    const sent: any[] = [];
+    context.performance = { now: () => 10 };
+    context.currentCid = 'c1';
+    context.enqueueMessage = () => {
+      throw new Error('busy programmatic sends must not re-enter the retired local queue');
+    };
+    context.apiFetch = async (url: string, opts: any) => {
+      sent.push({ url, body: JSON.parse(opts.body) });
+      return { json: async () => ({ ok: true }) };
+    };
+    vm.runInContext('pendingConvs.set("c1", { loadingEl: null, aborted: false });', context);
+
+    const result = await context.sendInConversation('c1', 'form answer text', { attachments: ['a.pdf'] }, {
+      source_view: 'conversation',
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].url).toBe('/api/conversations/c1/send');
+    expect(sent[0].body.content).toBe('form answer text');
+    expect(sent[0].body.attachments).toEqual(['a.pdf']);
+    // Callers gate on started — a queued board admission IS a started send.
+    expect(result).toMatchObject({ started: true, errored: false });
+  });
+
+  it('paints an immediately-admitted busy send from the response, and leaves a queued one to its board row', async () => {
+    // A busy send can race the previous turn's settlement: the backend may
+    // already be idle, admit the message instantly, and emit its events into
+    // closed streams. The response's `persisted` flag is the renderer's only
+    // reliable signal — true → paint the bubble now; false → the queued board
+    // row is the message's surface and no bubble may appear yet.
+    const context = loadConversationRenderer();
+    const claims: any[] = [];
+    context.performance = { now: () => 10 };
+    context.currentCid = 'c1';
+    context._renderOrClaimPersistedUserMessage = (cid: string, gm: any) => claims.push({ cid, id: gm.id });
+    context._observeConversationRunFromPlanAction = () => null;
+    context._startRuntimeActorRecovery = () => {};
+    context.startPolling = () => {};
+    const resyncs: string[] = [];
+    context.window.TaskBoard = { resync: (cid: string) => resyncs.push(cid) };
+    vm.runInContext('pendingConvs.set("c1", { loadingEl: null, aborted: false });', context);
+
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, msg: { id: 'm-raced', persisted: true } }) });
+    await context.sendInConversation('c1', 'raced send', undefined, {});
+    expect(claims).toEqual([{ cid: 'c1', id: 'm-raced' }]);
+
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, msg: { id: 'm-queued', persisted: false } }) });
+    await context.sendInConversation('c1', 'queued send', undefined, {});
+    // No bubble for the queued one — but the board is refreshed both times so
+    // a lost task_created event cannot leave the row invisible.
+    expect(claims).toEqual([{ cid: 'c1', id: 'm-raced' }]);
+    expect(resyncs).toEqual(['c1', 'c1']);
+  });
+
+  it('reports a refused busy-conversation send as failed so the form widget can retry', async () => {
+    const context = loadConversationRenderer();
+    context.performance = { now: () => 10 };
+    context.currentCid = 'c1';
+    context.apiFetch = async () => ({ json: async () => ({ ok: false, error: 'agent disabled' }) });
+    vm.runInContext('pendingConvs.set("c1", { loadingEl: null, aborted: false });', context);
+
+    const result = await context.sendInConversation('c1', 'form answer text', undefined, {
+    });
+
+    expect(result).toMatchObject({ started: false, errored: true, result: 'failure' });
+  });
+
+
+  it('does not steal focus from an open global search when chat state settles', () => {
+    const context = loadConversationRenderer();
+    let focusCalls = 0;
+    const sendButton = {
+      disabled: false,
+      title: '',
+      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    };
+    const input = { disabled: false, placeholder: '', focus() { focusCalls += 1; } };
+    const searchInput = { id: 'global-search-input' };
+    context.currentCid = 'c1';
+    context.convAgentEnabledByCid = new Map();
+    context._isQueueItemEditing = () => false;
+    context.document.activeElement = searchInput;
+    context.document.getElementById = (id: string) => ({
+      'chat-send-btn': sendButton,
+      'chat-input': input,
+    }[id] || null);
+
+    context._updateConvSendUI('c1');
+
+    expect(focusCalls).toBe(0);
+    context.document.activeElement = null;
+    context._updateConvSendUI('c1');
+    expect(focusCalls).toBe(1);
+  });
+
+  it('renders background queue sends off-screen without changing the visible controller target', () => {
+    const context = loadConversationRenderer();
+    const detachedHistory = { dataset: {} };
+    const configs: any[] = [];
+    context.document.createElement = () => detachedHistory;
+    context.createChatController = (config: any) => {
+      configs.push(config);
+      return { abort() {} };
+    };
+
+    context._makeConvChatController('background-cid', { background: true });
+    context._makeConvChatController('visible-cid');
+
+    expect(configs[0]).toMatchObject({
+      historyEl: detachedHistory,
+      inputEl: null,
+      sendBtnEl: null,
+    });
+    expect(configs[1]).toMatchObject({
+      historyEl: 'chat-history',
+      inputEl: 'chat-input',
+      sendBtnEl: 'chat-send-btn',
+    });
+  });
+
+  it('binds a conversation controller render target to the mounted task, not its fixed request id', () => {
+    const context = loadConversationRenderer();
+    let config: any = null;
+    context.createChatController = (nextConfig: any) => {
+      config = nextConfig;
+      return { abort() {} };
+    };
+    context.currentView = 'conversation';
+    context.currentCid = 'c1';
+
+    context._makeConvChatController('c1');
+
+    expect(config.isRenderTargetActive('c1')).toBe(true);
+    context.currentCid = 'c2';
+    expect(config.isRenderTargetActive('c1')).toBe(false);
+    context.currentCid = 'c1';
+    context.currentView = 'project';
+    expect(config.isRenderTargetActive('c1')).toBe(false);
+  });
+
+  it('buffers live milestones when a fixed-id controller is no longer the mounted task', async () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const buffered: any[] = [];
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-08-24T15:59:31';
+    context._createStreamingAssistantMessage = () => ({ dataset: {}, querySelector: () => null });
+    context._handleStreamEvent = (_cid: string, _msg: any, event: any) => rendered.push(event);
+    context._bufferOffViewGroupProcessEvent = (_cid: string, event: any) => {
+      buffered.push(event);
+      return true;
+    };
+    context._clearOffViewGroupProcessEvents = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context._streamingMarkAborted = () => {};
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'tool', data: { phase: 'start', name: 'exec_command' } },
+          },
+        },
+      },
+    };
+    const chunk = new TextEncoder().encode(`data: ${JSON.stringify(processEvent)}\n\n`);
+    let reads = 0;
+    context.apiFetch = async (_url: string, options: any) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            if (reads++ === 0) return Promise.resolve({ done: false, value: chunk });
+            return new Promise((_resolve, reject) => {
+              options.signal.addEventListener(
+                'abort',
+                () => reject(new DOMException('aborted', 'AbortError')),
+                { once: true },
+              );
+            });
+          },
+        }),
+      },
+    });
+
+    const controller = context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'c1',
+      isRenderTargetActive: () => false,
+      streamEndpoint: () => '/stream',
+      features: { bindInput: false, scrollPin: false, actorIdentity: true },
+      hooks: { appendHistoryMessage: () => ({ dataset: {} }) },
+    });
+
+    const send = controller.send('run the tests');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(rendered).toHaveLength(0);
+    expect(buffered).toEqual([processEvent]);
+
+    controller.abort();
+    await send;
+  });
+
+  it('restores and commits an edit-chat queue item through its composer', () => {
+    const context = loadConversationRenderer();
+    const stored = new Map<string, string>([
+      ['queue_agent:a1', JSON.stringify([
+        { id: 'q1', content: 'first' },
+        {
+          id: 'q2',
+          content: 'second',
+          composer_edit: {
+            previous_input: 'separate edit-chat draft',
+            draft_content: 'second, in progress',
+          },
+        },
+      ])],
+    ]);
+    const makeTarget = (initial: Record<string, any> = {}) => {
+      const listeners: Record<string, Function[]> = {};
+      const classes = new Set<string>();
+      return {
+        dataset: {},
+        classList: {
+          contains: (name: string) => classes.has(name),
+          remove: (name: string) => classes.delete(name),
+          add: (name: string) => classes.add(name),
+          toggle: (name: string, on: boolean) => {
+            if (on) classes.add(name);
+            else classes.delete(name);
+          },
+        },
+        addEventListener: (type: string, fn: Function) => {
+          (listeners[type] ||= []).push(fn);
+        },
+        dispatch: (type: string, event: any = {}) => {
+          for (const fn of listeners[type] || []) fn({ preventDefault() {}, ...event });
+        },
+        focus() {},
+        setSelectionRange() {},
+        ...initial,
+      };
+    };
+    const input = makeTarget({ value: '', placeholder: 'Describe changes' });
+    const sendButton = makeTarget({ title: '', disabled: false });
+    context.localStorage = {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => stored.set(key, value),
+      removeItem: (key: string) => stored.delete(key),
+    };
+    context.document.getElementById = (id: string) => ({
+      'agent-input': input,
+      'agent-send': sendButton,
+    }[id] || null);
+    context.autoGrow = () => {};
+    // Keep the unlocked queue parked so the assertion can observe its final
+    // durable order without starting a model request.
+    context.ensureModelConfigured = () => false;
+
+    context.createChatController({
+      historyEl: { dataset: {} },
+      inputEl: 'agent-input',
+      sendBtnEl: 'agent-send',
+      getCurrentId: () => 'a1',
+      streamEndpoint: () => '/stream',
+      features: { bindInput: true, scrollPin: false, queue: true },
+      queue: {
+        keyPrefix: 'agent',
+        panelId: 'missing-panel',
+        listId: 'missing-list',
+        countId: 'missing-count',
+      },
+    });
+
+    expect(input.value).toBe('second, in progress');
+    expect(sendButton.title).toBe('chat.queue_save');
+
+    input.value = 'second, revised';
+    input.dispatch('input');
+    sendButton.dispatch('click');
+
+    expect(input.value).toBe('separate edit-chat draft');
+    expect(JSON.parse(stored.get('queue_agent:a1')!)).toEqual([
+      { id: 'q1', content: 'first' },
+      { id: 'q2', content: 'second, revised' },
+    ]);
+  });
+
+  it.each(['agent', 'skill'])('retries a failed %s edit reply through its owning controller with the original request metadata', async (owner) => {
+    const context = loadConversationRenderer();
+    const historyEl: any = { innerHTML: '', dataset: {} };
+    const capturedRequests: Array<{ url: string; body: any }> = [];
+    let retryHandler: Function | null = null;
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-08-08T14:30:00';
+    context._scrollToBottomNoAnim = () => {};
+    context._createStreamingAssistantMessage = () => ({ dataset: {} });
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context.appendChatMessage = (_message: any, _autoScroll: boolean, opts: any) => {
+      retryHandler ||= opts.failedRetryHandler;
+      return { dataset: {} };
+    };
+    context.apiFetch = async (url: string, options: any = {}) => {
+      if (!options.method) {
+        return {
+          json: async () => ({
+            ok: true,
+            history: [
+              { role: 'user', content: 'Refine this skill' },
+              { role: 'assistant', content: 'Model response failed: aborted' },
+            ],
+          }),
+        };
+      }
+      capturedRequests.push({ url, body: JSON.parse(options.body) });
+      return {
+        ok: true,
+        body: { getReader: () => ({ read: async () => ({ done: true }) }) },
+      };
+    };
+
+    context.window.addEventListener = () => {};
+    context.document.getElementById = (id: string) => id === `${owner}s-chat-messages` ? historyEl : null;
+    context._setChatScrollOffset = () => {};
+    context._pinMessageToTopWithDynamicSpacer = () => {};
+    context._chatAttachList = () => [];
+    vm.runInContext(fs.readFileSync(path.join(process.cwd(), `src/renderer/modules/${owner}s.js`), 'utf8'), context);
+    vm.runInContext(owner === 'agent'
+      ? "_selectedAgent = { id: 'resource-a1', source: 'custom' }; _bindAgentEditAttachments = () => {};"
+      : "_skillEditSkillId = 'resource-a1'; _bindSkillEditAttachments = () => {};", context);
+    const controller = owner === 'agent' ? context._ensureAgentChatController() : context._ensureSkillChatController();
+    await controller.loadHistory();
+
+    const userMessage = {
+      dataset: {
+        retryContent: 'Refine this skill',
+        retryAttachments: '["brief.md"]',
+        retryAttachmentCid: 'skill-edit-skill-a1',
+        retryModelText: 'Use the imported source and refine this skill',
+      },
+      classList: { contains: (name: string) => name === 'chat-message' || name === 'user' },
+      previousElementSibling: null,
+      querySelector: () => null,
+    };
+    const failedMessage = { previousElementSibling: userMessage };
+    expect(retryHandler).toBeTypeOf('function');
+    await retryHandler!(failedMessage, null);
+
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]).toEqual({
+      url: `/api/${owner}s/resource-a1/chat/send/stream`,
+      body: expect.objectContaining({
+        content: 'Refine this skill',
+        attachments: ['brief.md'],
+        attachment_cid: 'skill-edit-skill-a1',
+        model_text: 'Use the imported source and refine this skill',
+      }),
+    });
+    expect(context.currentCid).toBe('');
+  });
+
+  it('settles an aborted send only from onDone and reuses the owning controller', () => {
+    const context = loadConversationRenderer();
+    const cleanups: string[] = [];
+    let hooks: any = null;
+    context.createChatController = (config: any) => {
+      hooks = config.hooks;
+      return { abort() {} };
+    };
+    context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
+    context._scheduleHistoryReconcileAfterStream = () => {};
+    context._updateConvSendUI = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context.startPolling = () => {};
+    context._startRuntimeActorRecovery = () => {};
+    // Sending now attaches the recovery bus observer beside the primary send
+    // stream; this case is about controller settlement, so stub it like the
+    // other onAssistantStart side effects above.
+    context._observeConversationRunFromPlanAction = () => {};
+
+    const ctrl = context._makeConvChatController('c1');
+    context.__ctrl = ctrl;
+    vm.runInContext('_convChatCtrls.set("c1", __ctrl)', context);
+    const msg = { dataset: {} };
+    hooks.onAssistantStart(msg, 'c1');
+
+    expect(context.pendingConvs.get('c1').controller).toBe(ctrl);
+    hooks.onAbort(msg, 'c1');
+    expect(cleanups).toHaveLength(0);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(cleanups).toEqual(['c1']);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(cleanups).toEqual(['c1']);
+  });
+
+  it('settles a recovered process bubble immediately when its observer is stopped', () => {
+    const context = loadConversationRenderer();
+    const details = createProcessTestElement('details');
+    details.className = 'stream-process';
+    details.dataset.processState = 'active';
+    details.style = { display: '' };
+    details.open = true;
+    details.matches = (selector: string) => selector === '.stream-process';
+    const summary = createProcessTestElement('summary');
+    summary.className = 'stream-process-summary';
+    const label = createProcessTestElement('span');
+    label.className = 'stream-process-label';
+    const body = createProcessTestElement('div');
+    body.className = 'stream-process-body';
+    body.appendChild(createProcessTestElement('div'));
+    details.appendChild(summary);
+    details.appendChild(label);
+    details.appendChild(body);
+
+    const bubble = createProcessTestElement('div');
+    bubble.className = 'chat-bubble';
+    bubble.appendChild(details);
+    const finalBody = createProcessTestElement('div');
+    finalBody.className = 'stream-final';
+    finalBody.dataset.role = 'final';
+    finalBody.style = { display: '' };
+    finalBody.textContent = 'Incomplete answer preview';
+    bubble.appendChild(finalBody);
+    const message = createProcessTestElement('div');
+    message.className = 'chat-message assistant';
+    message.dataset.placeholder = '1';
+    message.dataset.activityDone = '1';
+    message.dataset.streamBuf = 'Incomplete answer preview';
+    message.dataset.finalText = 'Incomplete answer preview';
+    message.appendChild(bubble);
+    const querySelector = message.querySelector.bind(message);
+    message.querySelector = (selector: string) => (
+      selector === '[data-role="final"]' ? finalBody : querySelector(selector)
+    );
+    const history = createProcessTestElement('div');
+    history.appendChild(message);
+
+    let observerAbortCalls = 0;
+    context.document.createElement = (tagName: string) => createProcessTestElement(tagName);
+    context.renderMarkdownFull = (text: string) => `<p>${escapeHtml(text)}</p>`;
+    context._attachInterruptedAssistantActions = () => {};
+    context._refreshTaskSurfacesAfterAbort = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context.apiFetch = () => Promise.resolve({ ok: true });
+    context.__recoveredMessage = message;
+    context.__recoveredState = {
+      loadingEl: message,
+      aborted: false,
+      controller: { abort() { observerAbortCalls += 1; } },
+    };
+    vm.runInContext(`
+      pendingConvs.set('c1', __recoveredState);
+      _groupPlaceholders.set(_phKey('c1', 's:turn-1:0'), __recoveredMessage);
+    `, context);
+
+    context.abortConvStream('c1');
+
+    expect(observerAbortCalls).toBe(1);
+    expect(details.dataset.processState).toBe('complete');
+    expect(details.open).toBeFalsy();
+    expect(message.dataset.interrupted).toBe('1');
+    expect(message.dataset.finalText).toBe('Interrupted');
+    expect(message.dataset.streamBuf).toBeUndefined();
+    expect(finalBody.innerHTML).toContain('Interrupted');
+    expect(finalBody.innerHTML).not.toContain('Incomplete answer preview');
+    expect(bubble.querySelector('.stream-aborted-note')).toBeNull();
+  });
+
+  it('settles both explicit and programmatic edit-chat aborts', async () => {
+    const context = loadConversationRenderer();
+    const clicks: any[] = [];
+    const events: any[] = [];
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-07-18T00:00:00';
+    context._createStreamingAssistantMessage = () => ({ dataset: {} });
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context._streamingMarkAborted = () => {};
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+
+    const createBlockedStream = () => {
+      const toolEvent = new TextEncoder().encode(`data: ${JSON.stringify({
+        type: 'event',
+        event: { stream: 'tool', data: { phase: 'start', name: 'search' } },
+      })}\n\n`);
+      let readCount = 0;
+      context.apiFetch = async (_url: string, options: any) => ({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () => {
+              if (readCount++ === 0) return Promise.resolve({ done: false, value: toolEvent });
+              return new Promise((_resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+              });
+            },
+          }),
+        },
+      });
+    };
+    const createController = () => context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'a1',
+      streamEndpoint: () => '/stream',
+      telemetrySurface: 'agent_edit',
+      features: { bindInput: false, scrollPin: false },
+      hooks: { appendHistoryMessage: () => ({ dataset: {} }) },
+    });
+
+    createBlockedStream();
+    const explicitController = createController();
+    const explicitSend = explicitController.send('hello', { attachments: ['brief.md'] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    explicitController.abort({ userInitiated: true });
+    await explicitSend;
+
+    createBlockedStream();
+    const programmaticController = createController();
+    const programmaticSend = programmaticController.send('hello');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    programmaticController.abort();
+    await programmaticSend;
+  });
+
+  it('starts the shared live runtime clock when an edit-chat send begins', async () => {
+    const context = loadConversationRenderer();
+    let wallNow = 10_000;
+    let monotonicNow = 1_000;
+    context.Date = class extends Date {
+      static now() { return wallNow; }
+    };
+    context.performance = { now: () => monotonicNow };
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-08-07T18:45:00';
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context._streamingMarkAborted = () => {};
+
+    const runtimeText = { textContent: '', hidden: true };
+    const label = { textContent: '' };
+    const processContainer = {
+      dataset: { processState: 'active' } as Record<string, string>,
+      style: { display: 'none' },
+      matches: (selector: string) => selector === '.stream-process',
+      querySelector: (selector: string) => (
+        selector === '.stream-process-runtime' ? runtimeText
+          : selector === '.stream-process-label' ? label
+            : null
+      ),
+    };
+    const msg: any = {
+      dataset: {},
+      isConnected: true,
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]' || selector === '.stream-process') {
+          return processContainer;
+        }
+        return null;
+      },
+    };
+    context._createStreamingAssistantMessage = () => msg;
+
+    let readCount = 0;
+    context.apiFetch = async (_url: string, options: any) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            if (readCount++ === 0) return Promise.resolve({ done: false, value: new Uint8Array() });
+            return new Promise((_resolve, reject) => {
+              options.signal.addEventListener(
+                'abort',
+                () => reject(new DOMException('aborted', 'AbortError')),
+                { once: true },
+              );
+            });
+          },
+        }),
+      },
+    });
+
+    const controller = context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'a1',
+      streamEndpoint: () => '/stream',
+      telemetrySurface: 'agent_edit',
+      features: { bindInput: false, scrollPin: false },
+      hooks: { appendHistoryMessage: () => ({ dataset: {} }) },
+    });
+
+    const send = controller.send('hello');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(processContainer.style.display).toBe('');
+    expect(runtimeText.hidden).toBe(false);
+    expect(label.textContent).toBe('Duration');
+
+    wallNow += 12_000;
+    monotonicNow += 12_000;
+    context._streamingPaintActivityMeta(msg);
+    expect(runtimeText.textContent).toBe('12s');
+    expect(processContainer.dataset.runtimeDurationMs).toBe('12000');
+
+    controller.abort();
+    await send;
+    context._streamingStopActivity(msg);
+  });
+
+  it('cleans an aborted send from onDone without locally finalizing bus-owned lifecycle state', () => {
+    const context = loadConversationRenderer();
+    const cleanups: string[] = [];
+    let hooks: any = null;
+    context.createChatController = (config: any) => {
+      hooks = config.hooks;
+      return { abort() {} };
+    };
+    context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
+    context._updateConvSendUI = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context.startPolling = () => {};
+    context._startRuntimeActorRecovery = () => {};
+    // Sending now attaches the recovery bus observer beside the primary send
+    // stream; this case is about controller settlement, so stub it like the
+    // other onAssistantStart side effects above.
+    context._observeConversationRunFromPlanAction = () => {};
+
+    const browserTurnStarts: string[] = [];
+    context.window.WebAssist = { beginTaskTurn: (id: string) => browserTurnStarts.push(id) };
+    const ctrl = context._makeConvChatController('c1');
+    context.__ctrl = ctrl;
+    vm.runInContext('_convChatCtrls.set("c1", __ctrl)', context);
+    const msg = { dataset: {} };
+    hooks.onAssistantStart(msg, 'c1');
+
+    expect(browserTurnStarts).toEqual(['c1']);
+    expect(context.pendingConvs.get('c1').controller).toBe(ctrl);
+    hooks.onAbort(msg, 'c1');
+    expect(cleanups).toHaveLength(0);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(cleanups).toEqual(['c1']);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(cleanups).toEqual(['c1']);
+  });
+
+  it('keeps a successful turn successful when the lifecycle stream errors afterward', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg, cleanups } = setupConversationStatusController(context);
+
+    // Canonical reply lands first. The controller then observes a host-stream
+    // teardown error: this is the production order that previously produced a
+    // false red Failed label beside a fully successful response.
+    context._handleGroupBusEvent('c1', msg, {
+      type: 'message',
+      turn_end: true,
+      turn_id: 'turn-1',
+      msg: {
+        from: 'commander',
+        text: 'Review complete; all checks passed.',
+        ts: '2026-08-08T12:00:00.000Z',
+      },
+    });
+    hooks.onDone(msg, 'c1', { started: true, aborted: false, errored: true });
+
+    expect(cleanups).toEqual(['c1']);
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('still marks a transport-only failure when no reply or task terminal settled the turn', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg } = setupConversationStatusController(context);
+    hooks.onDone(msg, 'c1', { started: true, aborted: false, errored: true });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('failed');
+  });
+
+  it('repairs an early transport failure when a completed task terminal arrives later', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg } = setupConversationStatusController(context);
+    hooks.onDone(msg, 'c1', { started: true, aborted: false, errored: true });
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('failed');
+
+    context._taskTerminalHandlePresentation({
+      type: 'terminal',
+      conversation_id: 'c1',
+      run_id: 'run-1',
+      status: 'completed',
+      started_at_ms: 1_000,
+      finished_at_ms: 2_000,
+    });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+  });
+
+  it('does not treat reopened pending history as success when its transport later fails', () => {
+    const context = loadConversationRenderer();
+    const { hooks, msg } = setupConversationStatusController(context);
+    context._syncFailedFromHistory('c1', [
+      { from: 'commander', text: 'Prior completed turn.' },
+      { from: 'user', text: 'Current turn still awaiting a reply.' },
+    ]);
+    expect(context._convRowStatus({ conversation_id: 'c1', status: 'failed' })).toBe('idle');
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: false, errored: true });
+
+    expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('failed');
+  });
+
+  it('classifies a server abort as aborted instead of model output failure', async () => {
+    const context = loadConversationRenderer();
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-07-17T00:00:00';
+    context._createStreamingAssistantMessage = () => ({ dataset: {} });
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    const encoded = new TextEncoder().encode(`data: ${JSON.stringify({
+      type: 'error',
+      aborted: true,
+      text: 'stopped',
+    })}\n\n`);
+    let readCount = 0;
+    context.apiFetch = async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => (readCount++ === 0
+            ? { done: false, value: encoded }
+            : { done: true, value: undefined }),
+        }),
+      },
+    });
+    let aborts = 0;
+    let errors = 0;
+    let doneResult: any = null;
+    const controller = context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'c1',
+      streamEndpoint: () => '/stream',
+      features: { bindInput: false, scrollPin: false },
+      hooks: {
+        appendHistoryMessage: () => ({ dataset: {} }),
+        onAbort: () => { aborts += 1; },
+        onError: () => { errors += 1; },
+        onDone: (_msg: any, _cid: string, result: any) => { doneResult = result; },
+      },
+    });
+
+    const result = await controller.send('hello');
+
+    expect(aborts).toBe(1);
+    expect(errors).toBe(0);
+    expect(result).toMatchObject({ started: true, aborted: true, errored: false });
+    expect(doneResult).toMatchObject({ started: true, aborted: true, errored: false });
+  });
+
+  it('renders a server abort as stopped instead of a model error', () => {
+    const context = loadConversationRenderer();
+    let stopped = 0;
+    let errors = 0;
+    context._streamingMarkAborted = () => { stopped += 1; };
+    context._streamingSetError = () => { errors += 1; };
+
+    context._handleStreamEvent('c1', {}, { type: 'error', aborted: true, text: 'stopped' });
+
+    expect(stopped).toBe(1);
+    expect(errors).toBe(0);
+  });
+
+  it.each([
+    [{ started: true, aborted: false, errored: false }, 'success'],
+    [{ started: true, aborted: false, errored: true }, 'failure'],
+    [{ started: true, aborted: true, errored: false }, 'cancelled'],
+  ])('returns the terminal chat result from controller state %#', async (terminal, expected) => {
+    const context = loadConversationRenderer();
+    context.performance = performance;
+    context._makeConvChatController = (_cid: string, options: any) => ({
+      abort() {},
+      async send() {
+        options.onStarted();
+        options.onDone(terminal);
+        return terminal;
+      },
+    });
+
+    const result = await context.sendInConversation('c1', 'hello', undefined, {
+      provider: 'deepseek',
+      model: 'deepseek-v4-pro',
+      entry_point: 'quick_start',
+      resource_id: 'creation',
+      agent_id: '173d4235a431',
+      recipient_type: 'agent',
+      position: 6,
+      source: 'pc_default',
+    });
+
+    expect(result.result).toBe(expected);
+  });
+
+  it.each(['rejected', 'thrown'])(
+    'discards a sent composer snapshot when preflight is %s', async (failure) => {
+    const context = loadConversationRenderer();
+    context._rememberSentComposerSnapshot('c1', { text: 'old unsent attempt' });
+    context.performance = performance;
+    context._makeConvChatController = () => ({
+      abort() {},
+      async send() {
+        if (failure === 'thrown') throw new Error('preflight failed');
+        return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
+      },
+    });
+
+    if (failure === 'thrown') {
+      await expect(context.sendInConversation('c1', 'hello')).rejects.toThrow('preflight failed');
+    } else {
+      expect((await context.sendInConversation('c1', 'hello')).result).toBe('failure');
+    }
+    expect(vm.runInContext('_sentComposerSnapshots.has("c1")', context)).toBe(false);
+    expect(context._restoreSentComposerSnapshot('c1')).toBe(false);
+  });
+
+  it.each([false, true])('restores a rejected composer send only before acceptance=%s', async (accepted) => {
+    const context = loadConversationRenderer();
+    context.performance = performance;
+    context._trackChatResourceMentionTelemetry = () => {};
+    let restored = '';
+    context._restoreSentComposerSnapshot = (cid: string) => { restored = cid; };
+    context._makeConvChatController = (_cid: string, options: any) => ({
+      async send() {
+        options.onStarted();
+        options.onDone({ started: true, errored: true });
+        return { started: true, aborted: false, errored: true, accepted };
+      },
+    });
+    const result = await context.sendInConversation('c1', '@Writer review', undefined, { restoreComposerOnFailure: true });
+    expect(result.result).toBe('failure');
+    expect(restored).toBe(accepted ? '' : 'c1');
+  });
+
+  it('returns a failed result for a controller preflight rejection', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    context.performance = performance;
+    context.Monitor = { event: (name: string, payload: any) => events.push({ name, payload }) };
+    context.window.Monitor = true;
+    context._trackChatResourceMentionTelemetry = () => {};
+    context._makeConvChatController = () => ({
+      abort() {},
+      async send() {
+        return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
+      },
+    });
+
+    const result = await context.sendInConversation('c1', 'hello');
+
+    expect(result.result).toBe('failure');
+  });
+});
+
+describe('chat attachment picker targeting', () => {
+  it('keeps project composer uploads separate from ordinary conversations', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._chatAttachTargetOf('projchat-p1')).toBe('project');
+    expect(context._chatAttachTargetOf('c1')).toBe('conversation');
+  });
+
+  it('reports a native picker dismissal as cancelled instead of success', async () => {
+    const context = loadConversationRenderer();
+    const clicks: any[] = [];
+    const events: any[] = [];
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.window.orkas = {
+      invoke: async () => ({ ok: true, cancelled: true, items: [], failed: [] }),
+    };
+
+    await context._chatAttachPickAndUpload('main_chat', 'picker');
+  });
+
+  it('blocks send during file reads before an uploading chip exists', async () => {
+    const context = loadConversationRenderer();
+    const alerts: string[] = [];
+    const input = { value: 'Use the attachment', style: {}, dataset: {} };
+    let resolveBytes: ((value: ArrayBuffer) => void) | null = null;
+    const bytes = new Promise<ArrayBuffer>((resolve) => { resolveBytes = resolve; });
+    let apiCalls = 0;
+    context.performance = performance;
+    context.document.getElementById = (id: string) => (id === 'new-chat-input' ? input : null);
+    context.ensureModelConfigured = () => true;
+    context._getQuotes = () => [];
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context.apiFetch = async () => {
+      apiCalls += 1;
+      return { json: async () => ({ ok: true, info: { name: 'notes.txt', kind: 'text', bytes: 3 } }) };
+    };
+
+    const upload = context._chatAttachUpload('main_chat', [{
+      name: 'notes.txt',
+      size: 3,
+      arrayBuffer: () => bytes,
+    }], 'drop');
+    expect(vm.runInContext("_chatAttachHasPendingWork('main_chat')", context)).toBe(true);
+
+    await context.handleNewChatSubmit();
+
+    expect(apiCalls).toBe(0);
+    expect(input.value).toBe('Use the attachment');
+    expect(alerts).toContain('chat.attach_still_uploading');
+
+    resolveBytes!(new Uint8Array([1, 2, 3]).buffer);
+    await upload;
+    expect(apiCalls).toBe(1);
+  });
+
+  it('does not let an older refresh erase a newer attachment mutation', async () => {
+    const context = loadConversationRenderer();
+    let resolveList: ((value: any) => void) | null = null;
+    const listResult = new Promise((resolve) => { resolveList = resolve; });
+    context.performance = performance;
+    context.apiFetch = async () => ({
+      json: () => listResult,
+    });
+
+    const refresh = context._chatAttachRefreshFromServer('main_chat');
+    vm.runInContext("_chatAttachSet('main_chat', [{ name: 'late.png', kind: 'image', bytes: 4, status: 'ready' }])", context);
+    resolveList!({ ok: true, items: [] });
+
+    expect(await refresh).toMatchObject({ ok: true, stale: true });
+    expect(vm.runInContext("_chatAttachList('main_chat').map((item) => item.name)", context))
+      .toEqual(['late.png']);
+  });
+
+  it('recovers an upload committed before its renderer response failed', async () => {
+    const context = loadConversationRenderer();
+    const alerts: string[] = [];
+    context.performance = performance;
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context.apiFetch = async (url: string) => {
+      if (url.endsWith('/upload')) {
+        return { json: async () => { throw new Error('response channel closed'); } };
+      }
+      return { json: async () => ({
+        ok: true,
+        items: [{ name: 'committed.txt', kind: 'text', bytes: 3 }],
+      }) };
+    };
+
+    await context._chatAttachUpload('main_chat', [{
+      name: 'committed.txt',
+      size: 3,
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+    }], 'drop');
+
+    expect(vm.runInContext("_chatAttachList('main_chat').map((item) => item.status)", context))
+      .toEqual(['error']);
+    const release = vm.runInContext("_chatAttachTryBeginSend('main_chat')", context);
+    const snapshot = await context._chatAttachSnapshotForSend('main_chat', { requireServerMatch: true });
+    release();
+
+    expect(snapshot).toMatchObject({ ok: true, names: ['committed.txt'] });
+    expect(vm.runInContext("_chatAttachList('main_chat').map((item) => item.status)", context))
+      .toEqual(['ready']);
+    expect(alerts).toEqual(['chat.attach_rejected_prefix']);
+  });
+
+  it('fails closed when a draft chip is missing from the main-process snapshot', async () => {
+    const context = loadConversationRenderer();
+    context.__attachmentWarningRows = [];
+    vm.runInContext(
+      '_convLog.warn = (...args) => globalThis.__attachmentWarningRows.push(args)',
+      context,
+    );
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, items: [] }) });
+    vm.runInContext("_chatAttachments.set('main_chat', [{ name: 'missing.pdf', kind: 'pdf', bytes: 10, reused: true, status: 'ready' }])", context);
+
+    const release = vm.runInContext("_chatAttachTryBeginSend('main_chat')", context);
+    const snapshot = await context._chatAttachSnapshotForSend('main_chat', { requireServerMatch: true });
+    release();
+
+    expect(snapshot).toMatchObject({ ok: false, reason: 'attachment_sync_mismatch' });
+    expect(vm.runInContext("_chatAttachList('main_chat').map((item) => item.name)", context))
+      .toEqual(['missing.pdf']);
+    expect(context.__attachmentWarningRows).toEqual([
+      ['attachment send snapshot mismatch', { missing_count: 1 }],
+    ]);
+    expect(JSON.stringify(context.__attachmentWarningRows)).not.toContain('main_chat');
+    expect(JSON.stringify(context.__attachmentWarningRows)).not.toContain('missing.pdf');
+  });
+
+  it('fails an edited attachment snapshot without consuming the displaced draft when a new selection is missing', async () => {
+    const context = loadConversationRenderer();
+    context.apiFetch = async () => ({ json: async () => ({ ok: true,
+      items: [{ name: 'other-draft.txt', kind: 'text', bytes: 1 }],
+    }) });
+    vm.runInContext("_chatAttachments.set('c1', [{ name: 'missing.txt', status: 'ready' }, { name: 'queued.txt', reused: true, status: 'ready' }])", context);
+    const release = vm.runInContext("_chatAttachTryBeginSend('c1')", context);
+    try {
+      const snapshot = await context._chatAttachSnapshotForSend('c1', { onlySelected: true });
+      expect(snapshot).toMatchObject({ ok: false, reason: 'attachment_sync_mismatch' });
+      expect(vm.runInContext("_chatAttachList('c1').map((item) => item.name)", context))
+        .toEqual(['missing.txt', 'queued.txt']);
+    } finally { release(); }
+  });
+
+  it('names each create card after its destination action and rejects unsupported create requests', () => {
+    const context = loadConversationRenderer();
+    const locale = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
+    context.t = (key: string) => locale[key] || key;
+    context.document.createElement = createProcessTestElement;
+    const host = createProcessTestElement();
+    context._mountAppNavRequests(host, { app_nav_requests: [
+      ...['projects', 'agents', 'skills', 'auto', 'settings'].map(surface_id => ({ surface_id, action: 'create' })),
+      { surface_id: 'projects', action: 'create', target_id: 'existing-project' },
+    ] });
+    expect(host.children[0].children.map((button: any) => button.textContent))
+      .toEqual(['New project', 'New agent', 'New skill', 'New auto task']);
+  });
+
+  it('summarizes app navigation failures without logging raw exception text', () => {
+    const context = loadConversationRenderer();
+    context.__navigationWarningRows = [];
+    vm.runInContext(
+      '_convLog.warn = (...args) => globalThis.__navigationWarningRows.push(args)',
+      context,
+    );
+    context.uiToast = vi.fn();
+
+    context._appNavReportFailure(
+      'settings',
+      'open',
+      new Error('/Users/test/private-plan.md failed with session-secret'),
+    );
+
+    expect(context.__navigationWarningRows).toEqual([
+      ['app navigation failed', {
+        surface_id: 'settings',
+        action: 'open',
+        error_type: 'Error',
+      }],
+    ]);
+    expect(JSON.stringify(context.__navigationWarningRows)).not.toContain('/Users/alice');
+    expect(JSON.stringify(context.__navigationWarningRows)).not.toContain('session-secret');
+  });
+
+  it('keeps the chip when the main process rejects attachment deletion', async () => {
+    const context = loadConversationRenderer();
+    const alerts: string[] = [];
+    context.apiFetch = async () => ({ json: async () => ({ ok: false, error: 'disk busy' }) });
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    vm.runInContext("_chatAttachments.set('main_chat', [{ name: 'brief.pdf', kind: 'pdf', bytes: 10, status: 'ready' }])", context);
+
+    await context._chatAttachRemove('main_chat', 0);
+
+    expect(vm.runInContext("_chatAttachList('main_chat').map((item) => [item.name, item.status])", context))
+      .toEqual([['brief.pdf', 'ready']]);
+    expect(alerts).toEqual(['chat.attach_remove_failed']);
+  });
+});
+
+describe('new chat quick-start scenarios', () => {
+  it('uses the account name in the centered prompt and falls back to Friend without one', () => {
+    const context = loadConversationRenderer();
+    const greeting = { textContent: '' };
+    context.t = (key: string, params: any = {}) => ({
+      'new_chat.title': `${params.name}, what do you want to accomplish?`,
+      'common.user_fallback': 'Friend',
+    }[key] || key);
+    context.document.getElementById = (id: string) => (
+      id === 'new-chat-greeting' ? greeting : null
+    );
+
+    context._updateEmptyStateAccount({ userInfo: { nickname: 'Avery' } });
+    expect(greeting.textContent).toBe('Avery, what do you want to accomplish?');
+
+    context._updateEmptyStateAccount({ userInfo: { email: 'avery@example.com' } });
+    expect(greeting.textContent).toBe('Friend, what do you want to accomplish?');
+  });
+
+  it('renders all nine quick-start cards when the new-chat view is entered', () => {
+    const context = loadConversationRenderer();
+    const heading = { textContent: '' };
+    const recipientName = {
+      textContent: '',
+      setAttribute() {},
+      removeAttribute() {},
+    };
+    const input = {
+      value: '',
+      dataset: {},
+      addEventListener() {},
+    };
+    const grid = {
+      children: [],
+      innerHTML: '',
+    };
+    const row = {
+      querySelectorAll: () => [],
+    };
+    context.document.getElementById = (id: string) => ({
+      'new-chat-greeting': heading,
+      'new-chat-recipient-name': recipientName,
+      'new-chat-input': input,
+      'new-chat-scenario-grid': grid,
+      'new-chat-scenarios': row,
+    } as Record<string, unknown>)[id] || null;
+
+    context.onEnterNewChatView();
+
+    expect(heading.textContent).toBe('Friend, what do you want to accomplish?');
+    expect([...grid.innerHTML.matchAll(/data-scenario="([^"]+)"/g)].map((match) => match[1])).toEqual([
+      'data',
+      'ecommerce',
+      'ppt',
+      'office',
+      'image',
+      'video',
+      'ui_design',
+      'rnd',
+      'seo_geo',
+    ]);
+  });
+
+  it('blocks a Quick start send until the highlighted placeholder is replaced', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    const alerts: string[] = [];
+    const input = {
+      value: 'Research [research topic] and summarize the findings.',
+      dataset: {
+        commanderEntryPoint: 'quick_start',
+        commanderResourceId: 'data',
+        commanderAgentId: '78900d8758bc',
+        commanderSource: 'pc_default',
+        commanderRecipientType: 'agent',
+        commanderPosition: '1',
+        commanderQuickStartPlaceholder: '[research topic]',
+      },
+      focused: false,
+      selection: [0, 0],
+      focus() { this.focused = true; },
+      setSelectionRange(start: number, end: number) { this.selection = [start, end]; },
+    };
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.unresolvedOssTemplatePlaceholder = () => '';
+    context.performance = performance;
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context._getQuotes = () => [];
+    context.document.getElementById = (id: string) => (id === 'new-chat-input' ? input : null);
+
+    await context.handleNewChatSubmit();
+
+    expect(input.focused).toBe(true);
+    expect(input.selection).toEqual([9, 25]);
+    expect(alerts).toEqual(['new_chat.quick.task_required']);
+  });
+
+  it('recovers a main-process-only draft attachment and sends the adopted name', async () => {
+    const context = loadConversationRenderer();
+    const requests: string[] = [];
+    const sends: any[] = [];
+    const input = { value: 'Describe this image', style: {}, dataset: {} };
+    const button = { disabled: false };
+    context.performance = performance;
+    context.window.orkas = { invoke: async () => ({ ok: true }) };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-input') return input;
+      if (id === 'new-chat-send-btn') return button;
+      if (id === 'chat-input') return { value: '', style: {} };
+      return null;
+    };
+    context.ensureModelConfigured = () => true;
+    context._getQuotes = () => [];
+    context._referenceSnapshotsForQuotes = () => [];
+    context._recipientSnapshotForSend = () => ({ kind: 'commander' });
+    context._normaliseRecipientSnapshot = (value: any) => value;
+    context.transformWithChatUse = (value: string) => value;
+    context.transformChatUseTokens = (value: string) => value;
+    context.applyRecipientPrefix = (value: string) => value;
+    context._autoTitle = (value: string) => value;
+    context.autoGrow = () => {};
+    context.renderConversationList = () => {};
+    context.setView = () => {};
+    context._renderRecipientChip = () => {};
+    context.apiFetch = async (url: string) => {
+      requests.push(url);
+      if (url === '/api/conversations/main_chat/attachments') {
+        return { json: async () => ({
+          ok: true,
+          items: [{ name: 'image.png', kind: 'image', bytes: 48894 }],
+        }) };
+      }
+      if (url === '/api/conversations/create') {
+        return { json: async () => ({
+          ok: true,
+          conversation: { conversation_id: 'c_with_image', title: 'New task' },
+        }) };
+      }
+      if (url === '/api/conversations/attachments/adopt') {
+        return { json: async () => ({
+          ok: true,
+          items: [{ sourceName: 'image.png', targetName: 'image.png' }],
+        }) };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    context.sendInConversation = async (_cid: string, content: string, extra: any, options: any) => {
+      expect(options.restoreComposerOnFailure).toBe(true);
+      sends.push({ content, extra });
+    };
+
+    expect(vm.runInContext("_chatAttachList('main_chat')", context)).toEqual([]);
+    await context.handleNewChatSubmit();
+
+    expect(requests).toEqual([
+      '/api/conversations/main_chat/attachments',
+      '/api/conversations/create',
+      '/api/conversations/attachments/adopt',
+    ]);
+    expect(sends).toEqual([{
+      content: 'Describe this image',
+      extra: { title_text: 'Describe this image', attachments: ['image.png'] },
+    }]);
+    expect(input.value).toBe('');
+    expect(button.disabled).toBe(false);
+  });
+
+  it('keeps body-carried routing mentions out of the new task title seed', async () => {
+    const context = loadConversationRenderer();
+    const sends: any[] = [];
+    const input = { value: '@ProductDemoBuilder Describe this image', style: {}, dataset: {} };
+    const button = { disabled: false };
+    context.performance = performance;
+    context.window.orkas = { invoke: async () => ({ ok: true }) };
+    context._agentsCache = [{ agent_id: 'd76b91de8c7b', name: 'ProductDemoBuilder' }];
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-input') return input;
+      if (id === 'new-chat-send-btn') return button;
+      if (id === 'chat-input') return { value: '', style: {} };
+      return null;
+    };
+    context.ensureModelConfigured = () => true;
+    context._getQuotes = () => [];
+    context._referenceSnapshotsForQuotes = () => [];
+    context._recipientSnapshotForSend = () => ({ kind: 'agent', id: 'd76b91de8c7b', name: 'ProductDemoBuilder' });
+    context._normaliseRecipientSnapshot = (value: any) => value;
+    context.transformWithChatUse = (value: string) => value;
+    context.transformChatUseTokens = (value: string) => value;
+    context.applyRecipientPrefix = (value: string) => value;
+    context._autoTitle = (value: string) => value;
+    context.autoGrow = () => {};
+    context.renderConversationList = () => {};
+    context.setView = () => {};
+    context._renderRecipientChip = () => {};
+    context.apiFetch = async (url: string) => {
+      if (url === '/api/conversations/main_chat/attachments') return { json: async () => ({ ok: true, items: [] }) };
+      if (url === '/api/conversations/attachments/adopt') return { json: async () => ({ ok: true, items: [] }) };
+      if (url === '/api/conversations/create') {
+        return { json: async () => ({ ok: true, conversation: { conversation_id: 'c_titled', title: 'New task' } }) };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    context.sendInConversation = async (_cid: string, content: string, extra: any) => {
+      sends.push({ content, extra });
+    };
+    const alerts: string[] = [];
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+
+    await context.handleNewChatSubmit();
+    expect(alerts).toEqual([]);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].content).toBe('@ProductDemoBuilder Describe this image');
+    expect(sends[0].extra.title_text).toBe('Describe this image');
+
+    // Negative control: an unknown @name is ordinary text and stays in the title.
+    input.value = '@Nobody Describe this image';
+    await context.handleNewChatSubmit();
+    expect(sends).toHaveLength(2);
+    expect(sends[1].extra.title_text).toBe('@Nobody Describe this image');
+  });
+
+  it('keeps the send button usable after conversation creation fails', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    const clicks: any[] = [];
+    const input = {
+      value: 'hello',
+      style: {},
+      dataset: {
+        commanderEntryPoint: 'quick_start',
+        commanderResourceId: 'creation',
+        commanderAgentId: '173d4235a431',
+        commanderSource: 'pc_default',
+        commanderRecipientType: 'agent',
+        commanderPosition: '6',
+      },
+    };
+    const button = { disabled: false };
+    context.performance = performance;
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-input') return input;
+      if (id === 'new-chat-send-btn') return button;
+      return null;
+    };
+    context.ensureModelConfigured = () => true;
+    context._currentComposerModelTelemetryContext = () => ({
+      provider: 'deepseek',
+      model: 'deepseek-v4-pro',
+    });
+    context._getQuotes = () => [];
+    context._referenceSnapshotsForQuotes = () => [];
+    context._recipientSnapshotForSend = () => ({ kind: 'commander' });
+    context._normaliseRecipientSnapshot = (value: any) => value;
+    context.transformWithChatUse = (value: string) => value;
+    context.applyRecipientPrefix = (value: string) => value;
+    context._chatAttachList = () => [];
+    context.apiFetch = async (url: string) => ({
+      json: async () => url.endsWith('/attachments')
+        ? { ok: true, items: [] }
+        : { ok: false, error: 'create failed' },
+    });
+    context.uiAlert = async () => {};
+
+    await context.handleNewChatSubmit();
+
+    const results = events.filter((event) => event.name === 'chat_send_result');
+    expect(button.disabled).toBe(false);
+  });
+
+  it('keeps the full composer retryable when attachment adoption is incomplete', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    const invocations: any[] = [];
+    const alerts: string[] = [];
+    const input = { value: 'Review both files', style: {}, dataset: {} };
+    const button = { disabled: false };
+    let clearedAttachments = 0;
+    let clearedQuotes = 0;
+    let consumedSelections = 0;
+    let renderedConversations = 0;
+    let sends = 0;
+    context.performance = performance;
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.window.orkas = {
+      async invoke(channel: string, payload: any) {
+        invocations.push({ channel, payload });
+        return { ok: true, discarded: true };
+      },
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-input') return input;
+      if (id === 'new-chat-send-btn') return button;
+      return null;
+    };
+    context.ensureModelConfigured = () => true;
+    context._getQuotes = () => [{ id: 'quote-1' }];
+    context._referenceSnapshotsForQuotes = () => [];
+    context.getChatUseSelections = () => [{ kind: 'skill', id: 'review' }];
+    context.consumeChatUseSelections = () => { consumedSelections += 1; return []; };
+    context._recipientSnapshotForSend = () => ({ kind: 'commander' });
+    context._normaliseRecipientSnapshot = (value: any) => value;
+    context.transformWithChatUse = (value: string) => value;
+    context.transformChatUseTokens = (value: string) => value;
+    context.applyRecipientPrefix = (value: string) => value;
+    context._autoTitle = (value: string) => value;
+    vm.runInContext(`_chatAttachments.set('main_chat', [
+      { name: 'brief.pdf', status: 'ready' },
+      { name: 'notes.md', status: 'ready' },
+    ])`, context);
+    context._chatAttachClear = () => { clearedAttachments += 1; };
+    context._clearQuotes = () => { clearedQuotes += 1; };
+    context.apiFetch = async (url: string) => ({
+      json: async () => {
+        if (url.endsWith('/main_chat/attachments')) {
+          return {
+            ok: true,
+            items: [
+              { name: 'brief.pdf', kind: 'pdf', bytes: 10 },
+              { name: 'notes.md', kind: 'text', bytes: 10 },
+            ],
+          };
+        }
+        if (url.endsWith('/create')) {
+          return { ok: true, conversation: { conversation_id: 'c_failed_adopt', title: 'New task' } };
+        }
+        return {
+          ok: true,
+          items: [{ sourceName: 'brief.pdf', targetName: 'brief.pdf' }],
+        };
+      },
+    });
+    context.uiAlert = async (message: string) => { alerts.push(message); };
+    context.renderConversationList = () => { renderedConversations += 1; };
+    context.sendInCurrentConversation = async () => { sends += 1; };
+
+    expect(vm.runInContext("_chatAttachList('main_chat').length", context)).toBe(2);
+    await context.handleNewChatSubmit();
+
+    expect(invocations).toEqual([{
+      channel: 'conversations.discardEmpty',
+      payload: { cid: 'c_failed_adopt' },
+    }]);
+    expect(input.value).toBe('Review both files');
+    expect(button.disabled).toBe(false);
+    expect(context.conversations).toEqual([]);
+    expect(clearedAttachments).toBe(0);
+    expect(clearedQuotes).toBe(0);
+    expect(consumedSelections).toBe(0);
+    expect(renderedConversations).toBe(0);
+    expect(sends).toBe(0);
+    expect(alerts).toEqual(['chat.attach_adopt_failed']);
+  });
+
+  it('falls back to commander without toast when the scenario agent is missing', async () => {
+    const context = loadConversationRenderer();
+    const toasts: any[] = [];
+    const clicks: any[] = [];
+    const events: any[] = [];
+    const classChanges: string[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      focused: false,
+      selection: [0, 0],
+      dataset: {},
+      focus() { this.focused = true; },
+      setSelectionRange(start: number, end: number) { this.selection = [start, end]; },
+      dispatchEvent() {},
+    };
+    const chip = {
+      dataset: { scenario: 'ui_design' },
+      classList: {
+        add(name: string) { classChanges.push(`add:${name}`); },
+        remove(name: string) { classChanges.push(`remove:${name}`); },
+      },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      dataset: {},
+      querySelectorAll: () => [chip],
+    };
+
+    context._agentsCache = [];
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.loadAgents = async () => [];
+    context._setQuickStartItems([{ id: 'ui_design', agent_id: 'missing-ui-agent' }]);
+    context.uiToast = (...args: any[]) => toasts.push(args);
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    expect(clickHandler).toBeTruthy();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({ kind: 'commander' });
+    expect(input.value).toContain('a personal finance app');
+    expect(input.focused).toBe(true);
+    expect(input.value.slice(input.selection[0], input.selection[1])).toBe('a personal finance app');
+    expect(classChanges).toEqual([]);
+    expect(toasts).toHaveLength(0);
+    expect(input.dataset).toMatchObject({
+      commanderEntryPoint: 'quick_start',
+      commanderResourceId: 'ui_design',
+      commanderRecipientType: 'commander',
+    });
+    expect(input.dataset.commanderQuickStartPlaceholder).toBeUndefined();
+  });
+
+  it('binds ecommerce research to the default-installed ECommerceResearcher', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      dataset: {},
+      focus() {},
+      setSelectionRange() {},
+      dispatchEvent() {},
+    };
+    const card = {
+      dataset: { scenario: 'ecommerce' },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      querySelectorAll: () => [card],
+    };
+
+    context._agentsCache = [{
+      agent_id: '5a1d43c2f28a',
+      name: 'ECommerceResearcher',
+      enabled: true,
+    }];
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({
+      kind: 'agent',
+      id: '5a1d43c2f28a',
+      name: 'ECommerceResearcher',
+    });
+    expect(input.value).toContain('Assess whether pet water fountains');
+  });
+
+  it('binds software development to the default-installed ProductDeveloper', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      dataset: {},
+      focus() {},
+      setSelectionRange() {},
+      dispatchEvent() {},
+    };
+    const card = {
+      dataset: { scenario: 'rnd' },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      querySelectorAll: () => [card],
+    };
+
+    context._agentsCache = [{
+      agent_id: 'a316881746f9',
+      name: 'ProductDeveloper',
+      enabled: true,
+    }];
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({
+      kind: 'agent',
+      id: 'a316881746f9',
+      name: 'ProductDeveloper',
+    });
+    expect(input.value).toContain('Build');
+  });
+});
+
+describe('polled history recovery identity', () => {
+  function recoveryHarness() {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    const container = {};
+    context.document.getElementById = (id: string) => id === 'chat-history' ? container : null;
+    context._refreshGroupMembers = async () => {};
+    context._removeSupersededInterruptionBubbles = () => 0;
+    context._collapseSupersededInterruptionRecords = (rows: any[]) => rows;
+    context._isVisibleGroupHistoryRecord = () => true;
+    context._findRenderedGroupMessage = () => null;
+    context._claimRenderNodeForMessage = () => null;
+    context._adoptFallbackRowForMessage = () => null;
+    context._scheduleConversationInfoFileRefresh = () => {};
+    context._syncFailedFromHistory = () => {};
+    context.appendChatMessage = vi.fn(() => ({ dataset: {} }));
+    context._finalizeActorPlaceholder = vi.fn();
+    context._groupMsgToLegacy = (value: any) => value;
+    return context;
+  }
+
+  it('settles a keyed live row once when its durable reply arrives through polling', async () => {
+    const context = recoveryHarness();
+    const row = { dataset: { renderKey: 's:turn-a:0', placeholder: '1', finalized: '0' }, parentElement: {} };
+    const record = { id: 'reply-a', from: 'commander', turn_id: 'turn-a', seg: 0, text: 'Done' };
+    context._findRenderedGroupMessage = () => row;
+    context._claimRenderNodeForMessage = () => {
+      if (row.dataset.finalized === '1') return null;
+      row.dataset.finalized = '1';
+      return row;
+    };
+    context._finalizeActorPlaceholder = vi.fn((node: any, gm: any) => { node.dataset.msgId = gm.id; });
+    context._messageRecordHasMountedSidecars = () => true;
+    expect(await context._recoverPolledVisibleMessages('c1', [record])).toBe(true);
+    expect(await context._recoverPolledVisibleMessages('c1', [record])).toBe(false);
+    expect(context._finalizeActorPlaceholder).toHaveBeenCalledTimes(1);
+    expect(context.appendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it('defers an old interruption while the same actor has a newer live turn', async () => {
+    const context = recoveryHarness();
+    vm.runInContext("_latestActiveTurns.set('c1', [{ actor: 'commander', turn_id: 'new-turn' }])", context);
+    const record = { id: 'old-interruption', from: 'commander', turn_id: 'old-turn', system_kind: 'reply_interrupted', text: '' };
+    expect(await context._recoverPolledVisibleMessages('c1', [record])).toBe(false);
+    expect(context.appendChatMessage).not.toHaveBeenCalled();
+    vm.runInContext("_latestActiveTurns.set('c1', [])", context);
+    expect(await context._recoverPolledVisibleMessages('c1', [record])).toBe(true);
+    expect(context.appendChatMessage).toHaveBeenCalledOnce();
+  });
+
+  it('repairs missing reply sidecars without appending a duplicate message', async () => {
+    const context = recoveryHarness();
+    context._findRenderedGroupMessage = () => ({ dataset: { msgId: 'reply-with-files' } });
+    context._messageRecordHasMountedSidecars = () => false;
+    context.loadConversationHistory = vi.fn();
+    expect(await context._recoverPolledVisibleMessages('c1', [{ id: 'reply-with-files', from: 'commander', produced: [{ path: 'report.pdf' }] }])).toBe(true);
+    expect(context.loadConversationHistory).toHaveBeenCalledWith('c1', { preserveScroll: true });
+    expect(context.appendChatMessage).not.toHaveBeenCalled();
+  });
+});
+
+// User-approved removal: diagnostics need state, not incidental words.
+describe('CLI prose cannot establish runtime state', () => {
+  it.each([
+    'Authentication successful',
+    'Credentials loaded successfully',
+    'Git authentication failed',
+    'Rate limits configured successfully',
+    'Connection recovered example',
+  ])('does not translate ordinary logs into an app diagnosis: %s', (message) => {
+    const context = loadConversationRenderer();
+    for (const data of [
+      { type: 'log', level: 'info', message },
+      { type: 'stderr-line', line: message },
+      { type: 'raw-line', line: message },
+    ]) expect(context._formatEventLine({ stream: 'cli', data })).toBeNull();
+  });
+
+  it('keeps a retry reason unknown when only prose names a failure class', () => {
+    const context = loadConversationRenderer();
+    for (const error of ['network configured', 'rate limit configured', 'not overloaded']) {
+      expect(context._formatCliRetryReason({ error })).toBe('Temporary model service error');
+    }
+    expect(context._formatCliRetryReason({ errorStatus: 429, error: 'not overloaded' }))
+      .toBe('Request rate limited');
+    expect(context._formatCliRetryReason({ error_status: 503 }))
+      .toBe('Model service is temporarily unavailable');
+  });
+});
+
+
+describe('authoritative tool execution states', () => {
+  it('distinguishes a proposed memory write from execution and a skipped receipt on replay', () => {
+    const context = loadConversationRenderer();
+    const display = context._createProcessDisplayContext();
+    const data = { id: 'memory', name: 'cross_session_memory', arguments: { action: 'add', content: 'private fact' } };
+    const proposed = { stream: 'tool', data: { ...data, phase: 'start', execution_state: 'proposed' } };
+    const running = { stream: 'tool', data: { ...data, phase: 'progress', execution_state: 'running' } };
+    const skipped = { stream: 'tool', data: { ...data, phase: 'end', execution_state: 'skipped', isError: true, result_preview: 'Tool not executed' } };
+    expect(context._formatEventLine(proposed, display)).toContain('Preparing:');
+    expect(context._formatEventLine(running, display)).not.toContain('Preparing:');
+    const terminal = context._formatEventLine(skipped, display);
+    expect(terminal).toContain('Not executed');
+    expect(terminal).not.toContain('Failed');
+    expect(terminal).not.toContain('private fact');
+    expect(context._formatEventLine(skipped, display)).toBe(terminal);
+  });
+});
+
+describe('streaming repaint lifecycle', () => {
+  function setup() {
+    const context = loadConversationRenderer();
+    const final: any = { style: { display: 'none' }, innerHTML: '',
+      querySelector: () => final.innerHTML.includes('markdown-body') ? {} : null };
+    const msg: any = { dataset: {}, isConnected: true,
+      querySelector: (selector: string) => selector === '[data-role="final"]' ? final : null };
+    context.renderMarkdownFull = (text: string) => `<p>${escapeHtml(text)}</p>`;
+    context._attachAssistantActions = () => {};
+    context._attachFailedAssistantActions = () => {};
+    context._attachInterruptedAssistantActions = () => {};
+    return { context, final, msg };
+  }
+
+  it('shows first text promptly and eventually paints the last delta without another event', () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      context._streamingAppendFinalDelta(msg, 'First', 'final_answer');
+      vi.advanceTimersByTime(1);
+      expect(final.innerHTML).toContain('First');
+      for (const piece of [' second', ' third', ' last']) {
+        context._streamingAppendFinalDelta(msg, piece, 'final_answer');
+        vi.advanceTimersByTime(10);
+      }
+      // Reading the first text must not see it blanked while updates collect.
+      expect(final.innerHTML).toContain('First');
+      vi.advanceTimersByTime(100);
+      expect(final.innerHTML).toContain('First second third last');
+      expect(msg.dataset.finalText).toBe('First second third last');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each(['final', 'error', 'stop'])('cancels trailing paints before %s, including the timer fallback', (terminal) => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      delete context.requestAnimationFrame;
+      context._streamingAppendFinalDelta(msg, 'Partial', 'final_answer');
+      vi.advanceTimersByTime(1);
+      context._streamingAppendFinalDelta(msg, ' latest', 'final_answer');
+      if (terminal === 'final') context._streamingSetFinal(msg, 'Canonical answer');
+      if (terminal === 'error') context._streamingSetError(msg, 'failure');
+      if (terminal === 'stop') context._streamingMarkAborted(msg);
+      const terminalHtml = final.innerHTML;
+      if (terminal === 'final') expect(terminalHtml).toContain('Canonical answer');
+      if (terminal === 'error') {
+        expect(terminalHtml).toContain('Partial latest');
+        expect(terminalHtml).toContain('msg-error');
+      }
+      if (terminal === 'stop') expect(terminalHtml).toContain('Interrupted');
+      vi.advanceTimersByTime(1000);
+      expect(final.innerHTML).toBe(terminalHtml);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('does not let an uncancellable old frame paint into a recovered row', () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      const frames: Array<() => void> = [];
+      context.requestAnimationFrame = (fn: () => void) => { frames.push(fn); return frames.length; };
+      context._streamingAppendFinalDelta(msg, 'Old task', 'final_answer');
+      context._cancelPendingStreamRaf(msg);
+      msg.dataset.streamBuf = '';
+      context._streamingAppendFinalDelta(msg, 'Recovered task', 'final_answer');
+      frames[0]();
+      expect(final.innerHTML).toBe('');
+      frames[1]();
+      expect(final.innerHTML).toContain('Recovered task');
+      context._streamingAppendFinalDelta(msg, ' detached', 'final_answer');
+      msg.isConnected = false;
+      vi.advanceTimersByTime(100);
+      frames[2]();
+      expect(final.innerHTML).not.toContain('detached');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('lets an identical pending formula finish instead of invalidating its result', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      let finish!: (html: string) => void;
+      context.typesetMathHtml = () => new Promise(resolve => { finish = resolve; });
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      finish('<div class="markdown-body"><mjx-container>a+b</mjx-container></div>');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(final.innerHTML).toContain('<mjx-container>a+b</mjx-container>');
+      expect(msg.dataset.streamPaintedDisplay).toBe('\\(a+b\\)');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('invalidates superseded math even when the newest display matches the visible content', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      final.innerHTML = '<div class="markdown-body"><mjx-container>a+b</mjx-container></div>';
+      final.querySelector = (selector: string) => selector === '.markdown-body' ? {} : null;
+      msg.dataset.streamPaintedDisplay = '\\(a+b\\)';
+      let finish!: (html: string) => void;
+      context.typesetMathHtml = () => new Promise(resolve => { finish = resolve; });
+      context._paintStreamingFinalMarkdown(msg, final, '\\(obsolete\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      finish('<mjx-container>obsolete</mjx-container>');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(final.innerHTML).toContain('<mjx-container>a+b</mjx-container>');
+      expect(final.innerHTML).not.toContain('obsolete');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('stops offscreen formula work after the user leaves the message', async () => {
+    vi.useFakeTimers();
+    try {
+      const { context, msg, final } = setup();
+      final.isConnected = true;
+      let finish!: (html: string) => void;
+      let typesets = 0;
+      context.typesetMathHtml = () => {
+        typesets++;
+        return typesets === 1 ? new Promise(resolve => { finish = resolve; })
+          : Promise.resolve('<mjx-container>a+b</mjx-container>');
+      };
+      context._paintStreamingFinalMarkdown(msg, final, '\\(a+b\\)');
+      await vi.advanceTimersByTimeAsync(50);
+      msg.isConnected = false;
+      final.isConnected = false;
+      finish('<mjx-container>a+b</mjx-container>');
+      await vi.advanceTimersByTimeAsync(500);
+      expect(final.innerHTML).toBe('');
+      // Detached tasks must not spend renderer time repeatedly typesetting
+      // a result that can no longer be displayed.
+      expect(typesets).toBe(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+});

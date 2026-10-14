@@ -1,0 +1,1766 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+
+import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
+import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
+import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
+
+const UID = 'u-attach-001';
+const CID = 'conv-123';
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=',
+  'base64',
+);
+const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
+
+let tmpDir: string;
+let prevWs: string | undefined;
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-chatattach-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.resetModules();
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(UID);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function attDir(): string {
+  return path.join(tmpDir, UID, 'cloud', 'chat_attachments', CID);
+}
+
+function cloudAttDir(cid: string): string {
+  return path.join(tmpDir, UID, 'cloud', 'chat_attachments', cid);
+}
+
+function draftAttDir(cid: string): string {
+  return path.join(tmpDir, UID, 'local', 'chat_attachment_drafts', cid);
+}
+
+async function loadMod() {
+  return import('../../../src/main/features/chat_attachments');
+}
+
+async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
+  const { Jimp } = await import('jimp' as any);
+  const img: any = new Jimp({ width: 200, height: 200, color });
+  return await img.getBuffer('image/png');
+}
+
+describe('chat_attachments › legacy spreadsheet input', () => {
+  it('uploads XLS unchanged, exposes it to the model, and lazily reads both sheets', async () => {
+    const bytes = fs.readFileSync(path.join(__dirname, '../../fixtures/xls/inventory.xls'));
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'inventory.XLS', bytes)).toMatchObject({ ok: true, info: { kind: 'spreadsheet' } });
+    const manifest = await m.buildAttachmentManifest(UID, CID, ['inventory.XLS']);
+    expect(manifest.manifest).toContain('kind="spreadsheet"');
+    expect(manifest.manifest).not.toContain('model_readable="false"');
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const file = path.join(attDir(), 'inventory.XLS');
+    expect(indexer.getCachedMeta(UID, file)).toBeNull();
+    await indexer.statFile(UID, file);
+    const result = await indexer.readRange(UID, file);
+    expect(result.content).toContain('冷却泵');
+    expect(result.content).toContain('Inventory sentinel 8384');
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect((await indexer.readRange(UID, file)).content).toBe(result.content);
+  });
+});
+
+describe('chat_attachments › common text inputs', () => {
+  it.each(['csv', 'tsv', 'html', 'xml', 'jsonl', 'ndjson', 'toml', 'py', 'js', 'css', 'rst', 'tex', 'srt', 'vtt'])(
+    'imports and reads %s as literal UTF-8 without modifying the source', async (ext) => {
+      const m = await loadMod();
+      const name = `input.${ext}`;
+      const text = '<b>中文 & literal</b>\n001,"a,b",0\n';
+      const source = path.join(tmpDir, name);
+      fs.writeFileSync(source, text);
+      expect(await m.importAttachmentFromPath(UID, CID, source)).toMatchObject({ ok: true, info: { kind: 'text' } });
+      const indexer = await import('../../../src/main/features/file_indexer');
+      expect((await indexer.readRange(UID, path.join(attDir(), name))).content).toBe(text);
+      expect(fs.readFileSync(source, 'utf8')).toBe(text);
+      expect(m.resolveAttachmentAbsPath(UID, CID, name).ok).toBe(true);
+    },
+  );
+  it('rejects a binary file disguised as a newly supported text format without storing it', async () => {
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'input.jsonl', Buffer.from([0xff, 0xfe, 0]))).toMatchObject({ ok: false });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+  });
+});
+
+describe('chat_attachments › diagnostic privacy', () => {
+  async function captureDiagnostics(): Promise<unknown[][]> {
+    const logger = await import('../../../src/main/logger');
+    const original = logger.createLogger;
+    const records: unknown[][] = [];
+    vi.spyOn(logger, 'createLogger').mockImplementation((scope) => {
+      if (scope !== 'chat_attachments') return original(scope);
+      const capture = (message: string, ...args: unknown[]) => {
+        records.push([message, ...args].map((value) => logger.redact(value)));
+      };
+      return { info: capture, warn: capture, error: capture, debug: capture };
+    });
+    return records;
+  }
+
+  it('keeps upload, import and duplicate filenames out of diagnostics while preserving files', async () => {
+    const records = await captureDiagnostics();
+    const m = await loadMod();
+    const uploadedName = 'Confidential merger notes.txt';
+    const importedName = 'Private diligence report.md';
+    const source = path.join(tmpDir, importedName);
+    fs.writeFileSync(source, 'imported source');
+    expect(await m.uploadAttachment(UID, CID, uploadedName, Buffer.from('uploaded source')))
+      .toMatchObject({ ok: true, info: { name: uploadedName } });
+    expect(await m.uploadAttachment(UID, CID, 'copy.txt', Buffer.from('uploaded source')))
+      .toMatchObject({ ok: true, reused: true, info: { name: uploadedName } });
+    expect(await m.importAttachmentFromPath(UID, CID, source))
+      .toMatchObject({ ok: true, info: { name: importedName } });
+    expect(await m.importAttachmentFromPath(UID, CID, source))
+      .toMatchObject({ ok: true, reused: true, info: { name: importedName } });
+    expect(fs.readFileSync(path.join(attDir(), uploadedName), 'utf8')).toBe('uploaded source');
+    expect(fs.readFileSync(path.join(attDir(), importedName), 'utf8')).toBe('imported source');
+    expect(fs.readFileSync(source, 'utf8')).toBe('imported source');
+    expect(records).toHaveLength(4);
+    for (const privateValue of [uploadedName, importedName, UID, CID, tmpDir]) {
+      expect(JSON.stringify(records)).not.toContain(privateValue);
+    }
+  });
+
+  it('keeps metadata and cache failure diagnostics private while leaving attachments usable', async () => {
+    const records = await captureDiagnostics();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const privateError = 'Confidential contract excerpt';
+    vi.spyOn(indexer, 'statFile').mockRejectedValue(new Error(privateError));
+    vi.spyOn(indexer, 'invalidateFileCache').mockImplementation(() => { throw new Error(privateError); });
+    const m = await loadMod();
+    const name = 'Private contract.txt';
+    expect((await m.uploadAttachment(UID, CID, name, Buffer.from('retained bytes'))).ok).toBe(true);
+    records.length = 0;
+    const manifest = await m.buildAttachmentManifest(UID, CID, [name]);
+    expect(manifest.skipped).toEqual([]);
+    expect(manifest.manifest).toContain(name);
+    expect(manifest.manifest).not.toContain('total_chars=');
+    expect(await m.buildConversationAttachmentIndex(UID, CID)).toContain(name);
+    expect(fs.readFileSync(path.join(attDir(), name), 'utf8')).toBe('retained bytes');
+    expect(m.deleteAttachment(UID, CID, name)).toEqual({ ok: true });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    expect(records).toHaveLength(3);
+    for (const privateValue of [name, privateError, UID, CID, tmpDir]) {
+      expect(JSON.stringify(records)).not.toContain(privateValue);
+    }
+  });
+});
+
+describe('chat_attachments › uploadAttachment', () => {
+  it('accepts and stores a text file without any sibling cache', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'hello.txt', Buffer.from('hi there', 'utf8'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.name).toBe('hello.txt');
+    expect(r.info.kind).toBe('text');
+    expect(fs.existsSync(path.join(attDir(), 'hello.txt'))).toBe(true);
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('stores commander draft attachments in local-only storage', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, 'main_chat', 'draft.txt', Buffer.from('hi', 'utf8'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(fs.existsSync(path.join(draftAttDir('main_chat'), 'draft.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir('main_chat'), 'draft.txt'))).toBe(false);
+    expect(m.listPendingAttachments(UID, 'main_chat').map((i) => i.name)).toEqual(['draft.txt']);
+  });
+
+  it('caps distinct pending attachments per message and still reuses duplicates', async () => {
+    const m = await loadMod();
+    for (let i = 0; i < m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE; i++) {
+      const uploaded = await m.uploadAttachment(
+        UID,
+        CID,
+        `file-${i}.txt`,
+        Buffer.from(`body-${i}`, 'utf8'),
+      );
+      expect(uploaded.ok).toBe(true);
+    }
+
+    const overflow = await m.uploadAttachment(
+      UID,
+      CID,
+      'overflow.txt',
+      Buffer.from('overflow', 'utf8'),
+    );
+    expect(overflow).toMatchObject({ ok: false });
+    if (!overflow.ok) expect(overflow.error).toMatch(/20/);
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
+
+    const duplicate = await m.uploadAttachment(
+      UID,
+      CID,
+      'duplicate-name.txt',
+      Buffer.from('body-0', 'utf8'),
+    );
+    expect(duplicate).toMatchObject({ ok: true, reused: true });
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
+
+    const importedSource = path.join(tmpDir, 'overflow-import.txt');
+    fs.writeFileSync(importedSource, 'unique imported overflow', 'utf8');
+    const importedOverflow = await m.importAttachmentFromPath(UID, CID, importedSource);
+    expect(importedOverflow).toMatchObject({ ok: false });
+    if (!importedOverflow.ok) expect(importedOverflow.error).toMatch(/20/);
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
+  });
+
+  it('stores PDF without pre-extracting (no sibling cache files)', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'report.pdf', makeMinimalPdf(['Page One', 'Page Two']));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.kind).toBe('pdf');
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('stores docx without pre-extracting', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'notes.docx', makeMinimalDocx({ heading: 'Title', paragraphs: ['Body.'] }));
+    expect(r.ok).toBe(true);
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('stores modern Office files without pre-extracting', async () => {
+    const m = await loadMod();
+    const docm = await m.uploadAttachment(UID, CID, 'macro.docm', makeMinimalDocx({ heading: 'Macro', paragraphs: ['Docm body.'] }));
+    const sheet = await m.uploadAttachment(UID, CID, 'scores.xlsx', makeMinimalXlsx());
+    const deck = await m.uploadAttachment(UID, CID, 'slides.pptx', makeMinimalPptx());
+    const macroSheet = await m.uploadAttachment(UID, CID, 'scores.xlsm', makeMinimalXlsx({ rows: [['Kind'], ['Macro sheet']] }));
+    const macroDeck = await m.uploadAttachment(UID, CID, 'slides.pptm', makeMinimalPptx({ slides: [['Macro deck']] }));
+
+    expect(docm.ok && sheet.ok && deck.ok && macroSheet.ok && macroDeck.ok).toBe(true);
+    if (!(docm.ok && sheet.ok && deck.ok && macroSheet.ok && macroDeck.ok)) return;
+    expect(docm.info.kind).toBe('docx');
+    expect(sheet.info.kind).toBe('spreadsheet');
+    expect(deck.info.kind).toBe('presentation');
+    expect(macroSheet.info.kind).toBe('spreadsheet');
+    expect(macroDeck.info.kind).toBe('presentation');
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('stores ZIP archives as opaque path-only attachments', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'skills.zip', Buffer.from('PK\u0003\u0004fixture'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.kind).toBe('archive');
+    expect(r.info.bytes).toBeGreaterThan(0);
+  });
+
+  it('rejects a Skill ZIP above the native importer limit without leaving a file', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(
+      UID,
+      CID,
+      'oversized-skills.zip',
+      Buffer.alloc(8 * 1024 * 1024 + 1, 0x61),
+    );
+
+    expect(r.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'oversized-skills.zip'))).toBe(false);
+  });
+
+  it('rejects legacy Word and PowerPoint before they enter the attachment pool', async () => {
+    const m = await loadMod();
+    const doc = await m.uploadAttachment(UID, CID, 'old.doc', Buffer.from('legacy'));
+    const ppt = await m.uploadAttachment(UID, CID, 'old.ppt', Buffer.from('legacy'));
+
+    expect(doc.ok).toBe(false);
+    expect(ppt.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'old.doc'))).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'old.ppt'))).toBe(false);
+  });
+
+  it('stores image without any sibling cache (preview generated on read)', async () => {
+    const m = await loadMod();
+    const png = await makePng();
+    const r = await m.uploadAttachment(UID, CID, 'chart.png', png);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.kind).toBe('image');
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('accepts a video file without preprocessing and no sibling caches', async () => {
+    const m = await loadMod();
+    // Bytes don't need to be a real mp4 — uploadAttachment doesn't decode
+    // videos at all (no transcoding, no poster frame). Any buffer under the
+    // size cap should land on disk as-is.
+    const fakeMp4 = Buffer.from('not-really-an-mp4-but-thats-fine');
+    const r = await m.uploadAttachment(UID, CID, 'clip.mp4', fakeMp4);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.kind).toBe('video');
+    expect(r.info.bytes).toBe(fakeMp4.length);
+    // Video path must NOT generate extract/preview siblings — those are
+    // for text/pdf/docx/image. The only dotfile allowed is .cache_version.
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings.filter((n) => n.startsWith('.clip.mp4.'))).toEqual([]);
+  });
+
+  it('recognises every whitelisted video extension', async () => {
+    const m = await loadMod();
+    const exts = ['.mp4', '.webm', '.mov', '.m4v', '.ogv'];
+    for (const ext of exts) {
+      const name = `v${ext.replace('.', '_')}${ext}`;
+      const r = await m.uploadAttachment(UID, CID, name, Buffer.from(`video-${ext}`));
+      expect(r.ok, `expected ${ext} to be accepted`).toBe(true);
+      if (r.ok) {
+        expect(r.info.name).toBe(name);
+        expect(r.info.kind).toBe('video');
+      }
+    }
+  });
+
+  it('rejects videos exceeding the 200MB cap', async () => {
+    const m = await loadMod();
+    // Allocate just over the cap — Buffer.alloc is cheap (sparse zero bytes).
+    const oversized = Buffer.alloc(200 * 1024 * 1024 + 1);
+    const r = await m.uploadAttachment(UID, CID, 'huge.mp4', oversized);
+    expect(r.ok).toBe(false);
+    // Source file must not land on disk after a rejected upload.
+    expect(fs.existsSync(path.join(attDir(), 'huge.mp4'))).toBe(false);
+  });
+
+  it.each([
+    { label: 'invalid leading bytes', bytes: [0xFF, 0xFE] },
+    { label: 'truncated four-byte character', bytes: [0xF0, 0x9F, 0x92] },
+    { label: 'interrupted four-byte character', bytes: [0xF0, 0x90, 0x80, 0x41] },
+    { label: 'truncated three-byte character', bytes: [0xE2, 0x82] },
+    { label: 'surrogate encoding', bytes: [0xED, 0xA0, 0x80] },
+  ])('rejects non-UTF-8 content for text types: $label', async ({ bytes }) => {
+    const m = await loadMod();
+    const buffer = Buffer.from(bytes);
+    const r = await m.uploadAttachment(UID, CID, 'bad.txt', buffer);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.toLowerCase()).toContain('utf-8');
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    const source = path.join(tmpDir, 'bad.txt');
+    fs.writeFileSync(source, buffer);
+    expect((await m.importAttachmentFromPath(UID, CID, source)).ok).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(buffer);
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+  });
+
+  it('preserves valid Unicode and an authored replacement character byte for byte', async () => {
+    const m = await loadMod();
+    const buffer = Buffer.from('\uFEFF中文 📝 \uFFFD');
+    expect((await m.uploadAttachment(UID, CID, 'unicode.txt', buffer)).ok).toBe(true);
+    expect(fs.readFileSync(path.join(attDir(), 'unicode.txt'))).toEqual(buffer);
+  });
+
+  it('rejects unknown extensions', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'malware.exe', Buffer.from('x'));
+    expect(r.ok).toBe(false);
+  });
+
+  it('keeps local-display SVG out of conversation attachment uploads', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(
+      UID,
+      CID,
+      'contact-sheet.svg',
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
+    );
+    expect(r.ok).toBe(false);
+    expect(m.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'contact-sheet.svg'))).toBe(false);
+  });
+
+  it('renames on name collision rather than overwrite', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'dup.txt', Buffer.from('v1'));
+    const r2 = await m.uploadAttachment(UID, CID, 'dup.txt', Buffer.from('v2'));
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r1.info.name).toBe('dup.txt');
+    expect(r2.info.name).not.toBe('dup.txt');
+    expect(r2.info.name.endsWith('.txt')).toBe(true);
+  });
+
+  it('preserves every file across three same-name uploads within one timestamp', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-24T11:00:00.000Z'));
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('first'));
+    const r2 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('second'));
+    const r3 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('third'));
+
+    expect(r1.ok && r2.ok && r3.ok).toBe(true);
+    if (!(r1.ok && r2.ok && r3.ok)) return;
+    expect(new Set([r1.info.name, r2.info.name, r3.info.name]).size).toBe(3);
+    const storedBodies = fs.readdirSync(attDir())
+      .filter((name) => !name.startsWith('.'))
+      .map((name) => fs.readFileSync(path.join(attDir(), name), 'utf8'))
+      .sort();
+    expect(storedBodies).toEqual(['first', 'second', 'third']);
+  });
+
+  it('reuses an existing attachment when upload content hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'first.txt', Buffer.from('same bytes'));
+    const r2 = await m.uploadAttachment(UID, CID, 'second.txt', Buffer.from('same bytes'));
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe(r1.info.name);
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['first.txt']);
+  });
+
+  it('keeps a re-selected copy pending when its bytes match a previously sent attachment', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('send these bytes again');
+    const sent = await m.uploadAttachment(UID, CID, 'sent.txt', body);
+    expect(sent.ok).toBe(true);
+    if (!sent.ok) return;
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${JSON.stringify({ role: 'user', content: 'first send', attachments: [sent.info.name] })}\n`,
+    );
+
+    const selectedAgain = await m.uploadAttachment(UID, CID, 'selected-again.txt', body);
+
+    expect(selectedAgain.ok).toBe(true);
+    if (!selectedAgain.ok) return;
+    expect(selectedAgain.info.name).not.toBe(sent.info.name);
+    expect(m.listPendingAttachments(UID, CID).map((item) => item.name))
+      .toEqual([selectedAgain.info.name]);
+  });
+
+  it('reuses a single attachment when matching uploads arrive concurrently', async () => {
+    const m = await loadMod();
+    const results = await Promise.all([
+      m.uploadAttachment(UID, CID, 'parallel-a.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-b.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-c.txt', Buffer.from('same parallel bytes')),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(2);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['parallel-a.txt']);
+  });
+
+  it('imports a workspace file by path into the attachment pool', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'workspace-note.md');
+    fs.writeFileSync(source, '# hello\n', 'utf8');
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.name).toBe('workspace-note.md');
+    expect(r.info.kind).toBe('text');
+    expect(fs.readFileSync(path.join(attDir(), 'workspace-note.md'), 'utf8')).toBe('# hello\n');
+  });
+
+  it('returns the content hash for a path import so its composer chip dedupes like a byte upload', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('hash me\n');
+    const source = path.join(tmpDir, 'hashed.txt');
+    fs.writeFileSync(source, body);
+    const expected = crypto.createHash('sha256').update(body).digest('hex');
+
+    const first = await m.importAttachmentFromPath(UID, CID, source);
+    const again = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(first).toMatchObject({ ok: true, sha256: expected });
+    expect(again).toMatchObject({ ok: true, reused: true, sha256: expected });
+    // A byte upload of the same content is the same pending attachment.
+    expect(await m.uploadAttachment(UID, CID, 'copy.txt', body)).toMatchObject({
+      ok: true, reused: true, info: expect.objectContaining({ name: 'hashed.txt' }),
+    });
+    expect(m.listAttachments(UID, CID).map((item) => item.name)).toEqual(['hashed.txt']);
+  });
+
+  it('applies the same per-kind cap and reason on the path route as on the byte route', async () => {
+    const m = await loadMod();
+    const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x61);
+    const source = path.join(tmpDir, 'oversized.zip');
+    fs.writeFileSync(source, oversized);
+
+    const viaBytes = await m.uploadAttachment(UID, CID, 'oversized.zip', oversized);
+    const viaPath = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(viaBytes.ok).toBe(false);
+    expect(viaPath.ok).toBe(false);
+    if (viaBytes.ok || viaPath.ok) return;
+    expect(viaPath.error).toBe(viaBytes.error);
+    expect(viaPath.error).toContain('8');
+    expect(fs.existsSync(path.join(attDir(), 'oversized.zip'))).toBe(false);
+  });
+
+  it('imports text files above the legacy 5 MiB cap by path', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'large-events.csv');
+    const bytes = 6 * 1024 * 1024;
+    fs.writeFileSync(source, Buffer.alloc(bytes, 0x61));
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info).toMatchObject({
+      name: 'large-events.csv',
+      kind: 'text',
+      bytes,
+    });
+    expect(fs.statSync(path.join(attDir(), 'large-events.csv')).size).toBe(bytes);
+  });
+
+  it('keeps the text attachment boundary at 200 MiB', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'too-large.csv');
+    fs.closeSync(fs.openSync(source, 'w'));
+    fs.truncateSync(source, 200 * 1024 * 1024 + 1);
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain('200');
+    expect(fs.existsSync(path.join(attDir(), 'too-large.csv'))).toBe(false);
+  });
+
+  it('reuses an existing attachment when imported file hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'kept.md', Buffer.from('same body'));
+    const source = path.join(tmpDir, 'copy.md');
+    fs.writeFileSync(source, 'same body', 'utf8');
+
+    const r2 = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe('kept.md');
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['kept.md']);
+  });
+
+  it('keeps an imported copy pending when it matches a previously sent attachment', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('workspace file selected again');
+    const sent = await m.uploadAttachment(UID, CID, 'sent.md', body);
+    expect(sent.ok).toBe(true);
+    if (!sent.ok) return;
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${JSON.stringify({ role: 'user', content: 'first send', attachments: [sent.info.name] })}\n`,
+    );
+    const source = path.join(tmpDir, 'workspace-copy.md');
+    fs.writeFileSync(source, body);
+
+    const selectedAgain = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(selectedAgain.ok).toBe(true);
+    if (!selectedAgain.ok) return;
+    expect(selectedAgain.info.name).not.toBe(sent.info.name);
+    expect(m.listPendingAttachments(UID, CID).map((item) => item.name))
+      .toEqual([selectedAgain.info.name]);
+  });
+
+  it('reuses a single attachment when matching imports arrive concurrently', async () => {
+    const m = await loadMod();
+    const sourceA = path.join(tmpDir, 'source-a.md');
+    const sourceB = path.join(tmpDir, 'source-b.md');
+    fs.writeFileSync(sourceA, 'same imported body', 'utf8');
+    fs.writeFileSync(sourceB, 'same imported body', 'utf8');
+
+    const results = await Promise.all([
+      m.importAttachmentFromPath(UID, CID, sourceA),
+      m.importAttachmentFromPath(UID, CID, sourceB),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(1);
+    const canonicalName = results[0].info.name;
+    expect(['source-a.md', 'source-b.md']).toContain(canonicalName);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual([canonicalName]);
+    expect(fs.readFileSync(path.join(attDir(), canonicalName), 'utf8')).toBe('same imported body');
+  });
+
+  it('validates text encoding when importing by path', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'bad.txt');
+    fs.writeFileSync(source, Buffer.from([0xFF, 0xFE]));
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'bad.txt'))).toBe(false);
+  });
+
+  it('detects invalid UTF-8 after the legacy 5 MiB boundary', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'large-invalid.txt');
+    const body = Buffer.alloc(6 * 1024 * 1024, 0x61);
+    body[body.length - 1] = 0xFF;
+    fs.writeFileSync(source, body);
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.toLowerCase()).toContain('utf-8');
+    expect(fs.existsSync(path.join(attDir(), 'large-invalid.txt'))).toBe(false);
+  });
+});
+
+describe('chat_attachments › listAttachments', () => {
+  it('lists uploaded files', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));
+    await m.uploadAttachment(UID, CID, 'b.pdf', makeMinimalPdf(['P']));
+    const items = m.listAttachments(UID, CID);
+    expect(items.map((i) => i.name).sort()).toEqual(['a.txt', 'b.pdf']);
+    expect(items.find((i) => i.name === 'a.txt')?.kind).toBe('text');
+    expect(items.find((i) => i.name === 'b.pdf')?.kind).toBe('pdf');
+  });
+
+  it('returns [] for unknown cid', async () => {
+    const m = await loadMod();
+    expect(m.listAttachments(UID, 'nope')).toEqual([]);
+  });
+});
+
+describe('chat_attachments › listPendingAttachments', () => {
+  it('returns all files when the conversation has no jsonl yet (new conv)', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));
+    await m.uploadAttachment(UID, CID, 'b.pdf', makeMinimalPdf(['P']));
+    const items = m.listPendingAttachments(UID, CID);
+    expect(items.map((i) => i.name).sort()).toEqual(['a.txt', 'b.pdf']);
+  });
+
+  it('filters out files already referenced by any user message in the jsonl', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'sent.txt', Buffer.from('old'));
+    await m.uploadAttachment(UID, CID, 'pending.pdf', makeMinimalPdf(['P']));
+
+    // Simulate the chat jsonl left behind by a prior send: one user message
+    // committed `sent.txt` to its attachments array.
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const rec = { time: '2026-04-24T00:00:00Z', role: 'user', content: 'hi', attachments: ['sent.txt'] };
+    fs.writeFileSync(path.join(chatsDir, `${CID}.jsonl`), JSON.stringify(rec) + '\n');
+
+    const items = m.listPendingAttachments(UID, CID);
+    expect(items.map((i) => i.name)).toEqual(['pending.pdf']);
+  });
+
+  it('survives malformed jsonl lines — falls back to listAttachments-equivalent set minus parseable refs', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));
+    await m.uploadAttachment(UID, CID, 'b.txt', Buffer.from('y'));
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const mixed = [
+      '{not valid json',
+      JSON.stringify({ role: 'user', attachments: ['a.txt'] }),
+      '',
+      'garbage-again',
+    ].join('\n');
+    fs.writeFileSync(path.join(chatsDir, `${CID}.jsonl`), mixed);
+
+    const items = m.listPendingAttachments(UID, CID);
+    expect(items.map((i) => i.name)).toEqual(['b.txt']);
+  });
+
+  it('keeps generated assistant images committed across filename collisions and device-local path changes', async () => {
+    const m = await loadMod();
+    const first = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1);
+    const second = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!(first.ok && second.ok)) return;
+    expect(second.info.name).not.toBe(first.info.name);
+    expect(fs.readFileSync(first.absPath)).toEqual(PNG_1X1);
+    expect(fs.readFileSync(second.absPath)).toEqual(PNG_1X1);
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const rows = [first.info.name, second.info.name].map((name) => ({
+      role: 'assistant',
+      produced: [`/old-device/cloud/chat_attachments/${CID}/${name}`],
+      text: `![generated image](chat-media://cid/${CID}/${encodeURIComponent(name)})`,
+    }));
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`,
+    );
+
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+  });
+
+  it('stores validated generated video bytes with the normal attachment size and sync boundary', async () => {
+    const m = await loadMod();
+    const saved = m.saveGeneratedMediaAttachment(UID, CID, MP4_FTYP, 'generated-clip.mp4', 'video');
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    expect(saved.info).toMatchObject({ name: 'generated-clip.mp4', kind: 'video', bytes: MP4_FTYP.length });
+    expect(fs.readFileSync(saved.absPath)).toEqual(MP4_FTYP);
+    expect(m.saveGeneratedMediaAttachment(UID, CID, MP4_FTYP, 'generated-clip.txt', 'video')).toMatchObject({
+      ok: false,
+      error: 'generated output must use a supported video extension',
+    });
+  });
+
+  it('keeps a background media cache name stable and refuses to recreate a deleted conversation pool', async () => {
+    const m = await loadMod();
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    const messageFile = path.join(chatsDir, `${CID}.jsonl`);
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+
+    const stableName = 'cli-remote-aabbccddeeff001122334455.png';
+    const first = await m.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, stableName, 'image');
+    const second = await m.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, stableName, 'image');
+
+    expect(first).toMatchObject({ ok: true, info: { name: stableName } });
+    if (first.ok) expect(first.reused).toBeUndefined();
+    expect(second).toMatchObject({ ok: true, info: { name: stableName }, reused: true });
+    expect(fs.readFileSync(path.join(attDir(), stableName))).toEqual(PNG_1X1);
+    expect(fs.readdirSync(attDir()).filter(name => name.startsWith('.'))).toEqual([]);
+
+    fs.unlinkSync(messageFile);
+    await m.purgeByCid(UID, CID);
+    const late = await m.saveGeneratedMediaCacheAttachment(
+      UID,
+      CID,
+      PNG_1X1,
+      'cli-remote-ffeeddccbbaa009988776655.png',
+      'image',
+    );
+    expect(late).toMatchObject({ ok: false, error: 'conversation no longer exists' });
+    expect(fs.existsSync(attDir())).toBe(false);
+  });
+});
+
+describe('chat_attachments › deleteAttachment', () => {
+  it('removes the original file', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'report.pdf', makeMinimalPdf(['P']));
+    expect(fs.existsSync(path.join(attDir(), 'report.pdf'))).toBe(true);
+    const r = m.deleteAttachment(UID, CID, 'report.pdf');
+    expect(r.ok).toBe(true);
+    expect(fs.existsSync(path.join(attDir(), 'report.pdf'))).toBe(false);
+  });
+});
+
+describe('chat_attachments › purgeByCid', () => {
+  it('wipes the entire <cid>/ dir', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));
+    await m.uploadAttachment(UID, CID, 'b.pdf', makeMinimalPdf(['P']));
+    expect(fs.existsSync(attDir())).toBe(true);
+    const n = await m.purgeByCid(UID, CID);
+    expect(n).toBeGreaterThan(0);
+    expect(fs.existsSync(attDir())).toBe(false);
+  });
+
+  it('does not touch other cids', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, 'other-cid', 'x.txt', Buffer.from('x'));
+    await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('y'));
+    await m.purgeByCid(UID, CID);
+    expect(fs.existsSync(path.join(tmpDir, UID, 'cloud', 'chat_attachments', 'other-cid', 'x.txt'))).toBe(true);
+  });
+});
+
+describe('chat_attachments › adoptDraftAttachments', () => {
+  const DRAFT = 'main_chat';
+
+  it('renames draft dir to target cid when target does not exist', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('hi'));
+    await m.uploadAttachment(UID, DRAFT, 'doc.pdf', makeMinimalPdf(['p1']));
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(true);
+    expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
+
+    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.count).toBe(2);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'note.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'doc.pdf'))).toBe(true);
+  });
+
+  it('returns count=0 without error when draft dir is absent', async () => {
+    const m = await loadMod();
+    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.count).toBe(0);
+  });
+
+  it('rejects same src == dst', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'a.txt', Buffer.from('x'));
+    const r = m.adoptDraftAttachments(UID, DRAFT, DRAFT);
+    expect(r.ok).toBe(false);
+  });
+
+  it('merges into existing target dir without overwriting unrelated files', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('kept'));
+    await m.uploadAttachment(UID, DRAFT, 'new.txt', Buffer.from('fresh'));
+    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'kept.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'new.txt'))).toBe(true);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
+  it('rolls back earlier moves when merging the whole draft fails midway', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('kept'));
+    await m.uploadAttachment(UID, DRAFT, 'first.txt', Buffer.from('first'));
+    await m.uploadAttachment(UID, DRAFT, 'second.txt', Buffer.from('second'));
+
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    let forwardMove = 0;
+    const isForwardMove = (from: fs.PathLike, to: fs.PathLike) => (
+      String(from).startsWith(draftAttDir(DRAFT) + path.sep)
+      && String(to).startsWith(cloudAttDir(CID) + path.sep)
+    );
+    const renameSync = vi.fn((from: fs.PathLike, to: fs.PathLike) => {
+      if (isForwardMove(from, to)) {
+        forwardMove += 1;
+        if (forwardMove === 2) throw new Error('forced rename failure');
+      }
+      return actualFs.renameSync(from, to);
+    });
+    const copyFileSync = vi.fn((from: fs.PathLike, to: fs.PathLike, mode?: number) => {
+      if (isForwardMove(from, to) && forwardMove === 2) {
+        throw new Error('forced copy failure');
+      }
+      return actualFs.copyFileSync(from, to, mode);
+    });
+    vi.resetModules();
+    vi.doMock('node:fs', () => ({ ...actualFs, renameSync, copyFileSync }));
+
+    try {
+      const moduleWithFailingMove = await loadMod();
+      const result = moduleWithFailingMove.adoptDraftAttachments(UID, DRAFT, CID);
+
+      expect(result.ok).toBe(false);
+      expect(fs.readdirSync(draftAttDir(DRAFT)).sort()).toEqual(['first.txt', 'second.txt']);
+      expect(fs.readdirSync(cloudAttDir(CID))).toEqual(['kept.txt']);
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+    }
+  });
+
+  it('preserves both files when a draft name collides with the target conversation', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'same-name.txt', Buffer.from('existing conversation file'));
+    await m.uploadAttachment(UID, DRAFT, 'same-name.txt', Buffer.from('new draft file'));
+
+    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.count).toBe(1);
+    expect(r.items).toHaveLength(1);
+    expect(r.items[0].sourceName).toBe('same-name.txt');
+    expect(r.items[0].targetName).not.toBe('same-name.txt');
+    const names = fs.readdirSync(cloudAttDir(CID)).filter((name) => !name.startsWith('.'));
+    expect(names).toHaveLength(2);
+    expect(fs.readFileSync(path.join(cloudAttDir(CID), 'same-name.txt'), 'utf8'))
+      .toBe('existing conversation file');
+    expect(fs.readFileSync(path.join(cloudAttDir(CID), r.items[0].targetName), 'utf8'))
+      .toBe('new draft file');
+    expect(names.map((name) => fs.readFileSync(path.join(cloudAttDir(CID), name), 'utf8')).sort())
+      .toEqual(['existing conversation file', 'new draft file']);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
+  it('migrates legacy cloud draft attachments back to local storage on access', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(cloudAttDir(DRAFT), { recursive: true });
+    fs.writeFileSync(path.join(cloudAttDir(DRAFT), 'legacy.txt'), 'old draft');
+
+    const items = m.listPendingAttachments(UID, DRAFT);
+    expect(items.map((i) => i.name)).toEqual(['legacy.txt']);
+    expect(fs.existsSync(path.join(draftAttDir(DRAFT), 'legacy.txt'))).toBe(true);
+    expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
+  });
+});
+
+describe('chat_attachments › resolveAttachmentAbsPath', () => {
+  it('returns absolute path + kind for a well-formed lookup', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'chart.png', await makePng());
+    const r = m.resolveAttachmentAbsPath(UID, CID, 'chart.png');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('image');
+    // Absolute path must live under the <cid>/ dir. An attacker who
+    // passed `../other/file.png` would slip above it; `path.relative`
+    // below would start with `..`.
+    expect(path.isAbsolute(r.absPath)).toBe(true);
+    expect(r.absPath).toBe(path.join(attDir(), 'chart.png'));
+  });
+
+  it('blocks path separators in the name (surface layer catches traversal)', async () => {
+    const m = await loadMod();
+    const r = m.resolveAttachmentAbsPath(UID, CID, '../escape.png');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('rejects names that start with a dot (hides cache/preview siblings)', async () => {
+    const m = await loadMod();
+    const r = m.resolveAttachmentAbsPath(UID, CID, '.chart.png.preview.jpg');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('refuses non-whitelisted extensions', async () => {
+    const m = await loadMod();
+    const r = m.resolveAttachmentAbsPath(UID, CID, 'program.exe');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('returns not_found when the file is absent on disk', async () => {
+    const m = await loadMod();
+    const r = m.resolveAttachmentAbsPath(UID, CID, 'ghost.png');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('not_found');
+  });
+
+  it('refuses invalid cids', async () => {
+    const m = await loadMod();
+    const r = m.resolveAttachmentAbsPath(UID, '../other', 'a.png');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+});
+
+describe('chat_attachments › mediaMimeFor', () => {
+  it('maps image + video + audio extensions to standard MIME types', async () => {
+    const m = await loadMod();
+    expect(m.mediaMimeFor('a.png')).toBe('image/png');
+    expect(m.mediaMimeFor('a.jpg')).toBe('image/jpeg');
+    expect(m.mediaMimeFor('a.jpeg')).toBe('image/jpeg');
+    expect(m.mediaMimeFor('a.webp')).toBe('image/webp');
+    expect(m.mediaMimeFor('a.gif')).toBe('image/gif');
+    expect(m.mediaMimeFor('clip.mp4')).toBe('video/mp4');
+    expect(m.mediaMimeFor('clip.webm')).toBe('video/webm');
+    expect(m.mediaMimeFor('clip.mov')).toBe('video/quicktime');
+    expect(m.mediaMimeFor('clip.m4v')).toBe('video/x-m4v');
+    expect(m.mediaMimeFor('clip.ogv')).toBe('video/ogg');
+    expect(m.mediaMimeFor('voice.mp3')).toBe('audio/mpeg');
+    expect(m.mediaMimeFor('voice.wav')).toBe('audio/wav');
+    expect(m.mediaMimeFor('voice.ogg')).toBe('audio/ogg');
+    expect(m.mediaMimeFor('voice.opus')).toBe('audio/ogg');
+    expect(m.mediaMimeFor('voice.m4a')).toBe('audio/mp4');
+    expect(m.mediaMimeFor('voice.aac')).toBe('audio/aac');
+    expect(m.mediaMimeFor('voice.flac')).toBe('audio/flac');
+  });
+
+  it('falls back to octet-stream for unknown extensions', async () => {
+    const m = await loadMod();
+    // NB: caller is expected to gate on the whitelist before calling — this
+    // is the end-of-line safety net, not the first check.
+    expect(m.mediaMimeFor('weird.bin')).toBe('application/octet-stream');
+  });
+
+  it('keeps SVG MIME support local-display-only', async () => {
+    const m = await loadMod();
+    expect(m.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    expect(m.mediaMimeFor('contact-sheet.svg')).toBe('application/octet-stream');
+    expect(m.localMediaMimeFor('contact-sheet.svg')).toBe('image/svg+xml');
+  });
+});
+
+describe('chat_attachments › resolveLocalMediaPath', () => {
+  // Unlike resolveAttachmentAbsPath (per-cid, strict filename validation),
+  // this variant serves the `chat-media://local/…` route: any abs path on
+  // the user's machine, gated only by extension whitelist + existence +
+  // size. The threat model assumes the user trusts their own LLM — there
+  // is no directory whitelist.
+  async function setup() {
+    const mod = await loadMod();
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-localmedia-'));
+    return { mod, sandbox };
+  }
+
+  it('accepts an existing image at an arbitrary abs path', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'shot.png');
+    fs.writeFileSync(p, await makePng());
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('image');
+    expect(r.absPath).toBe(path.resolve(p));
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts a passive local SVG for display without adding SVG to attachment uploads', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/><image href="01-frame.png"/></svg>');
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('image');
+    expect(r.absPath).toBe(path.resolve(p));
+    expect(mod.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['apng', 'image', 'image/apng'], ['jpe', 'image', 'image/jpeg'],
+    ['jfif', 'image', 'image/jpeg'], ['avif', 'image', 'image/avif'],
+    ['bmp', 'image', 'image/bmp'], ['ico', 'image', 'image/x-icon'],
+    ['oga', 'audio', 'audio/ogg'], ['weba', 'audio', 'audio/webm'],
+  ])('serves local .%s previews with the correct kind, MIME and size limit', async (ext, kind, mime) => {
+    const { mod, sandbox } = await setup();
+    try {
+      const p = path.join(sandbox, `preview.${ext}`);
+      fs.writeFileSync(p, 'fixture');
+      expect(mod.resolveLocalMediaPath(p)).toMatchObject({ ok: true, kind });
+      expect(mod.localMediaMimeFor(p)).toBe(mime);
+      // Sparse files exercise admission without allocating large payloads.
+      fs.truncateSync(p, (kind === 'image' ? 20 : 50) * 1024 * 1024 + 1);
+      expect(mod.resolveLocalMediaPath(p).ok).toBe(false);
+    } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
+  });
+
+  it('inlines relative raster references when serving a legacy local SVG', async () => {
+    const { mod, sandbox } = await setup();
+    const frame = path.join(sandbox, '01-frame.png');
+    fs.writeFileSync(frame, await makePng());
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><image href="01-frame.png"/></svg>');
+    const r = mod.materializeLocalDisplaySvg(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.body).toContain('href="data:image/png;base64,');
+    expect(r.body).not.toContain('href="01-frame.png"');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects a legacy SVG raster symlink escape and recovers with a local image', async () => {
+    const { mod, sandbox } = await setup();
+    try {
+      const folder = path.join(sandbox, 'sheet');
+      fs.mkdirSync(folder);
+      const outside = path.join(sandbox, 'outside.png');
+      const bytes = await makePng();
+      fs.writeFileSync(outside, bytes);
+      const linked = path.join(folder, 'frame.png');
+      fs.symlinkSync(outside, linked);
+      const svg = path.join(folder, 'contact-sheet.svg');
+      fs.writeFileSync(svg, '<svg xmlns="http://www.w3.org/2000/svg"><image href="frame.png"/></svg>');
+      expect(mod.materializeLocalDisplaySvg(svg)).toEqual({
+        ok: false, code: 'bad_input', error: 'SVG image reference escapes its directory',
+      });
+      expect(fs.readFileSync(outside)).toEqual(bytes);
+      fs.unlinkSync(linked);
+      fs.writeFileSync(linked, bytes);
+      const recovered = mod.materializeLocalDisplaySvg(svg);
+      expect(recovered.ok).toBe(true);
+      if (recovered.ok) expect(recovered.body).toContain('href="data:image/png;base64,');
+    } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
+  });
+
+  it('does not let legacy SVG image references escape their directory', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><image href="../outside.png"/></svg>');
+    const r = mod.materializeLocalDisplaySvg(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    expect(r.error).toBe('SVG image reference escapes its directory');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['frame 01.png', 'frame%2001.png'],
+    ['帧#01.png', '%E5%B8%A7%2301.png'],
+    ['frame%20.png', 'frame%2520.png?revision=1'],
+  ])('embeds the exact raster bytes named by the SVG URL %s', async (name, href) => {
+    const mod = await loadMod();
+    const directory = path.join(tmpDir, 'svg-urls');
+    fs.mkdirSync(directory);
+    const bytes = await makePng();
+    fs.writeFileSync(path.join(directory, name), bytes);
+    const file = path.join(directory, 'sheet.svg');
+    const source = `<svg xmlns="http://www.w3.org/2000/svg"><image href="${href}"/></svg>`;
+    fs.writeFileSync(file, source);
+
+    const result = mod.materializeLocalDisplaySvg(file);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body).toBe(`<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,${bytes.toString('base64')}"/></svg>`);
+    expect(fs.readFileSync(file, 'utf8')).toBe(source);
+    expect(fs.readFileSync(path.join(directory, name))).toEqual(bytes);
+  });
+
+  it.each(['%2e%2e/outside.png', '..%2foutside.png', 'broken%ZZ.png'])(
+    'rejects an escaping or malformed SVG URL %s without returning file bytes', async (href) => {
+      const mod = await loadMod();
+      const directory = path.join(tmpDir, 'svg-urls');
+      fs.mkdirSync(directory);
+      const bytes = await makePng();
+      fs.writeFileSync(path.join(tmpDir, 'outside.png'), bytes);
+      const file = path.join(directory, 'sheet.svg');
+      fs.writeFileSync(file, `<svg xmlns="http://www.w3.org/2000/svg"><image href="${href}"/></svg>`);
+      const result = mod.materializeLocalDisplaySvg(file);
+      expect(result).toMatchObject({ ok: false, code: 'bad_input' });
+      expect(result).not.toHaveProperty('body');
+      expect(fs.readFileSync(path.join(tmpDir, 'outside.png'))).toEqual(bytes);
+    },
+  );
+
+  it.each([
+    '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div>unsafe</div></foreignObject></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.com/x.png"/></svg>',
+  ])('rejects active or remote local SVG content', async (svg) => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'unsafe.svg');
+    fs.writeFileSync(p, svg);
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    expect(r.error).toBe('unsafe SVG content');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts a video file and reports kind="video"', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'clip.mp4');
+    fs.writeFileSync(p, Buffer.from('fake-bytes'));
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('video');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts an audio file and reports kind="audio"', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'voice.mp3');
+    fs.writeFileSync(p, Buffer.from('fake-bytes'));
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('audio');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects relative paths', async () => {
+    const { mod } = await setup();
+    const r = mod.resolveLocalMediaPath('./foo.png');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('rejects non-media extensions even when file exists', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'secret.txt');
+    fs.writeFileSync(p, 'hi');
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    // Bad extension is resolved before the FS stat, so the error code is
+    // bad_input rather than not_found.
+    expect(r.code).toBe('bad_input');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('returns not_found when the file is absent', async () => {
+    const { mod, sandbox } = await setup();
+    const r = mod.resolveLocalMediaPath(path.join(sandbox, 'ghost.png'));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('not_found');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('returns not_found when the path points at a directory', async () => {
+    const { mod, sandbox } = await setup();
+    // Name a directory so its extension is `.png` — otherwise extension
+    // gating trips first; we specifically want to exercise the stat branch.
+    const p = path.join(sandbox, 'dir.png');
+    fs.mkdirSync(p);
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('not_found');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects files over the per-kind size cap', async () => {
+    const { mod, sandbox } = await setup();
+    // Image cap is 20MB. Allocate 1 byte over.
+    const p = path.join(sandbox, 'huge.png');
+    fs.writeFileSync(p, Buffer.alloc(20 * 1024 * 1024 + 1));
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('too_large');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects empty string', async () => {
+    const { mod } = await setup();
+    const r = mod.resolveLocalMediaPath('');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+});
+
+describe('chat_attachments › resolveLocalPreviewPath', () => {
+  // Preview-doc sibling of resolveLocalMediaPath: accepts pdf / html / htm
+  // at arbitrary abs paths so the renderer can render LLM-produced docs
+  // inline. No size cap (Chromium streams through serveFileRange).
+  async function setup() {
+    const mod = await loadMod();
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-localpreview-'));
+    return { mod, sandbox };
+  }
+
+  it('accepts an existing pdf at an arbitrary abs path', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'doc.pdf');
+    fs.writeFileSync(p, makeMinimalPdf(['hi']));
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('pdf');
+    expect(r.absPath).toBe(path.resolve(p));
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts .html and reports kind="html"', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'page.html');
+    fs.writeFileSync(p, '<!doctype html><h1>ok</h1>');
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('html');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('also accepts the .htm spelling', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'old.htm');
+    fs.writeFileSync(p, '<html></html>');
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('html');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects image / video extensions (those belong to resolveLocalMediaPath)', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'photo.png');
+    fs.writeFileSync(p, await makePng());
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects relative paths', async () => {
+    const { mod } = await setup();
+    const r = mod.resolveLocalPreviewPath('./foo.pdf');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('returns not_found when the file is absent', async () => {
+    const { mod, sandbox } = await setup();
+    const r = mod.resolveLocalPreviewPath(path.join(sandbox, 'ghost.pdf'));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('not_found');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('imposes no size cap (very-large pdfs accepted — Chromium streams)', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'big.pdf');
+    // 60 MB — above any existing image / docx cap. The preview path has
+    // no cap by design; if a cap were silently reintroduced this would
+    // start failing.
+    fs.writeFileSync(p, Buffer.alloc(60 * 1024 * 1024));
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+});
+
+describe('chat_attachments › mediaMimeFor (preview docs)', () => {
+  // Existing media MIME coverage already exists earlier in the file; this
+  // describe pins the preview-doc additions so a renamed handler doesn't
+  // silently downgrade pdf / html to octet-stream.
+  it('returns application/pdf for .pdf', async () => {
+    const m = await loadMod();
+    expect(m.mediaMimeFor('report.pdf')).toBe('application/pdf');
+  });
+  it('returns text/html for .html and .htm', async () => {
+    const m = await loadMod();
+    expect(m.mediaMimeFor('page.html')).toBe('text/html');
+    expect(m.mediaMimeFor('old.htm')).toBe('text/html');
+  });
+});
+
+describe('chat_attachments › buildAttachmentManifest', () => {
+  it('surfaces a ZIP by path without parsing archive bytes into model context', async () => {
+    const m = await loadMod();
+    const opaqueBytes = Buffer.from('PK\u0003\u0004private-package-body');
+    await m.uploadAttachment(UID, CID, 'skills.zip', opaqueBytes);
+    const r = await m.buildAttachmentManifest(UID, CID, ['skills.zip']);
+
+    expect(r.manifest).toMatch(/<file[^>]*name="skills\.zip"[^>]*kind="archive"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
+    expect(r.manifest).toContain('task-specific host import tool');
+    expect(r.manifest).not.toContain('private-package-body');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['archive'] });
+  });
+
+  it('emits text entry with total_chars (cheap stat, no body leak)', async () => {
+    const m = await loadMod();
+    const body = 'hello world';
+    await m.uploadAttachment(UID, CID, 'notes.txt', Buffer.from(body, 'utf8'));
+    const r = await m.buildAttachmentManifest(UID, CID, ['notes.txt']);
+    expect(r.manifest).toContain('<attachments>');
+    expect(r.manifest).toContain('name="notes.txt"');
+    expect(r.manifest).toContain('kind="text"');
+    expect(r.manifest).toContain(`total_chars="${body.length}"`);
+    expect(r.manifest).toContain('host-validated paths are authoritative and readable');
+    expect(r.manifest).toContain('call read_files with the exact path directly');
+    // bytes attribute removed — model only sees chars.
+    expect(r.manifest).not.toMatch(/bytes="/);
+    // No body / chunks / preview leakage.
+    expect(r.manifest).toContain('/>');
+    expect(r.manifest).not.toContain('chunks=');
+    expect(r.manifest).not.toContain('preview=');
+    expect(r.manifest).not.toContain(body);
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['text'] });
+  });
+
+  it('emits PDF entry WITHOUT total_chars when never extracted (no eager work)', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'paper.pdf', makeMinimalPdf(['alpha', 'beta']));
+    const r = await m.buildAttachmentManifest(UID, CID, ['paper.pdf']);
+    expect(r.manifest).toContain('name="paper.pdf"');
+    expect(r.manifest).toContain('kind="pdf"');
+    expect(r.manifest).not.toMatch(/paper\.pdf[^>]*total_chars=/);
+    expect(r.manifest).not.toMatch(/bytes="/);
+    expect(r.manifest).not.toContain('chunks=');
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['pdf'] });
+  });
+
+  it('emits modern Office entries WITHOUT total_chars when never extracted', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'scores.xlsx', makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+    await m.uploadAttachment(UID, CID, 'slides.pptx', makeMinimalPptx({ slides: [['Roadmap']] }));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['scores.xlsx', 'slides.pptx']);
+
+    expect(r.manifest).toContain('name="scores.xlsx"');
+    expect(r.manifest).toContain('kind="spreadsheet"');
+    expect(r.manifest).not.toMatch(/scores\.xlsx[^>]*total_chars=/);
+    expect(r.manifest).toContain('name="slides.pptx"');
+    expect(r.manifest).toContain('kind="presentation"');
+    expect(r.manifest).not.toMatch(/slides\.pptx[^>]*total_chars=/);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['spreadsheet', 'presentation'] });
+  });
+
+  it('emits PDF entry WITH total_chars when cache already exists', async () => {
+    const m = await loadMod();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const { chatAttachmentDir } = await import('../../../src/main/paths');
+    await m.uploadAttachment(UID, CID, 'cached.pdf', makeMinimalPdf(['one', 'two']));
+    const abs = path.join(chatAttachmentDir(UID, CID), 'cached.pdf');
+    // Pre-stat so the manifest picks up total_chars from cache.
+    await indexer.statFile(UID, abs);
+    const r = await m.buildAttachmentManifest(UID, CID, ['cached.pdf']);
+    expect(r.manifest).toMatch(/cached\.pdf[^>]*total_chars="\d+"/);
+  });
+
+  it('emits modern Office entries WITH total_chars when cache already exists', async () => {
+    const m = await loadMod();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const { chatAttachmentDir } = await import('../../../src/main/paths');
+    await m.uploadAttachment(UID, CID, 'cached.xlsx', makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+    await m.uploadAttachment(UID, CID, 'cached.pptx', makeMinimalPptx({ slides: [['Roadmap']] }));
+    await indexer.statFile(UID, path.join(chatAttachmentDir(UID, CID), 'cached.xlsx'));
+    await indexer.statFile(UID, path.join(chatAttachmentDir(UID, CID), 'cached.pptx'));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['cached.xlsx', 'cached.pptx']);
+
+    expect(r.manifest).toMatch(/cached\.xlsx[^>]*total_chars="\d+"/);
+    expect(r.manifest).toMatch(/cached\.pptx[^>]*total_chars="\d+"/);
+  });
+
+  it('skips legacy Office names if a stale caller tries to build a manifest for them', async () => {
+    const m = await loadMod();
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['old.doc']);
+
+    expect(r.manifest).toBe('');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0].name).toBe('old.doc');
+    expect(r.skipped[0].reason).toMatch(/unsupported|不支持|未対応/i);
+  });
+
+  it('surfaces a video attachment in the manifest by path with model_readable="false" (usable by media tools, not skipped)', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'clip.mp4', Buffer.from('fake-bytes'));
+    const r = await m.buildAttachmentManifest(UID, CID, ['clip.mp4']);
+    // Not vision input, but the path IS surfaced so an agent can probe /
+    // transcribe / extract frames instead of giving up on the clip ([474]).
+    expect(r.manifest).toMatch(/<file[^>]*name="clip\.mp4"[^>]*kind="video"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
+    expect(r.manifest).toMatch(/media tools/i); // the how-to-read note is present
+    // Not inline vision bytes, and NOT dropped to skipped anymore.
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['video'] });
+  });
+
+  it('surfaces an audio attachment in the manifest by path with model_readable="false"', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'voice.mp3', Buffer.from('fake-bytes'));
+    const r = await m.buildAttachmentManifest(UID, CID, ['voice.mp3']);
+    expect(r.manifest).toMatch(/<file[^>]*name="voice\.mp3"[^>]*kind="audio"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['audio'] });
+  });
+
+  it('packs images into images[] and marks model-bounded delivery with a stable order', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'chart.png', await makePng());
+    const r = await m.buildAttachmentManifest(UID, CID, ['chart.png']);
+    // Manifest entry — gives the LLM a text-side handle on the image
+    // (filename + abs path) so it can answer "what did I upload" by name.
+    expect(r.manifest).toMatch(/<attachments>/);
+    expect(r.manifest).toMatch(/name="chart\.png"/);
+    expect(r.manifest).toMatch(/kind="image"/);
+    expect(r.manifest).toMatch(/attached="model-bounded"/);
+    expect(r.manifest).toMatch(/image_order="1"/);
+    expect(r.manifest).toContain('image delivery is bounded by the active model');
+    expect(r.manifest).toContain('call read_files({"paths":[{"path":"<exact-path>"}]}) for that image, one at a time');
+    // Look-alike negative: an image is candidate vision input and must NOT be
+    // marked model_readable="false" like a video/audio file.
+    expect(r.manifest).not.toContain('model_readable');
+    // Bytes — fed to vision via ChatOptions.images on the same user turn.
+    expect(r.images.length).toBe(1);
+    expect(r.images[0].mediaType).toBe('image/jpeg');
+    expect(r.images[0].data.length).toBeGreaterThan(100);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
+  });
+
+  it('keeps over-cap images path-addressable as deferred instead of reporting them as skipped', async () => {
+    const m = await loadMod();
+    for (let i = 0; i < 7; i++) {
+      await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng(0x11223300 + i));
+    }
+    const r = await m.buildAttachmentManifest(
+      UID, CID,
+      ['img0.png', 'img1.png', 'img2.png', 'img3.png', 'img4.png', 'img5.png', 'img6.png'],
+      { maxImages: 3 },
+    );
+    expect(r.images).toHaveLength(3);
+    expect(r.manifest.match(/<file [^>]*kind="image"/g)?.length).toBe(7);
+    expect(r.manifest.match(/attached="model-bounded"/g)?.length).toBe(3);
+    expect(r.manifest.match(/attached="deferred"/g)?.length).toBe(4);
+    expect(r.manifest).toMatch(/name="img0\.png"/);
+    expect(r.manifest).toMatch(/name="img6\.png"/);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
+  });
+
+  it.each([
+    { label: 'small opaque', width: 240, height: 120, transparent: false },
+    { label: 'large transparent', width: 1600, height: 800, transparent: true },
+  ])('preserves reference colors on first delivery and reread for $label images', async ({ width, height, transparent }) => {
+    const { Jimp } = await import('jimp' as any);
+    const source: any = new Jimp({ width, height, color: transparent ? 0x00000000 : 0xFFFFFFFF });
+    // The source palette, not a second production transform, is the oracle.
+    const palette = [0xDC2020FF, 0x20B040FF, 0x2040DCFF];
+    palette.forEach((color, index) => {
+      const patch: any = new Jimp({ width: width / 5, height: height / 2, color });
+      source.composite(patch, Math.floor(width * (index + 0.5) / 4), height / 4);
+    });
+    const png: Buffer = await source.getBuffer('image/png');
+    const m = await loadMod();
+    expect(await m.uploadAttachment(UID, CID, 'reference.png', png)).toMatchObject({ ok: true });
+    const delivered = await m.buildAttachmentManifest(UID, CID, ['reference.png']);
+    expect(delivered.skipped).toEqual([]);
+    expect(delivered.images).toHaveLength(1);
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const reread = await indexer.readImageAsJpeg(UID, path.join(attDir(), 'reference.png'));
+    for (const data of [delivered.images[0].data, reread.base64]) {
+      const decoded: any = await Jimp.read(Buffer.from(data, 'base64'));
+      expect(decoded.bitmap.width).toBe(Math.min(width, 1024));
+      expect(decoded.bitmap.height).toBe(Math.min(height, 512));
+      for (const [index, color] of palette.entries()) {
+        const actual = decoded.getPixelColor(
+          Math.floor(decoded.bitmap.width * ((index + 0.5) / 4 + 0.1)),
+          decoded.bitmap.height / 2,
+        );
+        for (const shift of [24, 16, 8]) {
+          expect(Math.abs(((actual >>> shift) & 0xFF) - ((color >>> shift) & 0xFF))).toBeLessThan(15);
+        }
+      }
+      // Transparent backgrounds must still flatten onto white for JPEG.
+      const background = decoded.getPixelColor(5, 5);
+      for (const shift of [24, 16, 8]) expect((background >>> shift) & 0xFF).toBeGreaterThan(240);
+    }
+    expect(fs.readFileSync(path.join(attDir(), 'reference.png'))).toEqual(png);
+    expect(fs.readdirSync(attDir())).toEqual(['reference.png']);
+  });
+
+  it('skips missing files gracefully', async () => {
+    const m = await loadMod();
+    const r = await m.buildAttachmentManifest(UID, CID, ['ghost.txt']);
+    expect(r.manifest).toBe('');
+    expect(r.skipped.length).toBe(1);
+    expect(r.skipped[0].reason).toMatch(/no longer exists|不存在/);
+  });
+
+  it('keeps valid files usable when a mixed turn contains a corrupt image', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'usable.md', Buffer.from('# usable attachment\n'));
+    await m.uploadAttachment(UID, CID, 'broken.png', Buffer.from('not an image'));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['usable.md', 'broken.png']);
+
+    expect(r.manifest).toContain('name="usable.md"');
+    expect(r.manifest).not.toContain('name="broken.png"');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0]).toMatchObject({ name: 'broken.png' });
+    expect(r.skipped[0].reason).toMatch(/compression failed|图片压缩失败/i);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['text', 'image'] });
+  });
+});
+
+describe('chat_attachments › buildConversationAttachmentIndex', () => {
+  it('lists persisted conversation attachments without leaking file bodies', async () => {
+    const m = await loadMod();
+    const body = '# Orkas 1.0.5\nRelease note: local attachment index stays lightweight.';
+    await m.uploadAttachment(UID, CID, 'orkas-1.0.5-update.md', Buffer.from(body, 'utf8'));
+    await m.uploadAttachment(UID, CID, 'intro.mp4', Buffer.from('fake-video'));
+    await m.uploadAttachment(UID, CID, 'logo.png', Buffer.from('fake-image'));
+
+    const index = await m.buildConversationAttachmentIndex(UID, CID);
+
+    expect(index).toContain('<conversation-attachments');
+    expect(index).toContain('name="orkas-1.0.5-update.md"');
+    expect(index).toContain('kind="text"');
+    expect(index).toContain(`total_chars="${body.length}"`);
+    expect(index).toContain('name="intro.mp4"');
+    expect(index).toContain('kind="video"');
+    expect(index).toContain('model_readable="false"');
+    expect(index).toContain('name="logo.png"');
+    expect(index).toContain('kind="image"');
+    expect(index).toContain('inline="false"');
+    expect(index).not.toContain('local attachment index stays lightweight');
+  });
+
+  it('excludes current-turn attachment names already covered by the manifest', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'old.md', Buffer.from('old', 'utf8'));
+    await m.uploadAttachment(UID, CID, 'current.md', Buffer.from('current', 'utf8'));
+
+    const index = await m.buildConversationAttachmentIndex(UID, CID, {
+      excludeNames: ['current.md'],
+    });
+
+    expect(index).toContain('name="old.md"');
+    expect(index).not.toContain('name="current.md"');
+  });
+});
+
+describe('chat_attachments › HTML preview assets', () => {
+  // Same-folder stylesheets, scripts, data and fonts of a page opened in the
+  // file viewer. Unlike the media route, nothing is served until the viewer
+  // grants the page's folder, and hidden or outside files never are.
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env.HOME; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+  });
+
+  async function setup() {
+    const mod = await loadMod();
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-preview-assets-')));
+    const page = path.join(sandbox, 'site');
+    fs.mkdirSync(path.join(page, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(page, 'index.html'), '<!doctype html><link rel="stylesheet" href="style.css">');
+    fs.writeFileSync(path.join(page, 'style.css'), 'body{}');
+    fs.writeFileSync(path.join(page, 'assets', 'icons.js'), 'window.icons = 1;');
+    fs.writeFileSync(path.join(page, 'data.json'), '{}');
+    return { mod, sandbox, page };
+  }
+
+  it('serves nothing until the viewer grants the page folder, then its whole tree', async () => {
+    const { mod, sandbox, page } = await setup();
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'))).toEqual({ ok: true, root: page });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css')))
+      .toEqual({ ok: true, absPath: path.join(page, 'style.css'), kind: 'asset' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'assets', 'icons.js')))
+      .toMatchObject({ ok: true, absPath: path.join(page, 'assets', 'icons.js') });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'data.json')).ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('keeps hidden paths, other folders, unsupported types and missing files out', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(page, '.env.json'), '{"token":"x"}');
+    fs.mkdirSync(path.join(page, '.cache'));
+    fs.writeFileSync(path.join(page, '.cache', 'bundle.js'), '');
+    fs.mkdirSync(path.join(sandbox, 'other'));
+    fs.writeFileSync(path.join(sandbox, 'other', 'theme.css'), '');
+    fs.writeFileSync(path.join(page, 'notes.txt'), 'x');
+    fs.mkdirSync(path.join(page, 'folder.css'));
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html')).ok).toBe(true);
+
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, '.env.json'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, '.cache', 'bundle.js'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'other', 'theme.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    // Containment is decided before existence: outside files are not probed.
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'other', 'missing.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'notes.txt'))).toMatchObject({ ok: false, code: 'bad_input' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'missing.css'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'folder.css'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath('style.css')).toMatchObject({ ok: false, code: 'bad_input' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32')('does not follow a symlink out of the granted folder', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(sandbox, 'secret.json'), '{"secret":1}');
+    fs.symlinkSync(path.join(sandbox, 'secret.json'), path.join(page, 'linked.json'));
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html')).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'linked.json'))).toMatchObject({ ok: false, code: 'forbidden' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('refuses to grant the home folder or anything above it, and non-HTML files', async () => {
+    const { mod, sandbox, page } = await setup();
+    fs.writeFileSync(path.join(sandbox, 'index.html'), '<!doctype html>');
+    process.env.HOME = sandbox;
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(sandbox, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
+    process.env.HOME = path.join(page, 'assets');
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
+    process.env.HOME = prevHome;
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'bad_input' });
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'gone.html'))).toMatchObject({ ok: false, code: 'not_found' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'forbidden' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('expires grants and keeps only the most recent folders', async () => {
+    const { mod, sandbox, page } = await setup();
+    expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'), 0).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'), 12 * 60 * 60 * 1000).ok).toBe(true);
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'), 12 * 60 * 60 * 1000 + 1))
+      .toMatchObject({ ok: false, code: 'forbidden' });
+
+    const now = Date.now();
+    for (let index = 0; index < 65; index += 1) {
+      const dir = path.join(sandbox, `page-${index}`);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html>');
+      fs.writeFileSync(path.join(dir, 'app.js'), '');
+      expect(mod.grantLocalHtmlPreviewAssets(path.join(dir, 'index.html'), now).ok).toBe(true);
+    }
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'page-0', 'app.js'), now))
+      .toMatchObject({ ok: false, code: 'forbidden' });
+    expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(sandbox, 'page-64', 'app.js'), now).ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('labels asset content types so browsers apply them', async () => {
+    const mod = await loadMod();
+    expect(['a.css', 'a.js', 'a.mjs', 'a.json', 'a.woff', 'a.woff2', 'a.ttf', 'a.otf', 'a.txt'].map(mod.localPreviewAssetMimeFor)).toEqual([
+      'text/css; charset=utf-8',
+      'text/javascript; charset=utf-8',
+      'text/javascript; charset=utf-8',
+      'application/json; charset=utf-8',
+      'font/woff',
+      'font/woff2',
+      'font/ttf',
+      'font/otf',
+      'application/octet-stream',
+    ]);
+  });
+});

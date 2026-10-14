@@ -1,0 +1,667 @@
+/**
+ * To-do tasks — project backlogs plus account-level global tasks.
+ *
+ * The third layer of a project's work-state (see
+ * Common/docs/plans/project-work-state.md):
+ *   - goal + rules   → ORKAS.md  (user-owned, agent read-only)   [projects.ts]
+ *   - TASKS (here)   → tasks/<tid>.json  (user + agent, structured, shared)
+ *   - decisions/notes→ MEMORY.md (agent freeform)                [memory.ts]
+ *
+ * Storage: ONE file per task under `<uid>/cloud/projects/<pid>/tasks/<tid>.json`
+ * for project tasks or `<uid>/cloud/tasks/<tid>.json` for global tasks.
+ * Per-task files — not a single array — so
+ * multi-agent / multi-device concurrent edits of DIFFERENT tasks never
+ * sync-conflict; listing is a directory scan (directory-is-truth, no aggregate
+ * index — mirrors `projects.ts`). Files are plain + human-readable (owner stored
+ * as NAME + id) so the user can open, review, and edit anything an agent wrote.
+ *
+ * Owner reference: `owner_agent` is a display NAME (LLM/user-facing; ids are
+ * error-prone for an LLM to write). `owner_agent_id` is the resolved id, kept
+ * for a stable link across agent rename. This layer only VALIDATES an
+ * already-resolved `owner_agent_id` against project bindings or the available
+ * account registry for global tasks; the name→id
+ * resolution lives with the caller (P0 UI picks from bound agents; the P1
+ * `todo_tasks` tool resolves before calling here).
+ */
+
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import { Mutex } from 'async-mutex';
+
+import * as path from 'node:path';
+
+import {
+  projectTasksDir,
+  projectTaskFile,
+  projectTaskAttachmentsDir,
+  userTasksDir,
+  userTaskFile,
+  userTaskAttachmentsDir,
+  userCloudRoot,
+} from '../paths';
+import { nowIso, readJson, writeJson } from '../storage';
+import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { taskContent } from '../util/project-task-content';
+import { clampStr, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
+  TASK_RESULT_REF_MAX, TASK_STATUSES as STATUSES } from './project_task_record';
+import { ALLOWED_EXTENSIONS } from './chat_attachments';
+import * as projects from './projects';
+import * as agents from './agents';
+import { getActiveUserId } from './users';
+
+const log = createLogger('project-tasks');
+
+export type TaskStatus = 'todo' | 'progress' | 'review' | 'done';
+// Review is unfinished work awaiting confirmation, so it counts as open.
+const OPEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['todo', 'progress', 'review']);
+
+export const TASK_CONTENT_MAX = 4000;
+export { TASK_RESULT_REF_MAX } from './project_task_record';
+
+export interface ProjectTask {
+  id: string;
+  content: string;
+  status: TaskStatus;
+  /** Agent display NAME (user/LLM-facing). */
+  owner_agent?: string;
+  /** Resolved agent id (stable across rename); validated against its scope. */
+  owner_agent_id?: string;
+  /** 'user' or an agent display name. */
+  created_by: string;
+  depends_on?: string[];
+  /** Pointer to the delivering conversation cid / artifact / file. */
+  result_ref?: string;
+  /** Latest successfully dispatched execution conversation; legacy field name. */
+  origin_cid?: string;
+  /** Filenames under `task_attachments/<id>/`, copied into the conversation the
+   *  task starts (manual Run or the auto-advance driver), like the composer's. */
+  attachments?: string[];
+  created_at: string;
+  updated_at: string;
+  done_at?: string;
+}
+
+export type TaskError =
+  | 'project_not_found'
+  | 'task_not_found'
+  | 'content_empty'
+  | 'content_too_long'
+  | 'content_invalid'
+  | 'content_required_for_update'
+  | 'bad_status'
+  | 'status_conflict'
+  | 'owner_not_bound'
+  | 'id_taken'
+  | 'delete_failed';
+
+const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
+const _createLocks = new Map<string, Mutex>();
+const _taskUpdateLocks = new Map<string, Mutex>();
+
+function _tasksDir(uid: string, pid: string): string {
+  return pid ? projectTasksDir(uid, pid) : userTasksDir(uid);
+}
+
+function _taskFile(uid: string, pid: string, tid: string): string {
+  return pid ? projectTaskFile(uid, pid, tid) : userTaskFile(uid, tid);
+}
+
+function _taskAttachmentsDir(uid: string, pid: string, tid: string): string {
+  return pid ? projectTaskAttachmentsDir(uid, pid, tid) : userTaskAttachmentsDir(uid, tid);
+}
+
+async function _scopeExists(uid: string, pid: string): Promise<boolean> {
+  return !pid || projects.projectExists(uid, pid);
+}
+
+function _scopeLog(pid: string): string {
+  return pid ? 'project' : 'global';
+}
+
+function genTaskId(): string {
+  return 't_' + crypto.randomBytes(6).toString('hex');
+}
+
+function canonicalOpenTaskContent(content: string): string {
+  let normalized = content.normalize('NFKC').trim();
+  const wrappingQuotes: ReadonlyArray<readonly [string, string]> = [
+    ['"', '"'], ["'", "'"], ['`', '`'], ['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'],
+  ];
+  for (const [open, close] of wrappingQuotes) {
+    if (normalized.startsWith(open) && normalized.endsWith(close)) {
+      normalized = normalized.slice(open.length, -close.length).trim();
+      break;
+    }
+  }
+  return normalized.replace(/\s+/g, ' ').toLowerCase();
+}
+
+/** Input-only compatibility for older clients; never persisted or returned. */
+export interface TaskContentInput {
+  content?: string;
+  title?: string;
+  detail?: string;
+}
+
+function validateTaskContent(input: TaskContentInput): TaskError | null {
+  const fields = input.content !== undefined ? [input.content] : [input.title, input.detail];
+  if (fields.some((value) => value !== undefined && typeof value !== 'string')) return 'content_invalid';
+  const content = taskContent(input);
+  if (!content) return 'content_empty';
+  return content.length > TASK_CONTENT_MAX ? 'content_too_long' : null;
+}
+
+async function withCreateLock<T>(uid: string, pid: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${uid}\0${pid}`;
+  const lock = _createLocks.get(key) || new Mutex();
+  _createLocks.set(key, lock);
+  try {
+    return await lock.runExclusive(fn);
+  } finally {
+    if (_createLocks.get(key) === lock && !lock.isLocked()) _createLocks.delete(key);
+  }
+}
+
+async function withTaskUpdateLock<T>(uid: string, pid: string, tid: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${uid}\0${pid}\0${tid}`;
+  const lock = _taskUpdateLocks.get(key) || new Mutex();
+  _taskUpdateLocks.set(key, lock);
+  try {
+    return await lock.runExclusive(fn);
+  } finally {
+    if (_taskUpdateLocks.get(key) === lock && !lock.isLocked()) _taskUpdateLocks.delete(key);
+  }
+}
+
+function _attachmentExtOk(name: string): boolean {
+  const i = name.lastIndexOf('.');
+  const ext = i >= 0 ? name.slice(i).toLowerCase() : '';
+  return ALLOWED_EXTENSIONS.has(ext);
+}
+
+async function _readTask(uid: string, pid: string, tid: string): Promise<ProjectTask | null> {
+  const f = _taskFile(uid, pid, tid);
+  if (!fs.existsSync(f)) return null;
+  try {
+    return _normaliseTask(await readJson(f));
+  } catch (err) {
+    log.warn('read task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) });
+    return null;
+  }
+}
+
+async function _writeTask(uid: string, pid: string, t: ProjectTask): Promise<void> {
+  fs.mkdirSync(_tasksDir(uid, pid), { recursive: true });
+  await writeJson(_taskFile(uid, pid, t.id), t);
+  _notifyDirty(pid);
+  _notifyTasksChanged(uid, pid);
+}
+
+// Public builds keep project tasks local. The hook remains for test parity.
+function _notifyDirty(_pid: string): void {
+}
+
+// Local, in-process change notification — index.ts wires it to a renderer
+// broadcast so an open project's to-do list refreshes live when a task is
+// created/updated/deleted from anywhere (the auto-advance driver, the model's
+// todo_tasks tool, another device's sync), not only after a view reload.
+export interface TasksChangedEvent { uid: string; pid: string }
+type TasksChangedListener = (e: TasksChangedEvent) => void;
+const _tasksChangedListeners: TasksChangedListener[] = [];
+export function onTasksChanged(cb: TasksChangedListener): void {
+  if (typeof cb === 'function') _tasksChangedListeners.push(cb);
+}
+function _notifyTasksChanged(uid: string, pid: string): void {
+  for (const cb of _tasksChangedListeners) {
+    try { cb({ uid, pid }); } catch { /* a listener must never break a task write */ }
+  }
+}
+
+type SyncDeletedNotifier = (relPath: string) => void;
+let _syncDeletedNotifierForTest: SyncDeletedNotifier | null = null;
+
+/** Test seam matching the other per-file synced features. */
+export function _setSyncDeletedNotifierForTest(fn: SyncDeletedNotifier | null): void {
+  _syncDeletedNotifierForTest = fn;
+}
+
+function _notifyDeleted(pid: string, tid: string): void {
+  const relPath = pid ? `cloud/projects/${pid}/tasks/${tid}.json` : `cloud/tasks/${tid}.json`;
+  if (_syncDeletedNotifierForTest) {
+    _syncDeletedNotifierForTest(relPath);
+  }
+}
+
+/** Validate a project-bound owner or an available account-global owner.
+ * Returns the fields to persist, or 'owner_not_bound'. */
+async function _resolveOwner(
+  uid: string,
+  pid: string,
+  input: { owner_agent?: string; owner_agent_id?: string },
+): Promise<{ owner_agent?: string; owner_agent_id?: string } | 'owner_not_bound'> {
+  const id = typeof input.owner_agent_id === 'string' ? input.owner_agent_id.trim() : '';
+  const name = clampStr(input.owner_agent, 200);
+  if (!id && !name) return {};
+  if (!pid) {
+    // The registry is scoped to the active account. Never resolve an owner
+    // for a different account through that registry.
+    if (!id || getActiveUserId() !== uid) return 'owner_not_bound';
+    const agent = (await agents.listAgentSummaries()).find((a) => a.agent_id === id && a.enabled !== false);
+    if (!agent || getActiveUserId() !== uid) return 'owner_not_bound';
+    return { owner_agent: agent.name, owner_agent_id: agent.agent_id };
+  }
+  if (id) {
+    const bindings = await projects.getBindings(uid, pid);
+    if (!bindings.agents.includes(id)) return 'owner_not_bound';
+  }
+  const out: { owner_agent?: string; owner_agent_id?: string } = {};
+  if (name) out.owner_agent = name;
+  if (id) out.owner_agent_id = id;
+  return out;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+/** List one scope's tasks (directory scan). Empty pid selects the global scope.
+ *  Backlog order = created_at asc. Missing project / tasks dir → []. */
+export async function listTasks(uid: string, pid: string): Promise<ProjectTask[]> {
+  if (!(await _scopeExists(uid, pid))) return [];
+  const dir = _tasksDir(uid, pid);
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return []; }
+  const ids: string[] = [];
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    const tid = e.name.slice(0, -'.json'.length);
+    if (TASK_ID_RE.test(tid)) ids.push(tid);
+  }
+  const tasks = (await Promise.all(ids.map((tid) => _readTask(uid, pid, tid))))
+    .filter((t): t is ProjectTask => t !== null);
+  // created_at asc, id asc as a tiebreaker so ordering is DETERMINISTIC across
+  // reloads (same-ms tasks won't jump around the list on refresh).
+  tasks.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || '') || a.id.localeCompare(b.id));
+  return tasks;
+}
+
+/** Read a single task (normalised) or null if missing/malformed. */
+export async function getTask(uid: string, pid: string, tid: string): Promise<ProjectTask | null> {
+  if (!TASK_ID_RE.test(tid)) return null;
+  if (!(await _scopeExists(uid, pid))) return null;
+  return _readTask(uid, pid, tid);
+}
+
+export interface TaskProgress {
+  total: number;
+  done: number;
+  open: number;
+  by_status: Record<TaskStatus, number>;
+}
+
+/** Derived progress — never stored (avoids drift). */
+export function computeProgress(tasks: readonly ProjectTask[]): TaskProgress {
+  const by_status = { todo: 0, progress: 0, review: 0, done: 0 } as Record<TaskStatus, number>;
+  for (const t of tasks) by_status[t.status] = (by_status[t.status] || 0) + 1;
+  const open = tasks.filter((t) => OPEN_STATUSES.has(t.status)).length;
+  return { total: tasks.length, done: by_status.done, open, by_status };
+}
+
+/** User/LLM-facing projection. Keeps the full human-readable task record while
+ *  excluding the internal stable owner id. Tool-result capping bounds large
+ *  backlogs retrieved on demand. */
+export interface ProjectTaskView {
+  id: string;
+  content: string;
+  status: TaskStatus;
+  owner_agent?: string;
+  depends_on?: string[];
+  attachments?: string[];
+  result_ref?: string;
+  origin_cid?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  done_at?: string;
+}
+export function taskView(t: ProjectTask): ProjectTaskView {
+  return {
+    id: t.id,
+    content: t.content,
+    status: t.status,
+    ...(t.owner_agent ? { owner_agent: t.owner_agent } : {}),
+    ...(t.depends_on?.length ? { depends_on: [...t.depends_on] } : {}),
+    ...(t.attachments?.length ? { attachments: [...t.attachments] } : {}),
+    ...(t.result_ref ? { result_ref: t.result_ref } : {}),
+    ...(t.origin_cid ? { origin_cid: t.origin_cid } : {}),
+    created_by: t.created_by,
+    created_at: t.created_at,
+    updated_at: t.updated_at,
+    ...(t.done_at ? { done_at: t.done_at } : {}),
+  };
+}
+
+export interface CreateTaskInput extends TaskContentInput {
+  status?: TaskStatus;
+  owner_agent?: string;
+  owner_agent_id?: string;
+  depends_on?: string[];
+  origin_cid?: string;
+  /** 'user' or an agent display name. */
+  created_by?: string;
+  /** Caller-supplied id so the editor can upload attachments to a draft task dir
+   *  BEFORE the task JSON exists (the renderer pre-allocates it); create then
+   *  adopts whatever landed in that dir. Must be a fresh `t_<12hex>`. */
+  id?: string;
+}
+
+export async function createTask(
+  uid: string, pid: string, input: CreateTaskInput,
+): Promise<{ ok: true; task: ProjectTask; alreadyExists: boolean } | { ok: false; error: TaskError }> {
+  if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
+  const contentError = validateTaskContent(input);
+  if (contentError) return { ok: false, error: contentError };
+  const content = taskContent(input)!;
+  if (input.status && !STATUSES.includes(input.status)) return { ok: false, error: 'bad_status' };
+  const owner = await _resolveOwner(uid, pid, input);
+  if (owner === 'owner_not_bound') return { ok: false, error: 'owner_not_bound' };
+  const dependsOn = Array.isArray(input.depends_on)
+    ? [...new Set(input.depends_on.filter((dependency) => TASK_ID_RE.test(dependency)))]
+    : [];
+
+  const requestedStatus = input.status || 'todo';
+  return withCreateLock(uid, pid, async () => {
+    // A caller-supplied id lets the editor stage attachments before the task
+    // JSON exists. Validate collisions under the same create lock that owns
+    // content de-duplication so concurrent creates cannot steal a draft.
+    const suppliedId = typeof input.id === 'string' && TASK_ID_RE.test(input.id) ? input.id : '';
+    if (suppliedId && fs.existsSync(_taskFile(uid, pid, suppliedId))) {
+      return { ok: false as const, error: 'id_taken' as const };
+    }
+    if (!suppliedId && OPEN_STATUSES.has(requestedStatus)) {
+      const canonicalContent = canonicalOpenTaskContent(content);
+      const existing = (await listTasks(uid, pid)).find((task) => (
+        OPEN_STATUSES.has(task.status)
+        && canonicalOpenTaskContent(task.content) === canonicalContent
+      ));
+      if (existing) {
+        log.info('reused open task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(existing.id) });
+        return { ok: true, task: existing, alreadyExists: true };
+      }
+    }
+
+    const id = suppliedId || genTaskId();
+    const attachments = suppliedId ? _scanAttachmentsDir(uid, pid, id) : [];
+    const now = nowIso();
+    const task: ProjectTask = {
+      id,
+      content,
+      status: requestedStatus,
+      created_by: clampStr(input.created_by, 200) || 'user',
+      created_at: now,
+      updated_at: now,
+      ...owner,
+      ...(dependsOn.length ? { depends_on: dependsOn } : {}),
+      ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
+      ...(attachments.length ? { attachments } : {}),
+    };
+    await _writeTask(uid, pid, task);
+    log.info('created', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(task.id), status: task.status });
+    return { ok: true, task, alreadyExists: false };
+  });
+}
+
+export interface UpdateTaskPatch extends TaskContentInput {
+  status?: TaskStatus;
+  owner_agent?: string;
+  owner_agent_id?: string;
+  result_ref?: string;
+  /** Execution conversation, replaced only by a successful host dispatch.
+   *  Never exposed as a model or renderer input field. Ordinary edits omit it. */
+  origin_cid?: string;
+}
+
+export async function updateTask(
+  uid: string, pid: string, tid: string, patch: UpdateTaskPatch,
+  // Host-only optimistic guard: compare and write under the same task lock.
+  options: { expectedStatus?: TaskStatus } = {},
+): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
+  if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'task_not_found' };
+  return withTaskUpdateLock(uid, pid, tid, async () => {
+    if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
+    const cur = await _readTask(uid, pid, tid);
+    if (!cur) return { ok: false, error: 'task_not_found' };
+    if (options.expectedStatus !== undefined && cur.status !== options.expectedStatus) {
+      return { ok: false, error: 'status_conflict' };
+    }
+
+    const next: ProjectTask = { ...cur };
+    if (patch.content !== undefined || patch.title !== undefined || patch.detail !== undefined) {
+      let fields: TaskContentInput = patch;
+      if (patch.content === undefined) {
+        const raw = await readJson(_taskFile(uid, pid, tid));
+        if (raw.content === undefined) {
+          fields = {
+            title: patch.title !== undefined ? patch.title : raw.title,
+            detail: patch.detail !== undefined ? patch.detail : raw.detail,
+          };
+        } else if (patch.title === undefined || patch.detail === undefined) {
+          // The old split cannot be recovered from canonical content safely.
+          return { ok: false, error: 'content_required_for_update' };
+        }
+      }
+      const contentError = validateTaskContent(fields);
+      if (contentError) return { ok: false, error: contentError };
+      next.content = taskContent(fields)!;
+    }
+    if (patch.status !== undefined) {
+      if (!STATUSES.includes(patch.status)) return { ok: false, error: 'bad_status' };
+      next.status = patch.status;
+      if (patch.status === 'done') next.done_at = nowIso();
+      else delete next.done_at;
+    }
+    if (patch.owner_agent !== undefined || patch.owner_agent_id !== undefined) {
+      const owner = await _resolveOwner(uid, pid, patch);
+      if (owner === 'owner_not_bound') return { ok: false, error: 'owner_not_bound' };
+      delete next.owner_agent; delete next.owner_agent_id;
+      if (owner.owner_agent) next.owner_agent = owner.owner_agent;
+      if (owner.owner_agent_id) next.owner_agent_id = owner.owner_agent_id;
+    }
+    if (patch.result_ref !== undefined) {
+      const ref = clampStr(patch.result_ref, TASK_RESULT_REF_MAX);
+      if (ref) next.result_ref = ref; else delete next.result_ref;
+    }
+    if (typeof patch.origin_cid === 'string' && patch.origin_cid.trim()) {
+      next.origin_cid = patch.origin_cid.trim();
+    }
+    next.updated_at = nowIso();
+    await _writeTask(uid, pid, next);
+    log.info('updated', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), status: next.status });
+    return { ok: true, task: next };
+  });
+}
+
+/** Record an admitted execution without rolling it back if its backlink fails.
+ *  Only dispatch entry points call this; creation and status edits do not. */
+export async function recordTaskExecution(uid: string, pid: string, tid: string, cid: string): Promise<void> {
+  try {
+    const linked = await updateTask(uid, pid, tid, { origin_cid: cid });
+    if (!linked.ok) log.error('task execution association rejected');
+  } catch {
+    log.error('task execution association failed');
+  }
+}
+
+/** Shortcut: mark done + record an optional result pointer. */
+export async function completeTask(
+  uid: string, pid: string, tid: string, resultRef?: string,
+): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
+  return updateTask(uid, pid, tid, { status: 'done', ...(resultRef ? { result_ref: resultRef } : {}) });
+}
+
+/** Human review decision on a task that is awaiting review. `approved` → done,
+ *  `changes_requested` → progress. Rejects with `not_in_review` when the task
+ *  is not currently `review`. The decider is always the user (single-user
+ *  app), so no reviewer/note fields are stored — change-request feedback travels
+ *  through the project conversation, Orkas's native feedback channel. */
+export async function decideReview(
+  uid: string, pid: string, tid: string, decision: 'approved' | 'changes_requested',
+): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError | 'not_in_review' }> {
+  if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
+  const result = await updateTask(uid, pid, tid,
+    { status: decision === 'approved' ? 'done' : 'progress' },
+    { expectedStatus: 'review' });
+  return result.ok === false && result.error === 'status_conflict'
+    ? { ok: false, error: 'not_in_review' }
+    : result;
+}
+
+export async function deleteTask(
+  uid: string, pid: string, tid: string,
+): Promise<{ ok: true } | { ok: false; error: TaskError }> {
+  if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'task_not_found' };
+  return withTaskUpdateLock(uid, pid, tid, async () => {
+    const f = _taskFile(uid, pid, tid);
+    if (!fs.existsSync(f)) return { ok: false, error: 'task_not_found' };
+    try { await fsp.unlink(f); }
+    catch (err) {
+      log.warn('delete task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) });
+      return { ok: false, error: 'delete_failed' };
+    }
+    // Drop the task's attachments too so its files don't linger in the scope.
+    try { fs.rmSync(_taskAttachmentsDir(uid, pid, tid), { recursive: true, force: true }); }
+    catch (err) { log.warn('delete task attachments', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) }); }
+    _notifyDeleted(pid, tid);
+    _notifyDirty(pid);
+    _notifyTasksChanged(uid, pid);
+    log.info('deleted', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid) });
+    return { ok: true };
+  });
+}
+
+// ── Attachments ─────────────────────────────────────────────────────────────
+// Files a task carries into the conversation it starts (manual Run / the driver),
+// mirroring auto_tasks. The directory `task_attachments/<tid>/` is the source of
+// truth; the task JSON caches the sanitized name list (drives the row indicator
+// and the fire-copy) and is re-derived from the dir on every upload/delete so the
+// two never drift. The editor uploads to a pre-allocated tid before the task JSON
+// exists (a "draft"); create() then adopts whatever is in that dir.
+
+// Reject anything that would blow up local disk on a single write. Per-kind caps
+// are re-checked by the composer's manifest builder when the files are read back
+// at LLM turn time, so this is only a coarse abuse guard.
+export const TASK_ATTACHMENT_MAX_BYTES = 200 * 1024 * 1024;
+
+function _scanAttachmentsDir(uid: string, pid: string, tid: string): string[] {
+  if (!TASK_ID_RE.test(tid)) return [];
+  const dir = _taskAttachmentsDir(uid, pid, tid);
+  let names: string[];
+  try { names = fs.readdirSync(dir); }
+  catch { return []; }
+  const out: string[] = [];
+  for (const n of names) {
+    const safe = _sanitiseAttachmentName(n);
+    if (!safe) continue;
+    try { if (!fs.statSync(path.join(dir, safe)).isFile()) continue; }
+    catch { continue; }
+    out.push(safe);
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
+// Re-derive the task JSON's cached attachment list from the dir (authoritative).
+// No-op when the task JSON doesn't exist yet (a draft — create() adopts the dir).
+async function _syncAttachmentList(uid: string, pid: string, tid: string): Promise<void> {
+  await withTaskUpdateLock(uid, pid, tid, async () => {
+    const cur = await _readTask(uid, pid, tid);
+    if (!cur) return;
+    const names = _scanAttachmentsDir(uid, pid, tid);
+    if (names.length) cur.attachments = names; else delete cur.attachments;
+    cur.updated_at = nowIso();
+    await _writeTask(uid, pid, cur);
+  });
+}
+
+/** List a task's attachment filenames (directory scan). */
+export async function listTaskAttachments(uid: string, pid: string, tid: string): Promise<string[]> {
+  if (!(await _scopeExists(uid, pid))) return [];
+  return _scanAttachmentsDir(uid, pid, tid);
+}
+
+/** Resolve an existing local file for preview, including unsaved task drafts.
+ * No copy/download is needed; reject redirects outside its exact account scope. */
+export async function resolveTaskAttachmentPath(uid: string, pid: string, tid: string, name: string): Promise<string | null> {
+  if (!TASK_ID_RE.test(tid) || !name || _sanitiseAttachmentName(name) !== name || !(await _scopeExists(uid, pid))) return null;
+  const file = path.join(_taskAttachmentsDir(uid, pid, tid), name);
+  try {
+    const cloud = userCloudRoot(uid);
+    const expected = path.join(await fsp.realpath(cloud), path.relative(cloud, file));
+    if (await fsp.realpath(file) !== expected || !(await fsp.lstat(file)).isFile()) return null;
+    return file;
+  } catch { return null; }
+}
+
+/** Stage one attachment under the task (draft-safe: the task JSON need not exist
+ *  yet). Validates the name + type against the composer's whitelist. */
+export async function uploadTaskAttachment(
+  uid: string, pid: string, tid: string, name: string, buf: Buffer,
+  options: { overwrite?: boolean } = {},
+): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+  if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'invalid_task_id' };
+  if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
+  const safe = _sanitiseAttachmentName(name);
+  if (!safe) return { ok: false, error: 'invalid_name' };
+  if (!_attachmentExtOk(safe)) return { ok: false, error: 'unsupported_type' };
+  if (!Buffer.isBuffer(buf) || buf.length > TASK_ATTACHMENT_MAX_BYTES) return { ok: false, error: 'too_large' };
+  const dir = _taskAttachmentsDir(uid, pid, tid);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    if (options.overwrite === false) {
+      const temp = path.join(dir, `.pending-${crypto.randomBytes(16).toString('hex')}`);
+      try {
+        await fsp.writeFile(temp, buf, { flag: 'wx' });
+        await fsp.link(temp, path.join(dir, safe));
+      } finally { await fsp.rm(temp, { force: true }); }
+    } else fs.writeFileSync(path.join(dir, safe), buf);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') return { ok: false, error: 'attachment_already_exists' };
+    log.warn('attachment upload', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), attachment: logPathRef(safe), error: logErrorSummary(err) });
+    return { ok: false, error: 'write_failed' };
+  }
+  await _syncAttachmentList(uid, pid, tid);
+  _notifyDirty(pid);
+  log.info('attachment uploaded', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), attachment: logPathRef(safe), bytes: buf.length });
+  return { ok: true, name: safe };
+}
+
+/** Remove one attachment from a task (or its draft dir). */
+export async function deleteTaskAttachment(
+  uid: string, pid: string, tid: string, name: string,
+): Promise<{ ok: boolean }> {
+  if (!TASK_ID_RE.test(tid)) return { ok: false };
+  const safe = _sanitiseAttachmentName(name);
+  if (!safe) return { ok: false };
+  const target = path.join(_taskAttachmentsDir(uid, pid, tid), safe);
+  try { if (fs.existsSync(target)) fs.unlinkSync(target); }
+  catch (err) {
+    log.warn('attachment delete', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), attachment: logPathRef(safe), error: logErrorSummary(err) });
+    return { ok: false };
+  }
+  await _syncAttachmentList(uid, pid, tid);
+  _notifyDirty(pid);
+  return { ok: true };
+}
+
+/** Discard a whole draft attachment dir — the editor's "cancel" for a task that
+ *  was never saved. Refuses to touch a live task's files (that goes through
+ *  deleteTaskAttachment / deleteTask). */
+export async function discardTaskAttachmentDraft(uid: string, pid: string, tid: string): Promise<{ ok: boolean }> {
+  if (!TASK_ID_RE.test(tid)) return { ok: false };
+  if (fs.existsSync(_taskFile(uid, pid, tid))) return { ok: false };
+  try { fs.rmSync(_taskAttachmentsDir(uid, pid, tid), { recursive: true, force: true }); }
+  catch (err) { log.warn('attachment draft discard', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) }); return { ok: false }; }
+  _notifyDirty(pid);
+  return { ok: true };
+}

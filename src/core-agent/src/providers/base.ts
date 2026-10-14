@@ -1,0 +1,113 @@
+import type {
+  Model,
+  Api,
+  Context as PiContext,
+  AssistantMessage as PiAssistantMessage,
+  AssistantMessageEvent as PiStreamEvent,
+  Tool as PiTool,
+  StreamOptions as PiStreamOptions,
+  SimpleStreamOptions as PiSimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+
+// Re-export pi-ai types that consumers need
+export type { Model, PiContext, PiAssistantMessage, PiStreamEvent, PiTool };
+
+import type { Message, StreamEvent, StopReason, Usage } from "../shared/types.js";
+
+/** Tool definition for LLM function calling. */
+export type ToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  /** Optional grammar input; the JSON schema remains the portable contract. */
+  constrainedSampling?: Extract<NonNullable<PiTool["constrainedSampling"]>, { type: "grammar" }>;
+};
+
+/** Parameters for an LLM completion request. */
+export type CompletionParams = {
+  /** Best-effort metadata observer, including attempts recovered by wrappers. Never sent to the API. */
+  onRequestFailure?: (failure: import("./request-diagnostics.js").ProviderRequestFailure) => void;
+  model: string;
+  messages: Message[];
+  systemPrompt?: string;
+  tools?: ToolDefinition[];
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  stopSequences?: string[];
+  /** Abort signal for cancellation. */
+  signal?: AbortSignal;
+  /** Optional per-call first usable stream-event deadline. Rotating wrappers
+   * use this only before a candidate is committed; ordinary adapters ignore
+   * it and continue to honor `signal` for the whole request. */
+  firstEventTimeoutMs?: number;
+  /** Thinking/reasoning level.
+   *  - `"off"` explicitly disables thinking even if the provider has a
+   *    `defaultReasoning` configured (used to opt out per-call).
+   *  - `undefined` falls back to the provider's `defaultReasoning`, when one
+   *    is configured; otherwise the request omits an explicit effort.
+   *  - `"minimal"`/`"low"`/`"medium"`/`"high"` map directly to pi-ai's
+   *    `ThinkingLevel` for the provider's reasoner channel. */
+  reasoning?: "off" | "minimal" | "low" | "medium" | "high";
+  /** Prompt-cache TTL policy forwarded to pi-ai. `"short"` (default in pi-ai)
+   * = Anthropic 5m / OpenAI default window; `"long"` = Anthropic 1h / OpenAI
+   * extended retention (24h on legacy models or 30m on explicit-cache models);
+   * `"none"` disables caching. Provider-specific translation happens inside
+   * pi-ai; providers without cache support ignore it. */
+  cacheRetention?: "none" | "short" | "long";
+  /** Stable identifier used as `prompt_cache_key` (OpenAI / Codex / Azure /
+   * OpenRouter) and as cache-affinity hint (Mistral, others). Should be the
+   * caller's session id so repeated turns on the same conversation hit the
+   * same cache bucket. */
+  sessionId?: string;
+  /** Opaque, in-memory identity of the active user turn. Transport adapters
+   * may associate private routing state with it; never serialize it into API
+   * payloads or persistence. Reuse for same-turn retries, not a new user turn. */
+  providerTurnContext?: object;
+  /** Host-private metadata for provider adapters. Generic providers must not
+   * forward this wholesale; adapters may pick specific fields for their own
+   * trusted endpoints. */
+  requestMetadata?: Record<string, unknown>;
+  /** Retry ownership across provider wrappers. Attempt zero is the first
+   * AgentRunner call for a model round; positive values mean AgentRunner is
+   * already recovering that call, so wrappers must not grant a fresh nested
+   * same-candidate retry budget. This is host-private and is never forwarded
+   * to provider APIs. */
+  retryContext?: {
+    agentAttempt: number;
+  };
+};
+
+/** Non-streaming completion result. */
+export type CompletionResult = {
+  content: Message["content"];
+  stopReason: StopReason;
+  usage: Usage;
+  model: string;
+};
+
+/**
+ * Abstract LLM provider interface.
+ *
+ * Now backed by @earendil-works/pi-ai for multi-provider support via OpenClaw's
+ * unified LLM communication layer.
+ */
+export interface LLMProvider {
+  readonly id: string;
+  readonly name: string;
+
+  /** Create a non-streaming completion. */
+  complete(params: CompletionParams): Promise<CompletionResult>;
+
+  /** Create a streaming completion. Yields StreamEvent items. */
+  stream(params: CompletionParams): AsyncIterable<StreamEvent>;
+
+  /** Test whether this provider's credentials are valid. */
+  validateAuth(): Promise<boolean>;
+}
+
+/** Provider factory function. */
+export type ProviderFactory = (config: {
+  apiKey?: string;
+  baseUrl?: string;
+}) => LLMProvider;

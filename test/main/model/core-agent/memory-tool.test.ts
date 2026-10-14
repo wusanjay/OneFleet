@@ -1,0 +1,173 @@
+import { describe, it, expect, vi } from 'vitest';
+import { createCrossSessionMemoryTool, type MemoryToolHandler, type MemoryTier } from '../../../../src/core-agent/src/tools/memory-tool';
+
+function stubHandler(): MemoryToolHandler & { calls: Array<{ op: string; tier: MemoryTier }> } {
+  const calls: Array<{ op: string; tier: MemoryTier }> = [];
+  const res = { ok: true, entries: [], usage: { current: 0, limit: 100 } };
+  return {
+    calls,
+    add: vi.fn((tier: MemoryTier) => { calls.push({ op: 'add', tier }); return res; }),
+    replace: vi.fn((tier: MemoryTier) => { calls.push({ op: 'replace', tier }); return res; }),
+    remove: vi.fn((tier: MemoryTier) => { calls.push({ op: 'remove', tier }); return res; }),
+    list: vi.fn((tier: MemoryTier) => { calls.push({ op: 'list', tier }); return res; }),
+  };
+}
+
+const enumOf = (tool: ReturnType<typeof createCrossSessionMemoryTool>): string[] =>
+  ((tool.inputSchema as any).properties.target.enum as string[]);
+
+describe('cross_session_memory tool › project tier exposure', () => {
+  it.each([
+    { includeProjectTier: false, projectTierReadOnly: false },
+    { includeProjectTier: true, projectTierReadOnly: false },
+    { includeProjectTier: true, projectTierReadOnly: true },
+  ])('advertises and enforces global read-only access: %j', async (options) => {
+    const h = stubHandler();
+    const tool = createCrossSessionMemoryTool(h, { ...options, globalTiersReadOnly: true });
+    expect(tool.description).toContain('intended scope, not write access');
+    expect(tool.description).toContain('before replying, even without a save request');
+    expect(tool.description).toContain('stable facts, corrections or invalidations for future conversations');
+    expect(tool.description).toContain('User/shared writes belong to Commander');
+    expect(tool.description).toContain('hand back those changes without substituting or duplicating them in another store');
+    expect((tool.inputSchema as any).properties.target.description).toContain('Agent-only reusable lessons');
+    expect(tool.description).toContain('exclude task progress and temporary state');
+    expect(tool.description).not.toContain('<handback');
+    expect(tool.description.length).toBeLessThanOrEqual(480);
+    expect((tool.inputSchema as any).properties.target.description.length).toBeLessThanOrEqual(220);
+    for (const target of ['user', 'shared']) {
+      expect((await tool.execute({ action: 'list', target }, {} as any)).isError).toBe(false);
+      for (const input of [
+        { action: 'add', content: 'new' },
+        { action: 'replace', old_text: 'old', content: 'new' },
+        { action: 'remove', old_text: 'old' },
+      ]) expect((await tool.execute({ ...input, target }, {} as any)).isError).toBe(true);
+    }
+    expect(h.calls).toEqual([{ op: 'list', tier: 'user' }, { op: 'list', tier: 'shared' }]);
+    const writable = options.includeProjectTier && !options.projectTierReadOnly ? ['agent', 'project'] : ['agent'];
+    for (const target of writable) {
+      expect((await tool.execute({ action: 'add', target, content: 'local' }, {} as any)).isError).toBe(false);
+    }
+  });
+
+  it('keeps every global mutation available to Commander', async () => {
+    const h = stubHandler();
+    const tool = createCrossSessionMemoryTool(h, { globalTiersReadOnly: false });
+    for (const target of ['user', 'shared']) {
+      for (const input of [
+        { action: 'add', content: 'new' },
+        { action: 'replace', old_text: 'old', content: 'new' },
+        { action: 'remove', old_text: 'old' },
+      ]) expect((await tool.execute({ ...input, target }, {} as any)).isError).toBe(false);
+    }
+    expect(h.calls).toEqual([
+      { op: 'add', tier: 'user' }, { op: 'replace', tier: 'user' }, { op: 'remove', tier: 'user' },
+      { op: 'add', tier: 'shared' }, { op: 'replace', tier: 'shared' }, { op: 'remove', tier: 'shared' },
+    ]);
+  });
+
+  it('non-project sessions expose three stores and keep routing in the target parameter', () => {
+    const tool = createCrossSessionMemoryTool(stubHandler());
+    const target = (tool.inputSchema as any).properties.target;
+    const action = (tool.inputSchema as any).properties.action;
+    expect(enumOf(tool)).toEqual(['agent', 'shared', 'user']);
+    expect(tool.description).toContain('Manage durable agent, shared, or user memory');
+    expect(tool.description).toContain('before replying');
+    expect(tool.description).toContain('even without an explicit save request');
+    expect(tool.description).toContain('Decide from meaning, never trigger words');
+    expect(tool.description).toContain('Do not store current-task progress');
+    expect(action.description).toContain('entries are already injected');
+    expect(target.description).toContain('Defaults to agent');
+    expect(target.description).toContain('user-wide profile/preferences');
+    expect(target.description).toContain('rare cross-project facts');
+  });
+
+  it('project sessions expose four stores with project routing and exact mutation guidance', () => {
+    const tool = createCrossSessionMemoryTool(stubHandler(), { includeProjectTier: true });
+    const target = (tool.inputSchema as any).properties.target;
+    expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
+    expect(tool.description).toContain('Use todo_tasks for task progress');
+    expect(target.description).toContain('project-specific facts and decisions');
+    expect(target.description).toContain('this agent\'s reusable lessons');
+    expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');
+  });
+
+  it('marks project memory read-only in both selection and parameter guidance', () => {
+    const tool = createCrossSessionMemoryTool(stubHandler(), {
+      includeProjectTier: true,
+      projectTierReadOnly: true,
+    });
+    expect(tool.description).toContain('Project memory is read-only');
+    expect((tool.inputSchema as any).properties.target.description)
+      .toContain('Project is read-only');
+  });
+
+  it('project target executes against the handler only when the tier is offered', async () => {
+    const withProject = stubHandler();
+    const t1 = createCrossSessionMemoryTool(withProject, { includeProjectTier: true });
+    const okRes = await t1.execute({ action: 'add', target: 'project', content: 'x' }, {} as any);
+    expect(okRes.isError).toBeFalsy();
+    expect(withProject.calls).toEqual([{ op: 'add', tier: 'project' }]);
+
+    const without = stubHandler();
+    const t2 = createCrossSessionMemoryTool(without);
+    const errRes = await t2.execute({ action: 'add', target: 'project', content: 'x' }, {} as any);
+    expect(errRes.isError).toBe(true);
+    expect(String(errRes.content)).toContain('target must be one of');
+    expect(without.calls).toEqual([]); // never reached the handler
+  });
+
+  it('default target stays "agent" in both shapes', async () => {
+    const h = stubHandler();
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
+    await tool.execute({ action: 'list' }, {} as any);
+    expect(h.calls).toEqual([{ op: 'list', tier: 'agent' }]);
+  });
+
+  it('surfaces a rejected ambiguous mutation as a tool error instead of success', async () => {
+    const h = stubHandler();
+    h.remove = vi.fn(() => ({
+      ok: false,
+      error: 'old_text is ambiguous; provide the complete unique entry text',
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+      usage: { current: 51, limit: 100 },
+    }));
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
+    const result = await tool.execute({ action: 'remove', target: 'project', old_text: 'release' }, {} as any);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(String(result.content))).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
+  });
+});
+
+
+describe('cross_session_memory async persistence', () => {
+  it.each([true, false])('awaits shared deletion before reporting its outcome (success=%s)', async (ok) => {
+    const h = stubHandler();
+    let finish!: (value: any) => void;
+    h.remove = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
+    const pending = tool.execute({ action: 'remove', target: 'project', old_text: 'obsolete fact' }, {} as any);
+    const receipt = { ok, ...(!ok ? { error: 'shared_sync_failed' } : {}), entries: [], usage: { current: 0, limit: 2500 } };
+    finish(receipt);
+    const result = await pending;
+    expect(result.isError).toBe(!ok);
+    expect(JSON.parse(result.content)).toEqual(receipt);
+  });
+
+  it('awaits the durable result and forwards cancellation to consolidation', async () => {
+    const h = stubHandler();
+    const controller = new AbortController();
+    let finish!: (value: any) => void;
+    h.add = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const tool = createCrossSessionMemoryTool(h);
+    const pending = tool.execute({ action: 'add', target: 'agent', content: 'new fact' }, { signal: controller.signal } as any);
+    expect(h.add).toHaveBeenCalledWith('agent', 'new fact', controller.signal);
+    finish({ ok: false, error: 'memory changed during consolidation', entries: ['concurrent fact'], usage: { current: 15, limit: 2000 } });
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ ok: false, entries: ['concurrent fact'] });
+  });
+});

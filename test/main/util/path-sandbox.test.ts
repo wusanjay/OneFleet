@@ -1,0 +1,220 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { isPathAllowed, resolveSandboxRoot } from '../../../src/main/util/path-sandbox';
+
+let tmpRoot: string;
+let workspace: string;
+let attachments: string;
+let workspaceFile: string;
+let attachmentFile: string;
+let outsideFile: string;
+
+beforeAll(() => {
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-sandbox-'));
+  workspace = path.join(tmpRoot, 'ws');
+  attachments = path.join(tmpRoot, 'attach');
+  const outside = path.join(tmpRoot, 'outside');
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(attachments, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+
+  workspaceFile = path.join(workspace, 'doc.md');
+  attachmentFile = path.join(attachments, 'a.pdf');
+  outsideFile = path.join(outside, 'secret.md');
+  fs.writeFileSync(workspaceFile, 'hello');
+  fs.writeFileSync(attachmentFile, 'pdf bytes');
+  fs.writeFileSync(outsideFile, 'secret');
+});
+
+afterAll(() => {
+  try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
+describe('path-sandbox › isPathAllowed', () => {
+  it('distinguishes deleting a directory entry from accessing its target', () => {
+    const link = path.join(workspace, 'entry-link');
+    fs.symlinkSync(path.dirname(outsideFile), link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      expect(isPathAllowed(link, [workspace])).toBe(false);
+      expect(isPathAllowed(link, [workspace], { followFinalSymlink: false })).toBe(true);
+      expect(isPathAllowed(path.join(link, 'secret.md'), [workspace], { followFinalSymlink: false })).toBe(false);
+      expect(isPathAllowed(link + path.sep, [workspace], { followFinalSymlink: false })).toBe(false);
+    } finally { fs.unlinkSync(link); }
+  });
+
+  it('does not authorize deleting an outside entry just because its target is inside', () => {
+    const link = path.join(path.dirname(outsideFile), 'entry-back');
+    fs.symlinkSync(workspace, link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      expect(isPathAllowed(link, [workspace])).toBe(true);
+      expect(isPathAllowed(link, [workspace], { followFinalSymlink: false })).toBe(false);
+    } finally { fs.unlinkSync(link); }
+  });
+
+  it('accepts files inside a root', () => {
+    expect(isPathAllowed(workspaceFile, [workspace, attachments])).toBe(true);
+    expect(isPathAllowed(attachmentFile, [workspace, attachments])).toBe(true);
+  });
+
+  it('accepts the root dir itself', () => {
+    expect(isPathAllowed(workspace, [workspace])).toBe(true);
+  });
+
+  it('rejects files outside all roots', () => {
+    expect(isPathAllowed(outsideFile, [workspace, attachments])).toBe(false);
+  });
+
+  it('rejects ../ traversal back into a sibling dir', () => {
+    const escape = path.join(workspace, '..', 'outside', 'secret.md');
+    expect(isPathAllowed(escape, [workspace])).toBe(false);
+  });
+
+  it('rejects sibling prefixes (no false-positive on startsWith)', () => {
+    // /tmp/.../ws vs /tmp/.../ws_other — must NOT match.
+    const sibling = path.join(tmpRoot, 'ws_other');
+    fs.mkdirSync(sibling, { recursive: true });
+    const siblingFile = path.join(sibling, 'x.md');
+    fs.writeFileSync(siblingFile, 'x');
+    try { expect(isPathAllowed(siblingFile, [workspace])).toBe(false); }
+    finally { fs.rmSync(sibling, { recursive: true, force: true }); }
+  });
+
+  it('resolves symlinks on both sides (block escape)', () => {
+    // Plant a symlink inside workspace that points at outsideFile.
+    const link = path.join(workspace, 'link-to-secret.md');
+    try { fs.symlinkSync(outsideFile, link); }
+    catch { return; /* platform without symlink perms — skip */ }
+    try {
+      // Realpath resolves to outside, so this must be rejected.
+      expect(isPathAllowed(link, [workspace])).toBe(false);
+    } finally {
+      try { fs.unlinkSync(link); } catch { /* best-effort */ }
+    }
+  });
+
+  it('rejects a nonexistent child reached through a symlink that escapes the root', () => {
+    const outsideDir = path.dirname(outsideFile);
+    const linkDir = path.join(workspace, 'outside-alias');
+    if (process.platform === 'win32') {
+      // Directory junctions do not require Developer Mode/admin privileges,
+      // so this security probe must stay active on ordinary Windows CI hosts.
+      fs.symlinkSync(outsideDir, linkDir, 'junction');
+    } else {
+      try { fs.symlinkSync(outsideDir, linkDir, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      expect(isPathAllowed(path.join(linkDir, 'not-created-yet.txt'), [workspace])).toBe(false);
+    } finally {
+      try { fs.unlinkSync(linkDir); } catch { /* best-effort */ }
+    }
+  });
+
+  it('accepts an allowed root addressed through a symlink alias', () => {
+    const rootAlias = path.join(tmpRoot, 'workspace-alias');
+    if (process.platform === 'win32') {
+      fs.symlinkSync(workspace, rootAlias, 'junction');
+    } else {
+      try { fs.symlinkSync(workspace, rootAlias, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias])).toBe(true);
+    } finally {
+      try { fs.unlinkSync(rootAlias); } catch { /* best-effort */ }
+    }
+  });
+
+  it('trusts a pre-resolved root only after resolveSandboxRoot, so a hot loop resolves it once', () => {
+    // A sync pass checks thousands of candidates against one root; the
+    // resolved form must reach the same verdicts as the per-call walk while
+    // candidates keep resolving (a planted symlink is still rejected).
+    const resolvedRoot = resolveSandboxRoot(workspace);
+    expect(isPathAllowed(workspaceFile, [resolvedRoot], { rootsResolved: true })).toBe(true);
+    expect(isPathAllowed(path.join(workspace, 'not-yet.md'), [resolvedRoot], { rootsResolved: true }))
+      .toBe(true);
+    expect(isPathAllowed(outsideFile, [resolvedRoot], { rootsResolved: true })).toBe(false);
+    const link = path.join(workspace, 'link-to-secret-resolved.md');
+    try { fs.symlinkSync(outsideFile, link); }
+    catch { return; /* platform without symlink perms — skip */ }
+    try {
+      expect(isPathAllowed(link, [resolvedRoot], { rootsResolved: true })).toBe(false);
+    } finally {
+      try { fs.unlinkSync(link); } catch { /* best-effort */ }
+    }
+  });
+
+  it('fails closed when a caller claims an unresolved symlinked root is resolved (negative control)', () => {
+    const rootAlias = path.join(tmpRoot, 'workspace-alias-unresolved');
+    if (process.platform === 'win32') {
+      fs.symlinkSync(workspace, rootAlias, 'junction');
+    } else {
+      try { fs.symlinkSync(workspace, rootAlias, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      // The per-call walk follows the alias; the resolved-root contract skips
+      // that walk, so the same call is rejected instead of silently trusted.
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias])).toBe(true);
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias], { rootsResolved: true }))
+        .toBe(false);
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [resolveSandboxRoot(rootAlias)], { rootsResolved: true }))
+        .toBe(true);
+    } finally {
+      try { fs.unlinkSync(rootAlias); } catch { /* best-effort */ }
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('uses native case-insensitive containment without prefix confusion', () => {
+    const upperCaseFile = workspaceFile.toUpperCase();
+    expect(isPathAllowed(upperCaseFile, [workspace.toLowerCase()])).toBe(true);
+
+    const sibling = path.join(tmpRoot, 'WS-SIBLING');
+    fs.mkdirSync(sibling);
+    const siblingFile = path.join(sibling, 'DOC.MD');
+    fs.writeFileSync(siblingFile, 'outside');
+    try {
+      expect(isPathAllowed(siblingFile.toLowerCase(), [workspace.toUpperCase()])).toBe(false);
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects relative paths', () => {
+    expect(isPathAllowed('relative/path.md', [workspace])).toBe(false);
+  });
+
+  it('ignores relative and empty allowed roots', () => {
+    expect(isPathAllowed(workspaceFile, ['', 'relative/root'])).toBe(false);
+  });
+
+  it('rejects empty inputs', () => {
+    expect(isPathAllowed('', [workspace])).toBe(false);
+    expect(isPathAllowed(workspaceFile, [])).toBe(false);
+  });
+
+  it('treats missing candidate as lexical resolve (still honors roots)', () => {
+    const ghost = path.join(workspace, 'does-not-exist.md');
+    expect(isPathAllowed(ghost, [workspace])).toBe(true);
+    const ghostOutside = path.join(tmpRoot, 'outside', 'never.md');
+    expect(isPathAllowed(ghostOutside, [workspace])).toBe(false);
+  });
+
+  it('switching allowed roots enforces isolation between workspaces', () => {
+    const wsB = path.join(tmpRoot, 'ws-b');
+    fs.mkdirSync(wsB, { recursive: true });
+    const fileB = path.join(wsB, 'b.md');
+    fs.writeFileSync(fileB, 'b');
+    try {
+      // Under ws-a's scope, ws-b is invisible
+      expect(isPathAllowed(fileB, [workspace, attachments])).toBe(false);
+      // Under ws-b's scope, ws-a is invisible
+      expect(isPathAllowed(workspaceFile, [wsB])).toBe(false);
+    } finally {
+      fs.rmSync(wsB, { recursive: true, force: true });
+    }
+  });
+});

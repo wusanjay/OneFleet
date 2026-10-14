@@ -1,0 +1,333 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  hardenedWebPreferences,
+  installExternalNavigationGuard,
+  installHtmlPreviewNavigationGuard,
+  isHtmlPreviewUrl,
+  HTML_PREVIEW_CSP,
+  HTML_PREVIEW_SANDBOX_FLAGS,
+  safeExternalHttpUrl,
+  safeExternalUserActionUrl,
+  safeLocalCliAuthUrl,
+  withHtmlPreviewAssetPolicy,
+  withHtmlPreviewPolicy,
+} from '../../../src/main/util/window-security';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+describe('window security baseline', () => {
+  it('cannot be weakened by caller overrides', () => {
+    const prefs = hardenedWebPreferences({
+      contextIsolation: false,
+      nodeIntegration: true,
+      sandbox: false,
+      webSecurity: false,
+      plugins: true,
+    });
+    expect(prefs).toMatchObject({
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      plugins: true,
+    });
+  });
+
+  it('accepts only credential-free HTTP(S) URLs', () => {
+    expect(safeExternalHttpUrl('https://example.test/docs?q=1')).toBe('https://example.test/docs?q=1');
+    expect(safeExternalHttpUrl('http://example.test:9000/path')).toBe('http://example.test:9000/path');
+    for (const value of [
+      'file:///etc/passwd',
+      'javascript:alert(1)',
+      'data:text/html,boom',
+      'chat-app://cid/a/b/index.html',
+      'https://user:pass@example.test/',
+      'https://example.test/\nfile:///etc/passwd',
+      'https://',
+      '',
+    ]) {
+      expect(safeExternalHttpUrl(value), value).toBeNull();
+    }
+  });
+
+  it('strictly validates user-clicked mail, phone, and XMPP links', () => {
+    for (const value of [
+      'https://example.test/docs?q=1',
+      'mailto:alice@example.com',
+      'mailto:alice@example.com?subject=Hello',
+      'tel:+86-13800138000',
+      'sms:+8613800138000',
+      'callto:+1 (555) 0100',
+      'xmpp:alice@example.com',
+    ]) {
+      expect(safeExternalUserActionUrl(value), value).toBe(value);
+    }
+
+    for (const value of [
+      'mailto:not-an-address',
+      'mailto:alice@example.com?subject=Hello%0AInjected',
+      'mailto:alice@example.com?attach=/etc/passwd',
+      'tel:$(open evil)',
+      'sms:+123?body=hello',
+      'xmpp:alice@example.com?message',
+      'file:///etc/passwd',
+      'javascript:alert(1)',
+      'chat-app://cid/a/b/index.html',
+      'kb-file://kb/private.pdf',
+      'blob:https://example.test/id',
+    ]) {
+      expect(safeExternalUserActionUrl(value), value).toBeNull();
+    }
+  });
+
+  it('accepts only exact official local CLI authorization routes', () => {
+    for (const value of [
+      'https://open.feishu.cn/page/cli?user_code=FEISHU-42',
+      'https://open.larksuite.com/page/cli?user_code=LARK-42',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=FEISHU-42',
+      'https://accounts.larksuite.com/oauth/v1/device/verify?flow_id=flow-2&user_code=LARK-42',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=DING-42',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=WECOM-42',
+      'https://identity.constantcontact.com/activate?user_code=CODE-42',
+    ]) {
+      expect(safeLocalCliAuthUrl(value), value).toBe(value);
+    }
+
+    for (const value of [
+      'http://open.feishu.cn/page/cli?user_code=CODE',
+      'https://open.feishu.cn.evil.test/page/cli?user_code=CODE',
+      'https://user@open.feishu.cn/page/cli?user_code=CODE',
+      'https://open.feishu.cn:444/page/cli?user_code=CODE',
+      'https://open.feishu.cn/page/cli/extra?user_code=CODE',
+      'https://open.feishu.cn/page/cli',
+      'https://open.feishu.cn/page/cli?user_code=ONE&user_code=TWO',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?user_code=CODE',
+      'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow&user_code=%0A',
+      'https://open.feishu.cn/page/cli?user_code=CODE#fragment',
+      'http://login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com.evil.test/oauth2/device/verify.htm?user_code=CODE',
+      'https://user@login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com:444/oauth2/device/verify.htm?user_code=CODE',
+      'https://login.dingtalk.com/oauth2/device/verify.htm/extra?user_code=CODE',
+      'https://login.dingtalk.com/oauth2/device/verify.htm',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=ONE&user_code=TWO',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=%0A',
+      'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=CODE#fragment',
+      'javascript:alert(1)',
+      'https://work.weixin.qq.com.evil.test/ai/qc/gen?source=wecom_cli_external&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/generate?source=wecom_cli_external&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external',
+      'https://work.weixin.qq.com/ai/qc/gen?source=other&scode=CODE',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=ONE&scode=TWO',
+      'https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=%0A',
+      'https://identity.constantcontact.com/activate',
+      'https://identity.constantcontact.com.evil.test/activate?user_code=CODE',
+    ]) {
+      expect(safeLocalCliAuthUrl(value), value).toBeNull();
+    }
+  });
+
+  it('denies every window.open and opens only safe URLs externally', async () => {
+    let openHandler!: (details: { url: string }) => { action: 'deny' };
+    let navigateHandler!: (event: { preventDefault(): void }, url: string) => void;
+    const webContents = {
+      setWindowOpenHandler: vi.fn((handler) => { openHandler = handler; }),
+      on: vi.fn((_event, handler) => { navigateHandler = handler; }),
+    };
+    const openExternal = vi.fn(async () => undefined);
+    installExternalNavigationGuard(webContents, openExternal);
+
+    expect(openHandler({ url: 'https://example.test/a' })).toEqual({ action: 'deny' });
+    expect(openHandler({ url: 'mailto:alice@example.test' })).toEqual({ action: 'deny' });
+    expect(openHandler({ url: 'javascript:alert(1)' })).toEqual({ action: 'deny' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledWith('https://example.test/a');
+
+    const externalEvent = { preventDefault: vi.fn() };
+    navigateHandler(externalEvent, 'https://example.test/b');
+    const localEvent = { preventDefault: vi.fn() };
+    navigateHandler(localEvent, 'file:///tmp/other.html');
+    expect(externalEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(localEvent.preventDefault).toHaveBeenCalledOnce();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(openExternal).toHaveBeenCalledTimes(2);
+    expect(openExternal).toHaveBeenLastCalledWith('https://example.test/b');
+  });
+
+  it('reports shell failures without allowing the navigation', async () => {
+    let openHandler!: (details: { url: string }) => { action: 'deny' };
+    const webContents = {
+      setWindowOpenHandler: (handler: typeof openHandler) => { openHandler = handler; },
+      on: vi.fn(),
+    };
+    const failure = new Error('shell failed');
+    const warn = vi.fn();
+    installExternalNavigationGuard(webContents, async () => { throw failure; }, warn);
+    expect(openHandler({ url: 'https://example.test/' })).toEqual({ action: 'deny' });
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(failure));
+  });
+});
+
+describe('local HTML preview policy', () => {
+  it('preserves the streamed response while allowing Web resources and preserving response metadata', async () => {
+    const original = new Response('preview body', {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: {
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-cache',
+        'Content-Range': 'bytes 0-11/12',
+        'Content-Type': 'text/html',
+      },
+    });
+
+    const secured = withHtmlPreviewPolicy(original);
+
+    expect(secured.status).toBe(206);
+    expect(secured.statusText).toBe('Partial Content');
+    expect(secured.headers.get('Accept-Ranges')).toBe('bytes');
+    expect(secured.headers.get('Cache-Control')).toBe('no-cache');
+    expect(secured.headers.get('Content-Range')).toBe('bytes 0-11/12');
+    expect(secured.headers.get('Content-Type')).toBe('text/html');
+    expect(secured.headers.get('Content-Security-Policy')).toBe(HTML_PREVIEW_CSP);
+    expect(HTML_PREVIEW_CSP).toContain("script-src chat-media://local http: https: 'unsafe-inline'");
+    expect(HTML_PREVIEW_CSP).toContain('connect-src chat-media://local http: https: ws: wss:');
+    expect(HTML_PREVIEW_CSP).toContain('img-src chat-media://local http: https: data: blob:');
+    expect(HTML_PREVIEW_CSP).toContain('frame-src chat-media://local http: https:');
+    expect(secured.headers.get('Referrer-Policy')).toBe('no-referrer');
+    expect(secured.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(await secured.text()).toBe('preview body');
+  });
+
+  it('applies the file viewer sandbox to a top-level preview document only on request', () => {
+    const page = () => new Response('<p>x</p>', { headers: { 'Content-Type': 'text/html' } });
+    expect(withHtmlPreviewPolicy(page()).headers.get('Content-Security-Policy')).toBe(HTML_PREVIEW_CSP);
+    expect(withHtmlPreviewPolicy(page(), { sandboxDocument: true }).headers.get('Content-Security-Policy'))
+      .toBe(`${HTML_PREVIEW_CSP}; sandbox ${HTML_PREVIEW_SANDBOX_FLAGS}`);
+    expect(HTML_PREVIEW_SANDBOX_FLAGS).not.toContain('allow-same-origin');
+    expect(HTML_PREVIEW_SANDBOX_FLAGS).not.toContain('allow-top-navigation');
+  });
+
+  it('keeps the file viewer iframe sandbox identical to the preview check sandbox', () => {
+    const viewer = fs.readFileSync(
+      path.resolve(__dirname, '../../../src/renderer/modules/chat-file-viewer.js'),
+      'utf8',
+    );
+    const htmlBody = viewer.slice(viewer.indexOf('async function _renderHtmlBody('));
+    expect(htmlBody).toContain(`const sandbox = '${HTML_PREVIEW_SANDBOX_FLAGS}';`);
+  });
+
+  it('grants CORS to preview assets without changing their bytes or range metadata', async () => {
+    const original = new Response('body{color:red}', {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: { 'Content-Type': 'text/css; charset=utf-8', 'Content-Range': 'bytes 0-14/15' },
+    });
+
+    const granted = withHtmlPreviewAssetPolicy(original);
+
+    expect(granted.status).toBe(206);
+    expect(granted.statusText).toBe('Partial Content');
+    expect(granted.headers.get('Content-Type')).toBe('text/css; charset=utf-8');
+    expect(granted.headers.get('Content-Range')).toBe('bytes 0-14/15');
+    expect(granted.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(granted.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(granted.headers.get('Content-Security-Policy')).toBeNull();
+    expect(await granted.text()).toBe('body{color:red}');
+  });
+
+  it.each([
+    'chat-media://local/Users/test/preview.html',
+    'chat-media://local/C:/Users/test/preview.HTM?v=2#slide',
+    'chat-media://local/Users/test/preview%2Ehtml',
+  ])('recognizes the validated local HTML route: %s', (url) => {
+    expect(isHtmlPreviewUrl(url)).toBe(true);
+  });
+
+  it.each([
+    'chat-media://cid/conversation/preview.html',
+    'chat-media://local/Users/test/preview.html.png',
+    'chat-media://local/Users/test/preview.xhtml',
+    'https://example.test/preview.html',
+    'data:text/html,preview',
+    'chat-media://local/Users/test/%E0%A4%A.html',
+  ])('rejects route look-alikes: %s', (url) => {
+    expect(isHtmlPreviewUrl(url)).toBe(false);
+  });
+
+  it('allows HTTP navigation while blocking privileged document schemes', () => {
+    let navigate!: (event: {
+      preventDefault(): void;
+      url: string;
+      isMainFrame: boolean;
+      frame?: { url: string } | null;
+      initiator?: { url: string } | null;
+    }) => void;
+    installHtmlPreviewNavigationGuard({
+      on: (_event, handler) => { navigate = handler; },
+    });
+
+    const remote = {
+      preventDefault: vi.fn(),
+      url: 'https://example.test/collect?private=value',
+      isMainFrame: false,
+      frame: { url: 'chat-media://local/Users/test/preview.html' },
+    };
+    navigate(remote);
+    expect(remote.preventDefault).not.toHaveBeenCalled();
+
+    const fetchLikeDataNavigation = {
+      preventDefault: vi.fn(),
+      url: 'data:text/html,escape',
+      isMainFrame: false,
+      initiator: { url: 'chat-media://local/Users/test/preview.htm?v=2' },
+    };
+    navigate(fetchLikeDataNavigation);
+    expect(fetchLikeDataNavigation.preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it('allows initial/non-preview navigation and validated local follow-up documents', () => {
+    let navigate!: (event: {
+      preventDefault(): void;
+      url: string;
+      isMainFrame: boolean;
+      frame?: { url: string } | null;
+      initiator?: { url: string } | null;
+    }) => void;
+    installHtmlPreviewNavigationGuard({
+      on: (_event, handler) => { navigate = handler; },
+    });
+
+    const initial = {
+      preventDefault: vi.fn(),
+      url: 'chat-media://local/Users/test/preview.html',
+      isMainFrame: false,
+      frame: { url: 'about:blank' },
+      initiator: { url: 'file:///renderer/index.html' },
+    };
+    navigate(initial);
+    expect(initial.preventDefault).not.toHaveBeenCalled();
+
+    const localFollowUp = {
+      preventDefault: vi.fn(),
+      url: 'chat-media://local/Users/test/second.html',
+      isMainFrame: false,
+      frame: { url: 'chat-media://local/Users/test/preview.html' },
+    };
+    navigate(localFollowUp);
+    expect(localFollowUp.preventDefault).not.toHaveBeenCalled();
+
+    const ordinaryFrame = {
+      preventDefault: vi.fn(),
+      url: 'https://example.test/',
+      isMainFrame: false,
+      frame: { url: 'chat-app://cid/a/b/index.html' },
+    };
+    navigate(ordinaryFrame);
+    expect(ordinaryFrame.preventDefault).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,830 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { ARTIFACT_FRAME } from '../../../src/main/features/chat_artifacts';
+import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../../../src/main/util/chat-media-url';
+import { HTML_PREVIEW_SANDBOX_FLAGS } from '../../../src/main/util/window-security';
+import {
+  renderInteractiveHtmlSmoke,
+  renderResponsiveHtmlPreview,
+  type HtmlPreviewRuntimeDeps,
+} from '../../../src/main/features/html_preview';
+
+let root: string;
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-html-preview-feature-'));
+  fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><main>Preview</main>');
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+function pageEvidence(width: number, overflow = 0, unreachable = 0, scrollHeight = 900) {
+  return {
+    readyState: 'complete',
+    title: 'Preview',
+    visibleTextChars: 7,
+    scrollWidth: width + overflow,
+    scrollHeight,
+    horizontalOverflowPx: overflow,
+    unreachableOverflowPx: unreachable,
+    focusableCount: 1,
+    headingCount: 1,
+    missingAltCount: 0,
+    failedImageCount: 0,
+    layoutIssues: overflow
+      ? [{ selector: '.cta', kind: 'right-overflow', pixels: overflow }]
+      : [],
+  };
+}
+
+function fakeRuntime(options: {
+  mobileOverflow?: number;
+  ineffectiveTransforms?: string[];
+  embedUnreachablePx?: number;
+  embedScrollHeight?: number;
+  externalRequest?: boolean;
+  consoleMessage?: { level: number | string; message: string; modern: boolean };
+  downloadCandidate?: boolean;
+  downloadObserved?: boolean;
+  downloadBytes?: number;
+  keyboardFocusIndicator?: boolean;
+  controlsExercised?: number;
+  stateChangesObserved?: number;
+  artifactMessagesObserved?: number;
+  stateControlsFound?: number;
+  stateControlsExercised?: number;
+  stateTransitionsObserved?: number;
+  formsFound?: number;
+  formsSubmitted?: number;
+  interactionFailureCount?: number;
+  interactionFailures?: string[];
+  interactionWarningCount?: number;
+  interactionWarnings?: string[];
+  loadFailure?: boolean;
+  extraRequests?: string[];
+} = {}): {
+  deps: HtmlPreviewRuntimeDeps;
+  windows: Array<{ options: Record<string, any>; destroyed: boolean }>;
+  requestDecisions: Array<{ url: string; cancel: boolean }>;
+  permissionDecisions: {
+    check: boolean[];
+    request: boolean[];
+    device: boolean[];
+    display: Array<Record<string, unknown>>;
+  };
+  sessionCleanup: { cache: boolean; storage: boolean };
+  loadedEntryUrls: string[];
+  bridgeAvailableAtLoad: boolean[];
+  interactionExecutions: string[];
+  protocolHandlers: Map<string, (request: Request) => Response | Promise<Response>>;
+  registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>>;
+} {
+  const windows: Array<{ options: Record<string, any>; destroyed: boolean }> = [];
+  const requestDecisions: Array<{ url: string; cancel: boolean }> = [];
+  const permissionDecisions = {
+    check: [] as boolean[],
+    request: [] as boolean[],
+    device: [] as boolean[],
+    display: [] as Array<Record<string, unknown>>,
+  };
+  const sessionCleanup = { cache: false, storage: false };
+  const loadedEntryUrls: string[] = [];
+  const bridgeAvailableAtLoad: boolean[] = [];
+  const interactionExecutions: string[] = [];
+  const protocolHandlers = new Map<string, (request: Request) => Response | Promise<Response>>();
+  const registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>> = [];
+  let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean }) => void) => void) | undefined;
+  const sessionListeners = new Map<string, Function>();
+  let tabKeyDowns = 0;
+
+  class FakeBrowserWindow {
+    options: Record<string, any>;
+    destroyed = false;
+    webContents: any;
+    listeners = new Map<string, Function>();
+
+    constructor(windowOptions: Record<string, any>) {
+      this.options = windowOptions;
+      const listeners = this.listeners;
+      this.webContents = {
+        setWindowOpenHandler: () => undefined,
+        on: (name: string, listener: Function) => listeners.set(name, listener),
+        focus: () => undefined,
+        sendInputEvent: (event: { type: string; keyCode?: string }) => {
+          if (event.type === 'keyDown' && event.keyCode === 'Tab') tabKeyDowns += 1;
+        },
+        executeJavaScript: async (script: string) => {
+          if (script.includes('document.body.setAttribute')) return true;
+          if (script.includes('visibleFocusIndicator')) {
+            return tabKeyDowns
+              ? {
+                fingerprint: 'button||||Contact',
+                label: 'Contact',
+                visible: true,
+                visibleFocusIndicator: options.keyboardFocusIndicator !== false,
+              }
+              : null;
+          }
+          if (script.includes('downloadCandidates')) {
+            interactionExecutions.push(String(windowOptions.width));
+            if (options.downloadObserved) {
+              sessionListeners.get('will-download')?.(
+                { preventDefault: () => undefined },
+                {
+                  getURL: () => 'blob:file-preview',
+                  getFilename: () => 'resume.txt',
+                  getMimeType: () => 'text/plain',
+                  getTotalBytes: () => options.downloadBytes ?? 128,
+                },
+              );
+            }
+            return {
+              controlsExercised: options.controlsExercised ?? 1,
+              stateChangesObserved: options.stateChangesObserved ?? 0,
+              artifactMessagesObserved: options.artifactMessagesObserved ?? 0,
+              stateControlsFound: options.stateControlsFound ?? 0,
+              stateControlsExercised: options.stateControlsExercised ?? 0,
+              stateTransitionsObserved: options.stateTransitionsObserved ?? 0,
+              downloadCandidates: options.downloadCandidate ? ['Download resume'] : [],
+              formsFound: options.formsFound ?? 0,
+              formsSubmitted: options.formsSubmitted ?? 0,
+              hashLinksChecked: 0,
+              mailtoLinksChecked: 0,
+              failureCount: options.interactionFailureCount
+                ?? options.interactionFailures?.length
+                ?? 0,
+              failures: options.interactionFailures ?? [],
+              warningCount: options.interactionWarningCount ?? options.interactionWarnings?.length ?? 0,
+              warnings: options.interactionWarnings ?? [],
+            };
+          }
+          {
+            const width = Number(windowOptions.width);
+            const isEmbed = width === ARTIFACT_FRAME.smokeWidth
+              && Number(windowOptions.height) === ARTIFACT_FRAME.maxHeight;
+            return script.startsWith('(async')
+              ? true
+              : { ...pageEvidence(
+                width,
+                width <= 480 ? options.mobileOverflow ?? 0 : 0,
+                isEmbed ? options.embedUnreachablePx ?? 0 : 0,
+                isEmbed ? options.embedScrollHeight ?? 900 : 900,
+              ), ...(options.ineffectiveTransforms ? { ineffectiveTransforms: options.ineffectiveTransforms } : {}) };
+          }
+        },
+        capturePage: async () => ({
+          getSize: () => ({ width: Number(windowOptions.width), height: Number(windowOptions.height) }),
+          toPNG: () => Buffer.from(`png:${windowOptions.width}x${windowOptions.height}`),
+        }),
+      };
+      (windows as any).push(this);
+    }
+
+    async loadURL(url: string) {
+      loadedEntryUrls.push(url);
+      const entryPath = url.startsWith('chat-media:') ? chatMediaLocalPathFromUrl(url) : fileURLToPath(url);
+      bridgeAvailableAtLoad.push(fs.existsSync(path.join(path.dirname(entryPath), '__orkas', 'bridge.js')));
+      requestHandler?.({ url }, (decision) => requestDecisions.push({ url, cancel: decision.cancel }));
+      if (options.loadFailure) throw new Error('synthetic preview load failure');
+      for (const extra of options.extraRequests ?? []) {
+        requestHandler?.({ url: extra }, (decision) => requestDecisions.push({ url: extra, cancel: decision.cancel }));
+      }
+      if (options.externalRequest) {
+        const external = 'https://example.invalid/tracker.png';
+        requestHandler?.(
+          { url: external },
+          (decision) => requestDecisions.push({ url: external, cancel: decision.cancel }),
+        );
+      }
+      if (options.consoleMessage) {
+        const { level, message, modern } = options.consoleMessage;
+        const listener = this.listeners.get('console-message');
+        if (modern) listener?.({ level, message });
+        else listener?.({}, level, message);
+      }
+    }
+
+    destroy() {
+      this.destroyed = true;
+    }
+  }
+
+  const deps: HtmlPreviewRuntimeDeps = {
+    loadElectron: async () => ({
+      BrowserWindow: FakeBrowserWindow as any,
+      session: {
+        fromPartition: () => ({
+          on: (name: string, listener: Function) => sessionListeners.set(name, listener),
+          removeAllListeners: (name: string) => sessionListeners.delete(name),
+          setPermissionCheckHandler: (handler: Function | null) => {
+            if (handler) permissionDecisions.check.push(handler(null, 'clipboard-read', 'file://preview', {}));
+          },
+          setPermissionRequestHandler: (handler: Function | null) => {
+            if (handler) {
+              handler(null, 'media', (allowed: boolean) => permissionDecisions.request.push(allowed), {});
+            }
+          },
+          setDevicePermissionHandler: (handler: Function | null) => {
+            if (handler) permissionDecisions.device.push(handler({ deviceType: 'usb' }));
+          },
+          setDisplayMediaRequestHandler: (handler: Function | null) => {
+            if (handler) {
+              handler({}, (streams: Record<string, unknown>) => {
+                permissionDecisions.display.push(streams);
+              });
+            }
+          },
+          protocol: {
+            handle: (scheme: string, handler: (request: Request) => Response | Promise<Response>) => {
+              protocolHandlers.set(scheme, handler);
+              registeredProtocolHandlers.push(handler);
+            },
+            unhandle: (scheme: string) => { protocolHandlers.delete(scheme); },
+            isProtocolHandled: (scheme: string) => protocolHandlers.has(scheme),
+          },
+          clearCache: async () => { sessionCleanup.cache = true; },
+          clearStorageData: async () => { sessionCleanup.storage = true; },
+          webRequest: {
+            onBeforeRequest: (handler: typeof requestHandler) => {
+              requestHandler = handler;
+            },
+          },
+        } as any),
+      },
+    }),
+  };
+  return {
+    deps,
+    windows,
+    requestDecisions,
+    permissionDecisions,
+    sessionCleanup,
+    loadedEntryUrls,
+    bridgeAvailableAtLoad,
+    interactionExecutions,
+    protocolHandlers,
+    registeredProtocolHandlers,
+  };
+}
+
+it.each([
+  [2, false, false], [3, false, true], ['warning', true, false], ['error', true, true],
+] as const)('classifies console level %s (modern=%s) without losing diagnostics', async (level, modern, blocks) => {
+  const runtime = fakeRuntime({ consoleMessage: { level, modern, message: 'Synthetic diagnostic' } });
+  const { evidence } = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), [
+    { name: 'desktop', width: 1280, height: 800 },
+  ], runtime.deps);
+  expect(evidence.ok).toBe(!blocks);
+  expect(evidence.viewports[0].consoleErrors).toEqual(blocks ? ['Synthetic diagnostic'] : []);
+  expect(evidence.warnings).toEqual(blocks ? [] : ['desktop: Synthetic diagnostic']);
+});
+
+const viewports = [
+  { name: 'desktop' as const, width: 1440, height: 900 },
+  { name: 'mobile' as const, width: 390, height: 844 },
+] as const;
+
+describe('responsive HTML preview renderer', () => {
+  it('uses hardened isolated windows and returns ordered desktop/mobile screenshots', async () => {
+    const runtime = fakeRuntime();
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.viewports.map((item) => item.name)).toEqual(['desktop', 'mobile']);
+    expect(result.evidence.screenshotCaptures).toEqual([
+      { viewport: 'desktop', width: 1440, height: 900, captured: true },
+      { viewport: 'mobile', width: 390, height: 844, captured: true },
+    ]);
+    expect(result.evidence.interactions.keyboard).toMatchObject({
+      method: 'tab-key',
+      focusableFound: 1,
+      uniqueTabStopsVisited: 1,
+      visibleFocusIndicators: 1,
+      sequence: ['Contact'],
+      failures: [],
+    });
+    expect(result.evidence.interactions.performed).toBe(true);
+    expect(runtime.interactionExecutions).toEqual(['1440']);
+    expect(result.screenshots.map((value) => value.toString())).toEqual([
+      'png:1440x900',
+      'png:390x844',
+    ]);
+    expect(runtime.windows).toHaveLength(2);
+    for (const win of runtime.windows) {
+      expect(win.options).toMatchObject({
+        show: false,
+        useContentSize: true,
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          webSecurity: true,
+          backgroundThrottling: false,
+        },
+      });
+      expect(win.destroyed).toBe(true);
+    }
+    const entryUrl = pathToFileURL(fs.realpathSync(path.join(root, 'index.html'))).toString();
+    expect(runtime.requestDecisions).toEqual([
+      { url: entryUrl, cancel: false },
+      { url: entryUrl, cancel: false },
+    ]);
+    expect(runtime.permissionDecisions).toEqual({
+      check: [false],
+      request: [false],
+      device: [false],
+      display: [{}],
+    });
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
+  it('renders and audits only the one fixed viewport requested by the caller', async () => {
+    const runtime = fakeRuntime();
+    const mobileOnly = [{ name: 'mobile' as const, width: 390, height: 844 }];
+
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      mobileOnly,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.viewports.map((item) => item.name)).toEqual(['mobile']);
+    expect(result.evidence.screenshotCaptures).toEqual([
+      { viewport: 'mobile', width: 390, height: 844, captured: true },
+    ]);
+    expect(result.evidence.interactions.viewport).toBe('mobile');
+    expect(result.screenshots.map((value) => value.toString())).toEqual(['png:390x844']);
+    expect(runtime.windows).toHaveLength(1);
+    expect(runtime.windows[0].destroyed).toBe(true);
+  });
+
+  it('preserves render, layout, screenshot, and keyboard evidence without exercising UI behavior', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 7,
+      formsSubmitted: 3,
+      interactionFailures: ['enabled control produced no observable outcome: Sign in'],
+    });
+
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+      { interactions: false },
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.viewports).toMatchObject([{
+      name: 'desktop',
+      readyState: 'complete',
+      horizontalOverflowPx: 0,
+      consoleErrors: [],
+    }]);
+    expect(result.evidence.screenshotCaptures).toEqual([
+      { viewport: 'desktop', width: 1440, height: 900, captured: true },
+    ]);
+    expect(result.evidence.interactions).toMatchObject({
+      performed: false,
+      controlsExercised: 0,
+      formsSubmitted: 0,
+      failures: [],
+      keyboard: {
+        method: 'tab-key',
+        uniqueTabStopsVisited: 1,
+        visibleFocusIndicators: 1,
+        failures: [],
+      },
+    });
+    expect(runtime.interactionExecutions).toEqual([]);
+    expect(result.screenshots.map((value) => value.toString())).toEqual(['png:1440x900']);
+  });
+
+  it('turns mobile overflow into a blocking result instead of a successful screenshot-only claim', async () => {
+    const runtime = fakeRuntime({ mobileOverflow: 28 });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.viewports[1]).toMatchObject({
+      name: 'mobile',
+      width: 390,
+      scrollWidth: 418,
+      horizontalOverflowPx: 28,
+    });
+    expect(result.evidence.blockers).toContain(
+      'mobile: horizontal overflow is 28px (scrollWidth 418px > viewport 390px)',
+    );
+  });
+
+  it('returns the failing element when a rendered transform cannot apply, even with interactions disabled', async () => {
+    const runtime = fakeRuntime({ ineffectiveTransforms: ['#answer'] });
+    const result = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), [viewports[0]], runtime.deps, { interactions: false });
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.blockers).toEqual([
+      'desktop: CSS transform does not apply to non-replaced inline box: #answer',
+    ]);
+    expect(result.evidence.interactions.performed).toBe(false);
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
+  it('destroys the window and clears the isolated session after a render failure', async () => {
+    const runtime = fakeRuntime({ loadFailure: true });
+
+    await expect(renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      runtime.deps,
+    )).rejects.toThrow('synthetic preview load failure');
+
+    expect(runtime.windows).toHaveLength(1);
+    expect(runtime.windows[0]?.destroyed).toBe(true);
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
+  it('permits external resources without weakening local file containment', async () => {
+    const runtime = fakeRuntime({ externalRequest: true });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.blockedResourceCount).toBe(0);
+    expect(result.evidence.blockedResourceSamples).toEqual([]);
+    expect(runtime.requestDecisions.filter((item) => item.url.startsWith('https:')))
+      .toEqual([
+        { url: 'https://example.invalid/tracker.png', cancel: false },
+        { url: 'https://example.invalid/tracker.png', cancel: false },
+      ]);
+  });
+
+  it('records observed download metadata and rejects a download control that produces nothing', async () => {
+    const observed = fakeRuntime({ downloadCandidate: true, downloadObserved: true });
+    const passed = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      observed.deps,
+    );
+    expect(passed.evidence.ok).toBe(true);
+    expect(passed.evidence.interactions).toMatchObject({
+      downloadCandidates: ['Download resume'],
+      downloads: [{
+        filename: 'resume.txt',
+        mimeType: 'text/plain',
+        totalBytes: 128,
+        urlKind: 'blob',
+      }],
+    });
+
+    const missing = fakeRuntime({ downloadCandidate: true });
+    const failed = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      missing.deps,
+    );
+    expect(failed.evidence.ok).toBe(false);
+    expect(failed.evidence.blockers).toContain(
+      '1 download action(s) were exercised but only 0 download(s) were observed',
+    );
+
+    const empty = fakeRuntime({
+      downloadCandidate: true,
+      downloadObserved: true,
+      downloadBytes: 0,
+    });
+    const emptyPayload = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      empty.deps,
+    );
+    expect(emptyPayload.evidence.ok).toBe(false);
+    expect(emptyPayload.evidence.blockers).toContain(
+      '1 observed download(s) lacked a filename, MIME type, or non-empty payload',
+    );
+  });
+
+  it('rejects keyboard traversal when focused controls have no visible indicator', async () => {
+    const runtime = fakeRuntime({ keyboardFocusIndicator: false });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      viewports,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.interactions.keyboard).toMatchObject({
+      method: 'tab-key',
+      uniqueTabStopsVisited: 1,
+      visibleFocusIndicators: 0,
+      failures: ['Tab traversal found no visible focus indicator'],
+    });
+    expect(result.evidence.blockers).toContain('1 keyboard traversal check(s) failed');
+  });
+
+  it.each([false, true])('retains inconclusive coverage without hiding explicit failures (failure=%s)', async (explicitFailure) => {
+    const runtime = fakeRuntime({
+      controlsExercised: 7,
+      stateChangesObserved: 5,
+      stateControlsFound: 3,
+      stateControlsExercised: 3,
+      stateTransitionsObserved: 2,
+      formsFound: 3,
+      formsSubmitted: 3,
+      interactionWarnings: ['enabled control produced no observable outcome: Create account'],
+      interactionFailures: explicitFailure ? ['missing hash target for Help'] : [],
+    });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(!explicitFailure);
+    expect(result.evidence.interactions).toMatchObject({
+      stateControlsFound: 3,
+      stateControlsExercised: 3,
+      stateTransitionsObserved: 2,
+      formsFound: 3,
+      formsSubmitted: 3,
+      warningCount: 1,
+      warnings: ['enabled control produced no observable outcome: Create account'],
+      failureCount: explicitFailure ? 1 : 0,
+    });
+    expect(result.evidence.warnings).toContain('1 interaction check(s) were inconclusive: no observable change. '
+      + 'This does not establish a functional failure; details are in interactions.warnings.');
+    expect(result.evidence.blockers).toEqual(explicitFailure ? ['1 safe interaction check(s) failed: missing hash target for Help'] : []);
+  });
+
+  it('reports the true interaction failure count with at most ten bounded reasons', async () => {
+    const interactionFailures = Array.from(
+      { length: 12 },
+      (_, index) => `[case-${index + 1}] ${'x'.repeat(500)}`,
+    );
+    const runtime = fakeRuntime({
+      interactionFailureCount: 14,
+      interactionFailures,
+      interactionWarningCount: 17,
+      interactionWarnings: interactionFailures,
+    });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.interactions.failureCount).toBe(14);
+    expect(result.evidence.interactions.failures).toHaveLength(10);
+    expect(result.evidence.interactions.failures.every((failure) => failure.length <= 400)).toBe(true);
+    const blocker = result.evidence.blockers.find((item) => (
+      item.startsWith('14 safe interaction check(s) failed')
+    ));
+    expect(blocker).toContain('[case-10]');
+    expect(blocker).not.toContain('[case-11]');
+    expect(blocker).toContain('(4 more not shown)');
+    expect(result.evidence.interactions.warningCount).toBe(17);
+    expect(result.evidence.interactions.warnings).toHaveLength(10);
+    expect(result.evidence.interactions.warnings!.every(warning => warning.length <= 400)).toBe(true);
+    expect(result.evidence.warnings[0]).toContain('17 interaction check(s) were inconclusive');
+  });
+
+  /**
+   * 2026-08-26: the smoke validated at 1280x800 and 390x844 while the chat
+   * frame gives an artifact roughly 480x420. Three consecutive artifacts
+   * passed 9/9 and shipped clipped, because the one gate that runs before the
+   * card is exposed never measured the box the user gets.
+   */
+  it('measures the chat embed frame, not only a desktop window', async () => {
+    const runtime = fakeRuntime({ controlsExercised: 2, stateChangesObserved: 1 });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.viewports.map((view) => view.name)).toContain('embed');
+    expect(result.evidence.viewports.find((view) => view.name === 'embed')).toMatchObject({
+      width: ARTIFACT_FRAME.smokeWidth,
+      height: ARTIFACT_FRAME.maxHeight,
+    });
+  });
+
+  it('blocks an artifact whose content the frame hides with no way to scroll to it', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: 694,
+      embedUnreachablePx: 254,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(false);
+    const blocker = result.evidence.blockers.find((item) => item.startsWith('embed:'));
+    expect(blocker).toContain('254px of content sits below');
+    expect(blocker).toContain(`${ARTIFACT_FRAME.maxHeight}px chat frame`);
+    // The remediation has to name the cause, or the next attempt is the same
+    // full-screen shell with different padding.
+    expect(blocker).toContain('100vh');
+  });
+
+  it('lets merely-tall content through with a warning instead of a refusal', async () => {
+    // Scrolling inside the frame is the documented behaviour, not a defect.
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: 900,
+      embedUnreachablePx: 0,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.warnings.some((item) => (
+      item.startsWith('embed:') && item.includes('900px tall')
+    ))).toBe(true);
+  });
+
+  it('says nothing about the embed when the artifact fits the frame', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+      embedScrollHeight: ARTIFACT_FRAME.maxHeight - 40,
+      embedUnreachablePx: 0,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.blockers.some((item) => item.startsWith('embed:'))).toBe(false);
+    expect(result.evidence.warnings.some((item) => item.startsWith('embed:'))).toBe(false);
+  });
+
+  it('keeps unobserved artifact behavior advisory while requiring an operable control', async () => {
+    const staticRuntime = fakeRuntime({ controlsExercised: 1, stateChangesObserved: 0 });
+    const staticResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      staticRuntime.deps,
+    );
+    expect(staticResult.evidence.ok).toBe(true);
+    expect(staticResult.evidence.blockers).toEqual([]);
+    expect(staticResult.evidence.warnings).toContain(
+      'interactive artifact smoke observed no visible state change, artifact submission, or download; functional behavior remains unverified',
+    );
+    const noControls = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), fakeRuntime({ controlsExercised: 0 }).deps);
+    expect(noControls.evidence.ok).toBe(false);
+    expect(noControls.evidence.blockers).toContain('interactive artifact smoke found no operable control to exercise');
+
+    const downloadRuntime = fakeRuntime({
+      controlsExercised: 1,
+      downloadCandidate: true,
+      downloadObserved: true,
+    });
+    const downloadResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      downloadRuntime.deps,
+    );
+    expect(downloadResult.evidence.ok).toBe(true);
+
+    const interactiveRuntime = fakeRuntime({ controlsExercised: 2, stateChangesObserved: 1 });
+    const interactiveResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      interactiveRuntime.deps,
+      { bridgeJavaScript: 'window.orkasArtifact = { send() {} };' },
+    );
+    expect(interactiveResult.evidence.ok).toBe(true);
+    expect(interactiveResult.evidence.interactions).toMatchObject({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+    });
+    expect(interactiveRuntime.bridgeAvailableAtLoad).toEqual([true, true, true]);
+    expect(interactiveRuntime.loadedEntryUrls.every((url) => (
+      !fs.existsSync(path.dirname(fileURLToPath(url)))
+    ))).toBe(true);
+  });
+});
+
+describe('file viewer check', () => {
+  const desktop = [{ name: 'desktop' as const, width: 1440, height: 900 }];
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=',
+    'base64',
+  );
+
+  async function servedBy(runtime: ReturnType<typeof fakeRuntime>, absPath: string): Promise<Response> {
+    const [handler] = runtime.registeredProtocolHandlers;
+    return handler(new Request(chatMediaLocalUrl(absPath)));
+  }
+
+  it('loads a plain page through chat-media under the file viewer sandbox and releases the handler', async () => {
+    const runtime = fakeRuntime();
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true },
+    );
+
+    const entryUrl = chatMediaLocalUrl(fs.realpathSync(path.join(root, 'index.html')));
+    expect(result.evidence.ok).toBe(true);
+    expect(runtime.loadedEntryUrls).toEqual([entryUrl]);
+    expect(runtime.requestDecisions).toEqual([{ url: entryUrl, cancel: false }]);
+    expect(runtime.registeredProtocolHandlers).toHaveLength(1);
+    expect(runtime.protocolHandlers.size).toBe(0);
+
+    const doc = await servedBy(runtime, path.join(root, 'index.html'));
+    expect(doc.status).toBe(200);
+    expect(doc.headers.get('Content-Type')).toBe('text/html');
+    expect(doc.headers.get('Content-Security-Policy')).toContain("script-src chat-media://local");
+    expect(doc.headers.get('Content-Security-Policy')).toMatch(new RegExp(`; sandbox ${HTML_PREVIEW_SANDBOX_FLAGS}$`));
+    expect(await doc.text()).toContain('Preview');
+  });
+
+  it('serves same-folder assets with CORS and media without it, never hidden or outside files', async () => {
+    fs.writeFileSync(path.join(root, 'style.css'), 'main{color:red}');
+    fs.mkdirSync(path.join(root, 'assets'));
+    fs.writeFileSync(path.join(root, 'assets', 'app.mjs'), 'export {};');
+    fs.writeFileSync(path.join(root, 'data.json'), '{"a":1}');
+    fs.writeFileSync(path.join(root, 'logo.png'), png1x1);
+    fs.mkdirSync(path.join(root, '.git'));
+    fs.writeFileSync(path.join(root, '.git', 'config.json'), '{}');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-html-preview-outside-'));
+    fs.writeFileSync(path.join(outside, 'leak.json'), '{"secret":1}');
+    try {
+      const runtime = fakeRuntime();
+      await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true });
+
+      const css = await servedBy(runtime, path.join(root, 'style.css'));
+      expect(css.status).toBe(200);
+      expect(css.headers.get('Content-Type')).toBe('text/css; charset=utf-8');
+      expect(css.headers.get('Access-Control-Allow-Origin')).toBe('*');
+      expect(css.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      const mod = await servedBy(runtime, path.join(root, 'assets', 'app.mjs'));
+      expect(mod.status).toBe(200);
+      expect(mod.headers.get('Content-Type')).toBe('text/javascript; charset=utf-8');
+      const data = await servedBy(runtime, path.join(root, 'data.json'));
+      expect(data.headers.get('Content-Type')).toBe('application/json; charset=utf-8');
+      expect(await data.json()).toEqual({ a: 1 });
+      const image = await servedBy(runtime, path.join(root, 'logo.png'));
+      expect(image.status).toBe(200);
+      expect(image.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect((await servedBy(runtime, path.join(root, '.git', 'config.json'))).status).toBe(403);
+      expect((await servedBy(runtime, path.join(outside, 'leak.json'))).status).toBe(403);
+      expect((await servedBy(runtime, path.join(root, 'missing.css'))).status).toBe(404);
+      expect((await servedBy(runtime, path.join(root, 'notes.txt'))).status).toBe(400);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks and labels chat-media requests outside the entry folder', async () => {
+    const outsideUrl = chatMediaLocalUrl(path.join(os.tmpdir(), 'orkas-elsewhere', 'app.js'));
+    const runtime = fakeRuntime({ extraRequests: [outsideUrl] });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true },
+    );
+
+    expect(runtime.requestDecisions).toContainEqual({ url: outsideUrl, cancel: true });
+    expect(result.evidence.blockedResourceSamples).toContain('chat-media:outside-entry-directory');
+    expect(result.evidence.ok).toBe(false);
+  });
+
+  it('confines linked media, documents and SVG image references to the entry directory', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-preview-linked-'));
+    try {
+      for (const name of ['image.png', 'document.html']) {
+        fs.writeFileSync(path.join(outside, name), name.endsWith('.png') ? png1x1 : 'outside document');
+        fs.symlinkSync(path.join(outside, name), path.join(root, name));
+      }
+      fs.writeFileSync(path.join(root, 'sheet.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><image href="image.png"/></svg>');
+      fs.writeFileSync(path.join(root, 'inside.png'), png1x1);
+      fs.symlinkSync(path.join(root, 'inside.png'), path.join(root, 'alias.png'));
+      const linkedUrl = chatMediaLocalUrl(path.join(root, 'image.png'));
+      const runtime = fakeRuntime({ extraRequests: [linkedUrl] });
+      await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps, { fileViewer: true });
+      expect(runtime.requestDecisions).toContainEqual({ url: linkedUrl, cancel: true });
+      for (const name of ['image.png', 'document.html']) {
+        expect((await servedBy(runtime, path.join(root, name))).status).toBe(403);
+      }
+      const svg = await servedBy(runtime, path.join(root, 'sheet.svg'));
+      expect(svg.status).toBe(400);
+      expect(await svg.text()).not.toContain(png1x1.toString('base64'));
+      const inside = await servedBy(runtime, path.join(root, 'alias.png'));
+      expect(inside.status).toBe(200);
+      expect(Buffer.from(await inside.arrayBuffer())).toEqual(png1x1);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
+  it('keeps file:// loading by default for generated artifact checks', async () => {
+    const runtime = fakeRuntime();
+    await renderResponsiveHtmlPreview(path.join(root, 'index.html'), desktop, runtime.deps);
+
+    expect(runtime.loadedEntryUrls).toEqual([pathToFileURL(fs.realpathSync(path.join(root, 'index.html'))).toString()]);
+    expect(runtime.registeredProtocolHandlers).toHaveLength(0);
+  });
+});

@@ -1,0 +1,913 @@
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
+import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as vm from 'node:vm';
+
+import {
+  APP_NAV_ACTIONS,
+  APP_NAV_SURFACES,
+  appNavSurfaceDescription,
+  findAppNavSurface,
+  validateAppNavRequest,
+} from '../../../../src/main/features/group_chat/app_nav';
+import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools';
+
+const RENDERER_CONVERSATION = path.join(
+  __dirname, '..', '..', '..', '..', 'src', 'renderer', 'modules', 'conversation.js',
+);
+const RENDERER_CONNECTORS = path.join(
+  __dirname, '..', '..', '..', '..', 'src', 'renderer', 'modules', 'connectors.js',
+);
+const RENDERER_AUTO = path.join(
+  __dirname, '..', '..', '..', '..', 'src', 'renderer', 'modules', 'auto.js',
+);
+const RENDERER_PROJECTS = path.join(
+  __dirname, '..', '..', '..', '..', 'src', 'renderer', 'modules', 'projects.js',
+);
+const RENDERER_STYLE = path.join(
+  __dirname, '..', '..', '..', '..', 'src', 'renderer', 'style.css',
+);
+// The real loader rejects eager scripts. A permissive loader mock previously
+// concealed the broken connector navigation path from these contract tests.
+const lazyFeatures = new Set<string>(vm.runInNewContext(
+  fs.readFileSync(path.join(path.dirname(RENDERER_CONVERSATION), 'lazy-features.js'), 'utf8')
+    + '\nObject.keys(_rendererFeatureManifest)',
+  { window: {} },
+));
+
+function extractAssignedAsyncFunction(source: string, marker: string): string {
+  const markerAt = source.indexOf(marker);
+  expect(markerAt, `${marker} must exist`).toBeGreaterThan(-1);
+  const functionAt = source.indexOf('async function', markerAt);
+  expect(functionAt).toBeGreaterThan(markerAt);
+  const bodyAt = source.indexOf('{', functionAt);
+  let depth = 0;
+  for (let i = bodyAt; i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(functionAt, i + 1);
+    }
+  }
+  throw new Error(`unterminated assigned function: ${marker}`);
+}
+
+function rendererSurfaceIds(): string[] {
+  const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+  const start = source.indexOf('const _APP_NAV_SURFACES = {');
+  expect(start, 'renderer executor map _APP_NAV_SURFACES must exist in conversation.js').toBeGreaterThan(-1);
+  const end = source.indexOf('\n};', start);
+  expect(end).toBeGreaterThan(start);
+  const block = source.slice(start, end);
+  const ids: string[] = [];
+  // Top-level executor keys only: quoted ('settings.models') or bare
+  // (connectors) identifiers immediately followed by an object literal.
+  for (const match of block.matchAll(/^\s{2}(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*)):\s*\{/gm)) {
+    ids.push(match[1] || match[2]!);
+  }
+  return ids;
+}
+
+function rendererSurfaceActions(): Record<string, string[]> {
+  const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+  const start = source.indexOf('const _APP_NAV_SURFACES = {');
+  const end = source.indexOf('\n};', start);
+  const block = source.slice(start, end);
+  const entries = [...block.matchAll(
+    /^\s{2}(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*)):\s*\{/gm,
+  )];
+  return Object.fromEntries(entries.map((entry, index) => {
+    const id = entry[1] || entry[2]!;
+    const body = block.slice(entry.index ?? 0, entries[index + 1]?.index ?? block.length);
+    const actionList = body.match(/actions:\s*\[([^\]]*)\]/)?.[1] ?? '';
+    return [id, [...actionList.matchAll(/'([^']+)'/g)].map((match) => match[1])];
+  }));
+}
+
+function rendererNavHarness(failingFeature = '') {
+  const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+  const start = source.indexOf('const _APP_NAV_SURFACES = {');
+  const end = source.indexOf('function _mountAppNavRequests', start);
+  const calls: string[] = [];
+  const context: any = {
+    calls,
+    currentCid: 'conversation-1',
+    setView: (view: string) => calls.push(`view:${view}`),
+    loadRendererFeature: async (feature: string) => {
+      calls.push(`load:${feature}`);
+      if (!lazyFeatures.has(feature)) throw new Error('unknown renderer feature');
+      if (feature === failingFeature) throw new Error(`feature unavailable: ${feature}`);
+      if (feature === 'settings') {
+        context.window.activateSettingsTab = (tab: string) => calls.push(`settings:${tab}`);
+      }
+    },
+    openMarketplace: (kind: string) => calls.push(`marketplace:${kind}`),
+    setTimeout: (fn: () => void) => fn(),
+    document: {
+      getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
+    },
+    window: {
+      openCreditsUsage: (returnView: string, returnCid: string) => {
+        calls.push(`credits:${returnView}:${returnCid}`);
+      },
+      openAgentModal: () => calls.push('agent:create'),
+      openAgentDetail: async (id: string) => { calls.push(`agent:configure:${id}`); return id !== 'missing'; },
+      openSkillModal: () => calls.push('skill:create'),
+      openAutoTaskDialog: () => calls.push('auto:create'),
+      openAutoTaskById: async (id: string) => { calls.push(`auto:configure:${id}`); return id !== 'missing'; },
+      openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
+      focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
+      openProjectsSurface: async (request: Record<string, string>) => {
+        calls.push(`project:${request.action}:${request.target_id || ''}`);
+        return request.target_id !== 'missing';
+      },
+    },
+  };
+  vm.runInNewContext(
+    `${source.slice(start, end)}\nglobalThis.__appNavSurfaces = _APP_NAV_SURFACES;`,
+    context,
+  );
+  return {
+    calls,
+    surfaces: (context as unknown as {
+      __appNavSurfaces: Record<string, {
+        createKey?: string;
+        open: (request: Record<string, string>) => Promise<void>;
+      }>;
+    }).__appNavSurfaces,
+  };
+}
+
+interface NavTargetLookups {
+  connectors?: Record<string, { name: string; iconSvg: string }>;
+  lateConnectors?: Record<string, { name: string; iconSvg: string }>;
+  throwingConnector?: string;
+  projects?: Array<{ project_id: string; name: string }>;
+  refreshedProjects?: Array<{ project_id: string; name: string }>;
+}
+
+function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {}) {
+  const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+  const start = source.indexOf('const _APP_NAV_SURFACES = {');
+  const end = source.indexOf('function _mountMarketplaceInstallRequests', start);
+  const calls: string[] = [];
+  const toasts: Array<{ message: string; variant?: string }> = [];
+
+  class FakeElement {
+    className = '';
+    dataset: Record<string, string> = {};
+    children: FakeElement[] = [];
+    innerHTML = '';
+    type = '';
+    disabled = false;
+    private text = '';
+
+    // Like the DOM, assigning text replaces every child node.
+    get textContent() { return this.text; }
+    set textContent(value: string) { this.text = value; this.children = []; }
+    private listeners = new Map<string, Array<() => void>>();
+
+    appendChild(child: FakeElement) { this.children.push(child); return child; }
+
+    addEventListener(type: string, listener: () => void) {
+      const listeners = this.listeners.get(type) ?? [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    click() { for (const listener of this.listeners.get('click') ?? []) listener(); }
+
+    querySelector(selector: string): FakeElement | null {
+      const descendants = this.children.flatMap((child) => [child, ...child.descendants()]);
+      if (selector === '.chat-app-nav-row') {
+        return descendants.find((node) => node.className.split(/\s+/).includes('chat-app-nav-row')) ?? null;
+      }
+      const prefix = '[data-app-nav="';
+      if (selector.startsWith(prefix) && selector.endsWith('"]')) {
+        const key = selector.slice(prefix.length, -2);
+        return descendants.find((node) => node.dataset.appNav === key) ?? null;
+      }
+      return null;
+    }
+
+    private descendants(): FakeElement[] {
+      return this.children.flatMap((child) => [child, ...child.descendants()]);
+    }
+  }
+
+  const host = new FakeElement();
+  const context = {
+    CSS: { escape: (value: string) => value },
+    document: {
+      createElement: () => new FakeElement(),
+      getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
+    },
+    ...(lookups.projects ? { _projectsCache: lookups.projects } : {}),
+    loadProjects: async (force: boolean) => {
+      calls.push(`projects:load:${force}`);
+      return lookups.refreshedProjects ?? lookups.projects ?? [];
+    },
+    window: {
+      uiIconHtml: (name: string) => `icon:${name}`,
+      connectorNavTarget: (id: string) => {
+        calls.push(`lookup:${id}`);
+        if (id === lookups.throwingConnector) throw new Error('catalog unavailable');
+        return lookups.connectors?.[id] ?? null;
+      },
+      loadConnectorNavTarget: async (id: string) => lookups.lateConnectors?.[id] ?? null,
+      openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
+      focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
+      openAgentModal: () => calls.push('agent:create'),
+      openAgentDetail: async (id: string) => { calls.push(`agent:configure:${id}`); return id !== 'missing'; },
+      openSkillModal: () => calls.push('skill:create'),
+      openAutoTaskDialog: () => calls.push('auto:create'),
+      openAutoTaskById: async (id: string) => { calls.push(`auto:configure:${id}`); return id !== 'missing'; },
+      openProjectsSurface: async (request: Record<string, string>) => {
+        calls.push(`project:${request.action}:${request.target_id || ''}`);
+        return request.target_id !== 'missing';
+      },
+    },
+    setView: (view: string) => calls.push(`view:${view}`),
+    loadRendererFeature: async (feature: string) => {
+      calls.push(`load:${feature}`);
+      if (!lazyFeatures.has(feature)) throw new Error('unknown renderer feature');
+      if (feature === failingFeature) throw new Error(`feature unavailable: ${feature}`);
+    },
+    openMarketplace: (kind: string) => calls.push(`marketplace:${kind}`),
+    setTimeout: (fn: () => void) => fn(),
+    _quickStartText: (_key: string, fallback: string) => fallback,
+    t: (key: string, values: { name?: string; target?: string } = {}) => `${key}:${values.name ?? values.target ?? ''}`,
+    uiToast: (message: string, opts: { variant?: string } = {}) => {
+      toasts.push({ message, variant: opts.variant });
+    },
+    _convLog: { warn: () => {} },
+  };
+  vm.runInNewContext(
+    `${source.slice(start, end)}\nglobalThis.__mountAppNavRequests = _mountAppNavRequests;`,
+    context,
+  );
+  return {
+    calls,
+    toasts,
+    host,
+    createHost: () => new FakeElement(),
+    mount: (context as unknown as {
+      __mountAppNavRequests: (target: FakeElement, message: Record<string, unknown>) => void;
+    }).__mountAppNavRequests,
+  };
+}
+
+describe('group_chat app_nav registry', () => {
+  it('declares unique surface ids with model-facing summaries', () => {
+    const ids = APP_NAV_SURFACES.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.length).toBeGreaterThan(0);
+    for (const surface of APP_NAV_SURFACES) {
+      expect(surface.id).toMatch(/^[a-z][a-z0-9_.]*$/);
+      expect(surface.summary.length).toBeGreaterThan(10);
+      expect(surface.actions.length).toBeGreaterThan(0);
+      expect(surface.actions).toContain('open');
+      expect(new Set(surface.actions).size).toBe(surface.actions.length);
+    }
+    expect(new Set(APP_NAV_ACTIONS)).toEqual(new Set(['open', 'create', 'add_custom', 'configure']));
+    expect(findAppNavSurface('settings.models')?.id).toBe('settings.models');
+    expect(findAppNavSurface('not-a-surface')).toBeNull();
+    const schemaDescription = appNavSurfaceDescription();
+    expect(estimateTextTokens(schemaDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    for (const surface of APP_NAV_SURFACES) expect(schemaDescription).toContain(surface.id);
+  });
+
+  it('carries app_nav_requests through the renderer legacy conversion', () => {
+    // Every non-streaming render path (history load, history refresh, the
+    // append fallback when the live row is already finalized) rebuilds the
+    // bubble from `_groupMsgToLegacy`. A staged card that the conversion
+    // drops is invisible after the first repaint even though the persisted
+    // message carries it — reported 2026-08-26 on the onboarding
+    // "help me set up a model" flow.
+    const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+    const start = source.indexOf('function _groupMsgToLegacy');
+    expect(start, '_groupMsgToLegacy must exist in conversation.js').toBeGreaterThan(-1);
+    const end = source.indexOf('\n}', start);
+    expect(end).toBeGreaterThan(start);
+    expect(source.slice(start, end)).toContain('app_nav_requests: gm.app_nav_requests');
+  });
+
+  it('labels the default open action as page navigation in every supported locale', () => {
+    const expected = {
+      en: 'Open page: {name}',
+      zh: '打开页面：{name}',
+      ja: 'ページを開く：{name}',
+      pt: 'Abrir página: {name}',
+    };
+    for (const [locale, copy] of Object.entries(expected)) {
+      const table = JSON.parse(fs.readFileSync(
+        path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales', `${locale}.json`),
+        'utf8',
+      ));
+      expect(table['chat.app_nav_open'], locale).toBe(copy);
+    }
+  });
+
+  it('localizes navigation failure recovery in every supported locale', () => {
+    for (const locale of ['en', 'zh', 'ja', 'pt']) {
+      const table = JSON.parse(fs.readFileSync(
+        path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales', `${locale}.json`),
+        'utf8',
+      ));
+      expect(table['chat.app_nav_failed'], locale).toBeTruthy();
+      expect(table['chat.app_nav_failed'], locale).not.toBe('chat.app_nav_failed');
+    }
+  });
+
+  it('matches the renderer executor map exactly (a staged card must always be openable)', () => {
+    // The tool enum comes from this registry while the click handler lives in
+    // the renderer; any drift ships a card that either cannot render or a
+    // surface the model can never stage.
+    expect(rendererSurfaceIds().sort()).toEqual(APP_NAV_SURFACES.map((s) => s.id).sort());
+    expect(rendererSurfaceActions()).toEqual(Object.fromEntries(
+      APP_NAV_SURFACES.map((surface) => [surface.id, [...surface.actions]]),
+    ));
+  });
+
+  it('validates action and target combinations at the staging boundary', () => {
+    expect(validateAppNavRequest({ surface_id: 'settings.models' })).toEqual({
+      ok: true,
+      request: { surface_id: 'settings.models', action: 'open' },
+    });
+    expect(validateAppNavRequest({ surface_id: 'connectors', action: 'add_custom' })).toEqual({
+      ok: true,
+      request: { surface_id: 'connectors', action: 'add_custom' },
+    });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'configure', target_id: 'agent-123',
+    })).toEqual({
+      ok: true,
+      request: { surface_id: 'agents', action: 'configure', target_id: 'agent-123' },
+    });
+    expect(validateAppNavRequest({ surface_id: 'settings.models', action: 'create' }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
+    expect(validateAppNavRequest({
+      surface_id: 'credits', action: 'open', target_id: 'account-settings',
+    })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('unknown surface_id: credits'),
+    });
+    expect(validateAppNavRequest({ surface_id: 'agents', action: 'configure' }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('target_id is required') });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'open', target_id: 'agent-123',
+    })).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/target_id requires action configure.*retry with action configure/),
+    });
+    expect(validateAppNavRequest({
+      surface_id: 'projects', action: 'open', target_id: 'project-123',
+    })).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/target_id requires action configure.*same target_id/),
+    });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'configure', target_id: 'bad\nidentifier',
+    })).toMatchObject({ ok: false, error: expect.stringContaining('bounded printable') });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'configure', target_id: 'x'.repeat(160),
+    })).toMatchObject({ ok: true });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'configure', target_id: 'x'.repeat(161),
+    })).toMatchObject({ ok: false, error: expect.stringContaining('bounded printable') });
+    expect(validateAppNavRequest({
+      surface_id: 'agents', action: 'configure', target_id: 'bad\u007fidentifier',
+    })).toMatchObject({ ok: false, error: expect.stringContaining('bounded printable') });
+    expect(validateAppNavRequest({ surface_id: 'agents', action: 'delete' }))
+      .toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
+  });
+
+  it('loads cold-start feature modules before invoking action-specific handlers', () => {
+    const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+    expect(source).toContain("_appNavLoadFeature('marketplace'");
+    expect(source).toContain('window.openConnectorSetupById');
+    expect(source).toContain('window.focusConnectorById');
+    expect(source).toContain('window.openAgentModal');
+    expect(source).toContain('window.openAgentDetail');
+    expect(source).toContain('window.openAutoTaskDialog');
+    expect(source).toContain('window.openAutoTaskById');
+  });
+
+  it('executes navigation actions through the owning renderer workflows after lazy loading', async () => {
+    const { calls, surfaces } = rendererNavHarness();
+
+    await surfaces['settings.models'].open({ action: 'open' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.splice(0)).toEqual([
+      'view:settings', 'load:settings', 'settings:credentials', 'settings:credentials',
+    ]);
+
+    await surfaces.connectors.open({ action: 'add_custom' });
+    expect(calls.splice(0)).toEqual([
+      'view:connectors', 'click:connectors-add-custom-btn',
+    ]);
+
+    await surfaces.connectors.open({ action: 'configure', target_id: 'connector-1' });
+    expect(calls.splice(0)).toEqual([
+      'view:connectors', 'connector:guided:connector-1',
+    ]);
+
+    await surfaces.agents.open({ action: 'create' });
+    expect(calls.splice(0)).toEqual(['view:agents', 'load:agents', 'agent:create']);
+
+    await surfaces.auto.open({ action: 'configure', target_id: 'task-1' });
+    expect(calls.splice(0)).toEqual(['view:auto', 'load:auto', 'auto:configure:task-1']);
+
+    await surfaces.projects.open({ action: 'configure', target_id: 'project-1' });
+    expect(calls.splice(0)).toEqual(['project:configure:project-1']);
+
+    await surfaces.apps.open({ action: 'open' });
+    expect(calls.splice(0)).toEqual(['view:apps']);
+
+    await surfaces.marketplace.open({ action: 'open' });
+    expect(calls.splice(0)).toEqual(['load:marketplace', 'marketplace:agent']);
+  });
+
+  it('executes every declared surface/action pair through its production owner', async () => {
+    const cases: Array<{
+      surface: string;
+      request: Record<string, string>;
+      expected: string[];
+    }> = [
+      { surface: 'settings.models', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:credentials', 'settings:credentials'] },
+      { surface: 'settings.general', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:general', 'settings:general'] },
+      { surface: 'settings.data', request: { action: 'open' }, expected: ['view:settings', 'load:settings', 'settings:data', 'settings:data'] },
+      { surface: 'connectors', request: { action: 'open' }, expected: ['view:connectors'] },
+      { surface: 'connectors', request: { action: 'add_custom' }, expected: ['view:connectors', 'click:connectors-add-custom-btn'] },
+      { surface: 'connectors', request: { action: 'configure', target_id: 'connector-1' }, expected: ['view:connectors', 'connector:guided:connector-1'] },
+      { surface: 'library', request: { action: 'open' }, expected: ['view:contexts'] },
+      { surface: 'projects', request: { action: 'open' }, expected: ['project:open:'] },
+      { surface: 'projects', request: { action: 'create' }, expected: ['project:create:'] },
+      { surface: 'projects', request: { action: 'configure', target_id: 'project-1' }, expected: ['project:configure:project-1'] },
+      { surface: 'agents', request: { action: 'open' }, expected: ['view:agents', 'load:agents'] },
+      { surface: 'agents', request: { action: 'create' }, expected: ['view:agents', 'load:agents', 'agent:create'] },
+      { surface: 'agents', request: { action: 'configure', target_id: 'agent-1' }, expected: ['view:agents', 'load:agents', 'agent:configure:agent-1'] },
+      { surface: 'skills', request: { action: 'open' }, expected: ['view:skills', 'load:skills'] },
+      { surface: 'skills', request: { action: 'create' }, expected: ['view:skills', 'load:skills', 'skill:create'] },
+      { surface: 'auto', request: { action: 'open' }, expected: ['view:auto', 'load:auto'] },
+      { surface: 'auto', request: { action: 'create' }, expected: ['view:auto', 'load:auto', 'auto:create'] },
+      { surface: 'auto', request: { action: 'configure', target_id: 'task-1' }, expected: ['view:auto', 'load:auto', 'auto:configure:task-1'] },
+      { surface: 'apps', request: { action: 'open' }, expected: ['view:apps'] },
+      { surface: 'marketplace', request: { action: 'open' }, expected: ['load:marketplace', 'marketplace:agent'] },
+    ];
+
+    for (const testCase of cases) {
+      const { calls, surfaces } = rendererNavHarness();
+      await surfaces[testCase.surface].open(testCase.request);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(calls, `${testCase.surface}:${testCase.request.action}`)
+        .toEqual(testCase.expected);
+    }
+  });
+
+  it('does not execute an action-specific side effect when its feature module is unavailable', async () => {
+    const { calls, surfaces } = rendererNavHarness('agents');
+    await expect(surfaces.agents.open({ action: 'create' })).rejects.toThrow('feature unavailable');
+    expect(calls).toEqual(['view:agents', 'load:agents']);
+  });
+
+  it('rejects a stale configure target instead of presenting navigation as successful', async () => {
+    const { calls, surfaces } = rendererNavHarness();
+    await expect(surfaces.auto.open({ action: 'configure', target_id: 'missing' }))
+      .rejects.toThrow('target unavailable');
+    expect(calls).toEqual(['view:auto', 'load:auto', 'auto:configure:missing']);
+  });
+
+  it('shows localized feedback when a clicked navigation card cannot open', async () => {
+    const { host, mount, toasts } = rendererMountHarness();
+    mount(host, { app_nav_requests: [{ surface_id: 'connectors', action: 'configure', target_id: 'missing' }] });
+    host.querySelector('.chat-app-nav-row')?.children[0]?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toasts).toEqual([{ message: 'chat.app_nav_failed:', variant: 'error' }]);
+  });
+
+  it('renders only validated, deduped cards and keeps legacy open requests clickable', async () => {
+    const { calls, host, mount } = rendererMountHarness();
+    const message = {
+      app_nav_requests: [
+        // Pre-action messages from 1.6.8 migration remain usable.
+        { surface_id: 'settings.models' },
+        { surface_id: 'settings.models' },
+        { surface_id: 'connectors', action: 'add_custom' },
+        { surface_id: 'connectors', action: 'add_custom' },
+        { surface_id: 'settings.models', action: 'create' },
+        { surface_id: 'settings.models', action: 'open', target_id: 'forged-target' },
+        { surface_id: 'agents', action: 'configure' },
+        { surface_id: 'agents', action: 'configure', target_id: 'x'.repeat(161) },
+        { surface_id: 'agents', action: 'configure', target_id: 'bad\nidentifier' },
+        { surface_id: 'not-a-surface', action: 'open' },
+      ],
+    };
+
+    mount(host, message);
+    // Re-mounting the same persisted message is the history-refresh path and
+    // must not append another set of cards.
+    mount(host, message);
+    const row = host.querySelector('.chat-app-nav-row');
+    expect(row?.children).toHaveLength(2);
+    expect(row?.children.map((button) => button.textContent)).toEqual([
+      'chat.app_nav_open:Models & credentials',
+      'chat.app_nav_add_custom:Connectors',
+    ]);
+    row?.children[1]?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(Array.from(calls)).toEqual([
+      'view:connectors', 'click:connectors-add-custom-btn',
+    ]);
+  });
+
+  it('names each connector configure card with its brand icon so several cards stay distinguishable', async () => {
+    const { calls, host, mount } = rendererMountHarness('', {
+      connectors: {
+        gmail: { name: 'Gmail', iconSvg: '<svg>gmail</svg>' },
+        gcal: { name: 'Google Calendar', iconSvg: '' },
+      },
+      lateConnectors: { 'm365-mail': { name: 'Microsoft 365 Mail', iconSvg: '<svg>m365</svg>' } },
+      throwingConnector: 'broken',
+    });
+    mount(host, {
+      app_nav_requests: [
+        ...['gmail', 'gcal', 'm365-mail', 'retired', 'broken']
+          .map((id) => ({ surface_id: 'connectors', action: 'configure', target_id: id })),
+        // Other actions and surfaces keep their page labels, even for a known connector id.
+        { surface_id: 'connectors', action: 'add_custom' },
+        { surface_id: 'agents', action: 'configure', target_id: 'gmail' },
+      ],
+    });
+    const row = host.querySelector('.chat-app-nav-row')!;
+    const labels = () => row.children.map((button) => button.textContent);
+    // Resolved names paint at once; late lookups keep the page label until they resolve.
+    expect(labels()).toEqual([
+      'chat.app_nav_configure_target:Gmail',
+      'chat.app_nav_configure_target:Google Calendar',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_add_custom:Connectors',
+      'chat.app_nav_configure:AI Team',
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(labels()[2]).toBe('chat.app_nav_configure_target:Microsoft 365 Mail');
+    expect(labels().slice(3)).toEqual([
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_configure:Connectors',
+      'chat.app_nav_add_custom:Connectors',
+      'chat.app_nav_configure:AI Team',
+    ]);
+    // Exactly one icon per card: the brand mark when the catalog ships one, else the page icon.
+    expect(row.children.map((button) => button.children.map((icon) => `${icon.className}|${icon.innerHTML}`)))
+      .toEqual([
+        ['chat-app-nav-btn-page-icon is-brand|<svg>gmail</svg>'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon is-brand|<svg>m365</svg>'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+        ['chat-app-nav-btn-page-icon|icon:panel-list'],
+      ]);
+    expect(calls.filter((call) => call.startsWith('lookup:')))
+      .toEqual(['lookup:gmail', 'lookup:gcal', 'lookup:m365-mail', 'lookup:retired', 'lookup:broken']);
+
+    row.children[2].click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.at(-1)).toBe('connector:guided:m365-mail');
+  });
+
+  it('names project configure cards and refreshes the project list at most once per unseen project', async () => {
+    const { calls, host, createHost, mount } = rendererMountHarness('', {
+      projects: [{ project_id: 'p1', name: 'Weekly report' }],
+      refreshedProjects: [
+        { project_id: 'p1', name: 'Weekly report' },
+        { project_id: 'p2', name: 'Launch plan' },
+      ],
+    });
+    const request = (id: string) => ({ surface_id: 'projects', action: 'configure', target_id: id });
+    mount(host, { app_nav_requests: [request('p1'), request('p2'), request('deleted')] });
+    const row = host.querySelector('.chat-app-nav-row')!;
+    expect(row.children.map((button) => button.textContent)).toEqual([
+      'chat.app_nav_configure_target:Weekly report',
+      'chat.app_nav_configure:Projects',
+      'chat.app_nav_configure:Projects',
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(row.children.map((button) => button.textContent)).toEqual([
+      'chat.app_nav_configure_target:Weekly report',
+      'chat.app_nav_configure_target:Launch plan',
+      'chat.app_nav_configure:Projects',
+    ]);
+    expect(calls).toEqual(['projects:load:true', 'projects:load:true']);
+
+    // Repainting history must not reload the list again for a project that is already known missing.
+    const repaint = createHost();
+    mount(repaint, { app_nav_requests: [request('deleted')] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual(['projects:load:true', 'projects:load:true']);
+    expect(repaint.querySelector('.chat-app-nav-row')!.children[0].textContent)
+      .toBe('chat.app_nav_configure:Projects');
+  });
+
+  it('ships a named configure label with its target placeholder in every renderer locale', () => {
+    const localeDir = path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales');
+    for (const file of fs.readdirSync(localeDir).filter((name) => name.endsWith('.json'))) {
+      const table = JSON.parse(fs.readFileSync(path.join(localeDir, file), 'utf8'));
+      expect(table['chat.app_nav_configure_target'], file).toContain('{target}');
+      expect(table['chat.app_nav_configure_target'], file).not.toBe(table['chat.app_nav_configure']);
+    }
+  });
+
+  it('keeps navigation cards independent of private onboarding telemetry', () => {
+    const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+    const start = source.indexOf('function _mountAppNavRequests');
+    const end = source.indexOf('function _mountMarketplaceInstallRequests', start);
+    const mountBlock = source.slice(start, end);
+    expect(mountBlock).not.toContain('_convTrackClick');
+    expect(mountBlock).not.toContain('_onboardingTelemetryContext');
+  });
+
+  it('names create cards after what they create, not the page that hosts them', () => {
+    // A shared "Create in {name}" label read as "create inside a Project" on the Project card.
+    const { host, mount } = rendererMountHarness();
+    mount(host, {
+      app_nav_requests: ['projects', 'agents', 'skills', 'auto']
+        .map((surfaceId) => ({ surface_id: surfaceId, action: 'create' })),
+    });
+    expect(host.querySelector('.chat-app-nav-row')!.children.map((button) => button.textContent)).toEqual([
+      'sidebar.project_create_title:Projects',
+      'agent_modal.title:AI Team',
+      'skill_modal.title_create:Skills',
+      'auto.create_section_title:Auto',
+    ]);
+  });
+
+  it('ships create-card copy for every creatable surface in every renderer locale', () => {
+    const { surfaces } = rendererNavHarness();
+    const localeDir = path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales');
+    const tables: Record<string, Record<string, string>> = Object.fromEntries(fs.readdirSync(localeDir)
+      .filter((name) => name.endsWith('.json'))
+      .map((file) => [file, JSON.parse(fs.readFileSync(path.join(localeDir, file), 'utf8'))]));
+    for (const surface of APP_NAV_SURFACES.filter((item) => item.actions.includes('create'))) {
+      const key = surfaces[surface.id].createKey ?? '';
+      for (const [file, table] of Object.entries(tables)) {
+        expect(table[key]?.trim(), `${file}:${surface.id}`).toBeTruthy();
+      }
+    }
+    expect(tables['zh.json'][surfaces.projects.createKey ?? '']).toBe('新建项目');
+    expect(tables['en.json'][surfaces.projects.createKey ?? '']).toBe('New project');
+  });
+
+  it('keeps the page action compact, evenly spaced, regular-weight, and chevron-free', () => {
+    const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
+    const start = source.indexOf('function _mountAppNavRequests');
+    const end = source.indexOf('function _mountMarketplaceInstallRequests', start);
+    const mountBlock = source.slice(start, end);
+    expect(mountBlock).toContain("uiIconHtml('panel-list'");
+    expect(mountBlock).not.toContain('chevron-right');
+
+    const css = fs.readFileSync(RENDERER_STYLE, 'utf8');
+    const styleStart = css.indexOf('.chat-app-nav-row .chat-app-nav-btn');
+    const styleEnd = css.indexOf('.chat-marketplace-request {', styleStart);
+    const styleBlock = css.slice(styleStart, styleEnd);
+    expect(styleBlock).toContain('width: fit-content');
+    expect(styleBlock).toContain('min-height: 40px');
+    expect(styleBlock).toContain('gap: 8px');
+    expect(styleBlock).toContain('padding: 9px 12px');
+    expect(styleBlock).toContain('font-weight: 400');
+    expect(styleBlock).toContain('width: 16px');
+    expect(styleBlock).toContain('flex: 0 0 16px');
+    expect(styleBlock.match(/background:\s*transparent/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('focuses the exact configured connector through the production helper', async () => {
+    const source = fs.readFileSync(RENDERER_CONNECTORS, 'utf8');
+    const fnSource = extractAssignedAsyncFunction(source, 'window.focusConnectorById =');
+    const calls: string[] = [];
+    const cards = ['connector-1', 'connector-2'].map((id) => ({
+      dataset: { id },
+      classList: { add: () => {}, remove: () => {} },
+      setAttribute: (name: string, value: string) => calls.push(`attr:${id}:${name}:${value}`),
+      scrollIntoView: () => calls.push(`scroll:${id}`),
+      focus: () => calls.push(`focus:${id}`),
+    }));
+    const context = {
+      loadConnectors: async () => { calls.push('load'); },
+      _connectorsSearchQuery: 'previous search',
+      _connectorsActiveCategory: 'previous category',
+      _connectorsHighlightedId: '',
+      _connectorsHighlightTimer: null,
+      _catalogUiId: (id: string) => id,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      _renderConnectorsGrid: () => {},
+      document: { querySelectorAll: () => cards, getElementById: () => null },
+      // Cold grid: nothing painted yet, so the helper must load first.
+      _connectorsState: { catalog: [] as unknown[], loading: false },
+    };
+    const focusConnector = vm.runInNewContext(`(${fnSource})`, context) as (
+      id: string,
+    ) => Promise<boolean>;
+
+    expect(await focusConnector(' connector-2 ')).toBe(true);
+    expect(context._connectorsSearchQuery).toBe('');
+    expect(context._connectorsActiveCategory).toBe('');
+    expect(context._connectorsHighlightedId).toBe('connector-2');
+    expect(calls).toEqual([
+      'load',
+      'attr:connector-2:tabindex:-1',
+      'scroll:connector-2',
+      'focus:connector-2',
+    ]);
+    expect(await focusConnector('missing')).toBe(false);
+    expect(calls.at(-1)).toBe('load');
+
+    // Painted, idle grid: focus reuses the last completed load (S6-A5).
+    context._connectorsState = { catalog: [{ id: 'connector-1' }], loading: false };
+    calls.length = 0;
+    expect(await focusConnector('connector-1')).toBe(true);
+    expect(calls).toEqual(['attr:connector-1:tabindex:-1', 'scroll:connector-1', 'focus:connector-1']);
+    // A load still in flight would repaint the card, so the helper waits for it.
+    context._connectorsState = { catalog: [{ id: 'connector-1' }], loading: true };
+    calls.length = 0;
+    expect(await focusConnector('connector-1')).toBe(true);
+    expect(calls[0]).toBe('load');
+  });
+
+  it('starts Commander guidance only for an exact unconfigured catalog connector', async () => {
+    const source = fs.readFileSync(RENDERER_CONNECTORS, 'utf8');
+    const fnSource = extractAssignedAsyncFunction(source, 'window.openConnectorSetupById =');
+    const calls: string[] = [];
+    const entries = new Map([
+      ['xiaohongshu-seller', { id: 'xiaohongshu-seller' }],
+      ['xiaohongshu-orders', { id: 'xiaohongshu-orders', catalog_parent_id: 'xiaohongshu-seller' }],
+      ['connected-shop', { id: 'connected-shop' }],
+      ['errored-shop', { id: 'errored-shop' }],
+    ]);
+    const context = {
+      loadConnectors: async () => { calls.push('load'); },
+      _catalogEntryById: (id: string) => entries.get(id),
+      _instanceForCatalogEntry: (entry: { id: string }) => (
+        ['connected-shop', 'errored-shop'].includes(entry.id) ? { id: entry.id } : null
+      ),
+      _isReconnectableError: (entry: { id: string }) => entry.id === 'errored-shop',
+      _runConnect: async (entry: { id: string }) => {
+        calls.push(`form:${entry.id}`);
+      },
+      window: {
+        focusConnectorById: async (id: string) => {
+          calls.push(`focus:${id}`);
+          return id !== 'missing';
+        },
+      },
+    };
+    const openConnectorSetup = vm.runInNewContext(`(${fnSource})`, context) as (
+      id: string,
+    ) => Promise<boolean>;
+
+    expect(await openConnectorSetup(' xiaohongshu-orders ')).toBe(true);
+    expect(calls.splice(0)).toEqual([
+      'load',
+      'focus:xiaohongshu-seller',
+      'form:xiaohongshu-seller',
+    ]);
+
+    expect(await openConnectorSetup('connected-shop')).toBe(true);
+    expect(calls.splice(0)).toEqual(['load', 'focus:connected-shop']);
+
+    expect(await openConnectorSetup('errored-shop')).toBe(true);
+    expect(calls.splice(0)).toEqual([
+      'load',
+      'focus:errored-shop',
+      'form:errored-shop',
+    ]);
+
+    expect(await openConnectorSetup('missing')).toBe(false);
+    expect(calls.splice(0)).toEqual(['load', 'focus:missing']);
+  });
+
+  it('opens Projects through the owning sidebar/create/detail workflows', async () => {
+    const source = fs.readFileSync(RENDERER_PROJECTS, 'utf8');
+    const fnSource = extractAssignedAsyncFunction(source, 'window.openProjectsSurface =');
+    const calls: string[] = [];
+    const lookups: unknown[][] = [];
+    let expanded = false;
+    const toggle = {
+      getAttribute: () => (expanded ? 'true' : 'false'),
+      click: () => { expanded = true; calls.push('expand'); },
+      scrollIntoView: () => calls.push('scroll'),
+      focus: () => calls.push('focus'),
+    };
+    const context: any = {
+      _projectsInlineCreate: false,
+      _startProjectInlineCreate: () => {
+        context._projectsInlineCreate = true;
+        calls.push('create');
+      },
+      loadProjects: async (...args: unknown[]) => {
+        lookups.push(args);
+        return [{ project_id: 'project-1' }, { project_id: 'project-2' }];
+      },
+      setView: (view: string, id: string) => calls.push(`${view}:${id}`),
+      document: { getElementById: () => toggle },
+    };
+    const openProjects = vm.runInNewContext(`(${fnSource})`, context) as (
+      request: Record<string, string>,
+    ) => Promise<boolean>;
+
+    expect(await openProjects({ action: 'open' })).toBe(true);
+    expect(calls.splice(0)).toEqual(['expand', 'scroll', 'focus']);
+    expect(await openProjects({ action: 'create' })).toBe(true);
+    expect(calls.splice(0)).toEqual(['create']);
+    expect(await openProjects({ action: 'configure', target_id: 'project-2' })).toBe(true);
+    expect(calls.splice(0)).toEqual(['project:project-2']);
+    expect(await openProjects({ action: 'configure', target_id: 'missing' })).toBe(false);
+    expect(calls).toEqual([]);
+    expect(lookups).toEqual([[true, true], [true, true]]);
+  });
+
+  it('does not use a stale display cache as fresh project existence evidence', async () => {
+    const source = fs.readFileSync(RENDERER_PROJECTS, 'utf8');
+    const start = source.indexOf('async function loadProjects(');
+    const end = source.indexOf('/** One-shot:', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const stale = [{ project_id: 'deleted-project' }];
+    const warnings: string[] = [];
+    const context: any = {
+      _projectsCache: stale,
+      _projectsLoadRequestId: 0,
+      _projectsLog: { warn: (message: string) => warnings.push(message) },
+      renderProjectsSection: () => {},
+      window: { orkas: { invoke: async () => ({ ok: false, error: 'offline' }) } },
+    };
+    const loadProjects = vm.runInNewContext(`(${source.slice(start, end)})`, context) as (
+      forceRefresh: boolean, requireFresh?: boolean,
+    ) => Promise<Array<{ project_id: string }> | null>;
+    expect(await loadProjects(true, true)).toBeNull();
+    expect(await loadProjects(true)).toEqual(stale);
+    context.window.orkas.invoke = async () => { throw new Error('offline'); };
+    expect(await loadProjects(true, true)).toBeNull();
+    context.window.orkas.invoke = async () => {
+      context._projectsLoadRequestId += 1;
+      return { ok: true, projects: stale };
+    };
+    expect(await loadProjects(true, true)).toBeNull();
+    expect(warnings).toEqual([
+      'load projects rejected', 'load projects rejected', 'load projects failed',
+    ]);
+  });
+
+  it('opens the exact automation task through the production helper', async () => {
+    const source = fs.readFileSync(RENDERER_AUTO, 'utf8');
+    const calls: string[] = [];
+    let tasks = [{ id: 'task-1' }, { id: 'task-2' }];
+    const opened: Array<{ task: { id: string } }> = [];
+    const logs: unknown[][] = [];
+    const context = vm.createContext({
+      window: {
+        addEventListener() {},
+        orkas: { invoke: async (channel: string) => {
+          calls.push(channel);
+          if (channel === 'autoTasks.list') return { tasks: [...tasks] };
+          if (channel === 'autoTasks.currentDevice') return { device: { id: 'device-1' } };
+          if (channel === 'conversations.autoTaskCounts') return { counts: {} };
+          throw new Error(`Unexpected IPC: ${channel}`);
+        } },
+      },
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById: (id: string) => id === 'auto-list' ? {} : null,
+      },
+      t: (key: string) => key,
+      createLogger: () => ({ warn: (...args: unknown[]) => logs.push(args) }),
+      recordOpened: (input: { task: { id: string } }) => { opened.push(input); },
+    });
+    // Load the real module and loader; only replace the presentation sinks.
+    // Inventing a loader in the fixture previously hid a missing function.
+    vm.runInContext(source, context);
+    vm.runInContext('_autoRenderList = () => {}; openAutoTaskDialog = recordOpened;', context);
+    const openAutoTask = vm.runInContext('window.openAutoTaskById', context) as (
+      id: string,
+    ) => Promise<boolean>;
+
+    expect(await openAutoTask(' task-2 ')).toBe(true);
+    expect(calls).toContain('autoTasks.list');
+    expect(opened).toEqual([{ task: tasks[1] }]);
+
+    // Commander can create a task after the sidebar list was already loaded.
+    tasks = [...tasks, { id: 'task-3' }];
+    expect(await openAutoTask('task-3')).toBe(true);
+    expect(opened[1]).toEqual({ task: tasks[2] });
+    tasks = tasks.filter((task) => task.id !== 'task-2');
+    expect(await openAutoTask('task-2')).toBe(false);
+    expect(await openAutoTask('missing')).toBe(false);
+    expect(await openAutoTask(' ')).toBe(false);
+    expect(opened).toHaveLength(2);
+    expect(logs).toEqual([]);
+  });
+});

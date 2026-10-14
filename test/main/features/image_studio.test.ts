@@ -1,0 +1,615 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import sharp from 'sharp';
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import {
+  assertImageQualityVerdict,
+  compileImageQualityScorecard,
+  imageStudioEvidenceIsGeneration,
+  inspectImageStudioProject,
+  normalizeImageStudioSnapshot,
+  requiredCopyLayoutIssues,
+  validateImageStudioManifest,
+} from '../../../src/main/features/image_studio';
+
+let root = '';
+
+function manifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    route: 'compose',
+    canvas: { width: 1200, height: 1200 },
+    brief: {
+      purpose: 'Launch poster',
+      audience: 'Product teams',
+      required_copy: ['Orkas Studio'],
+      must_include: ['product mark'],
+      must_avoid: ['generic dashboard cards'],
+    },
+    art_direction: {
+      subject_world: 'A tactile editorial launch desk',
+      one_job: 'Announce the new visual studio',
+      visual_tradition: 'Swiss editorial poster with material collage',
+      composition: 'Large title on the left with one asymmetric focal object',
+      signature_device: 'A folded violet paper aperture',
+      typography: 'Wide grotesk title and compact humanist details',
+      color_light_material: 'Ink black, paper white, violet foil, hard side light',
+    },
+    generation_budget: { max_calls: 0 },
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-studio-'));
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('ImageStudio project contract', () => {
+  it('delivers exact canvas pixels at normal, fractional and retina display densities without cropping product geometry', async () => {
+    for (const density of [1, 1.25, 2]) {
+      const captured = await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${400 * density}" height="${240 * density}" viewBox="0 0 400 240">
+        <rect x="0" y="0" width="200" height="240" fill="#2468ae"/>
+        <rect x="200" y="0" width="200" height="240" fill="#b82e37"/>
+      </svg>`)).png().toBuffer();
+      const delivered = await normalizeImageStudioSnapshot(captured, { width: 400, height: 240 });
+      const decoded = await sharp(delivered).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      expect(decoded.info).toMatchObject({ width: 400, height: 240, channels: 4 });
+      const pixel = (x: number, y: number) => [...decoded.data.subarray((y * 400 + x) * 4, (y * 400 + x) * 4 + 4)];
+      expect(pixel(100, 120)).toEqual([36, 104, 174, 255]);
+      expect(pixel(300, 120)).toEqual([184, 46, 55, 255]);
+      const repeat = await normalizeImageStudioSnapshot(delivered, { width: 400, height: 240 });
+      expect(await sharp(repeat).raw().toBuffer()).toEqual(await sharp(delivered).raw().toBuffer());
+    }
+  });
+
+  it('only exempts verified raster provenance, independent of route and legacy flags', () => {
+    expect(imageStudioEvidenceIsGeneration(null)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'generate' } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'edit', review_required: false } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'edit', source_kind: 'html', is_generation: true } as any)).toBe(false);
+    expect(imageStudioEvidenceIsGeneration({ route: 'hybrid', source_kind: 'raster', is_generation: true } as any)).toBe(true);
+  });
+
+  it('supports zero-call source edits and requires actionable reproduction constraints', () => {
+    const reference = { id: 'source', path: 'source.png', role: 'edit_source', strength: 1, required: true, preserve: ['product', 'layout'], may_change: ['headline'], region_ids: [] };
+    for (const route of ['compose', 'edit']) {
+      expect(validateImageStudioManifest(manifest({ route, entry: 'index.html', references: [reference], reference_intent: { mode: 'edit', basis: 'user', instructions: ['Replace only the headline'], minimum_score: 80 } })).issues).toEqual([]);
+    }
+    const intent = { mode: 'reproduce', basis: 'user', instructions: [], minimum_score: 85 };
+    expect(validateImageStudioManifest(manifest({ references: [], reference_intent: intent })).issues.map(item => item.code)).toContain('E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED');
+    expect(validateImageStudioManifest(manifest({ references: [{ ...reference, role: 'composition', preserve: [] }], reference_intent: intent })).issues.map(item => item.code)).toContain('E_MANIFEST_REPRODUCE_BOUNDARY_REQUIRED');
+    expect(validateImageStudioManifest(manifest({ references: [{ ...reference, role: 'composition' }], reference_intent: intent })).issues).toEqual([]);
+    expect(validateImageStudioManifest(manifest({ entry: 'index.html', raster_source: 'source.png' })).issues.map(item => item.code)).toContain('E_MANIFEST_FINAL_SOURCE_CONFLICT');
+  });
+
+  it('compiles an evidence scorecard and enforces reference-specific scoring', () => {
+    const scorecard = compileImageQualityScorecard({
+      intent_alignment: 92,
+      composition: 86,
+      craft: 84,
+      text_legibility: 95,
+      defect_freedom: 88,
+      specificity: 83,
+    });
+    expect(scorecard).toMatchObject({ overall: 88, pass_threshold: 80, dimension_floor: 70 });
+    expect(() => compileImageQualityScorecard({
+      intent_alignment: 92,
+      composition: 86,
+      craft: 84,
+      text_legibility: 95,
+      defect_freedom: 88,
+      specificity: 83,
+    }, true)).toThrow('reference_fidelity');
+
+    expect(() => assertImageQualityVerdict('passed', [], compileImageQualityScorecard({
+      intent_alignment: 95,
+      composition: 95,
+      craft: 95,
+      text_legibility: 95,
+      defect_freedom: 95,
+      specificity: 55,
+    }))).toThrow('E_IMAGE_REVIEW_SCORE_BELOW_FLOOR');
+    expect(() => assertImageQualityVerdict('passed', ['fix: title is too small'], scorecard)).toThrow('E_IMAGE_REVIEW_PASS_FINDINGS');
+    expect(() => assertImageQualityVerdict('passed', [], scorecard)).not.toThrow();
+    expect(() => assertImageQualityVerdict('passed', [], scorecard, 70, [{
+      code: 'A_ENGLISH_ALL_CAPS_OVERUSE',
+      message: 'Multiple English text roles use all caps.',
+    }])).toThrow('E_IMAGE_REVIEW_ENGLISH_CASING_REQUIRED');
+  });
+
+  it('accepts open-ended review dimensions without letting bonus scores dilute the mandatory baseline', () => {
+    const mandatoryScores = {
+      intent_alignment: 92,
+      composition: 86,
+      craft: 84,
+      text_legibility: 95,
+      defect_freedom: 88,
+      specificity: 83,
+    };
+    const scorecard = compileImageQualityScorecard(mandatoryScores, false, [{
+      id: 'icon_language_consistency',
+      label: 'Icon language consistency',
+      reason: 'The poster uses several functional icons as one visual family.',
+      evidence: 'Every visible icon uses the same monochrome stroke weight and corner treatment.',
+      score: 100,
+    }]);
+
+    // The independent oracle is the mandatory-score mean. An easy extra 100
+    // must not inflate the comparable quality result.
+    expect(scorecard.overall).toBe(88);
+    expect(scorecard.additional_dimensions).toEqual([
+      expect.objectContaining({ id: 'icon_language_consistency', score: 100 }),
+    ]);
+    expect(() => assertImageQualityVerdict('passed', [], scorecard)).not.toThrow();
+
+    const weakTaskSpecificAxis = compileImageQualityScorecard(mandatoryScores, false, [{
+      id: 'product_recognizability',
+      label: 'Product recognizability',
+      reason: 'The requested product must remain identifiable at thumbnail size.',
+      evidence: 'The product silhouette is lost behind the headline crop.',
+      score: 62,
+    }]);
+    expect(weakTaskSpecificAxis.overall).toBe(88);
+    expect(() => assertImageQualityVerdict('passed', [], weakTaskSpecificAxis))
+      .toThrow('E_IMAGE_REVIEW_SCORE_BELOW_FLOOR');
+  });
+
+  it('rejects ambiguous, duplicate, reserved, or ungrounded additional review dimensions', () => {
+    const mandatoryScores = {
+      intent_alignment: 90,
+      composition: 90,
+      craft: 90,
+      text_legibility: 90,
+      defect_freedom: 90,
+      specificity: 90,
+    };
+    const valid = {
+      id: 'brand_coherence',
+      label: 'Brand coherence',
+      reason: 'The supplied brand system is a material delivery constraint.',
+      evidence: 'The palette and mark placement match the declared brand roles.',
+      score: 88,
+    };
+
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [valid, valid]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_DUPLICATE');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [{ ...valid, id: 'composition' }]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_RESERVED');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [{ ...valid, evidence: '' }]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_EVIDENCE');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, Array.from(
+      { length: 9 },
+      (_, index) => ({ ...valid, id: `task_axis_${index}` }),
+    ))).toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSIONS_LIMIT');
+  });
+
+  it('locks route-specific generation budgets', () => {
+    expect(validateImageStudioManifest(manifest()).issues).toEqual([]);
+    expect(validateImageStudioManifest(manifest({ generation_budget: { max_calls: 1 } })).issues)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: 'E_COMPOSE_GENERATION_BUDGET' })]));
+    expect(validateImageStudioManifest(manifest({ route: 'hybrid', generation_budget: { max_calls: 2 } })).issues)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: 'E_HYBRID_GENERATION_BUDGET' })]));
+  });
+
+  it('defaults an unspecified reference to guide and lets explicit user intent override that default', () => {
+    const editSource = {
+      id: 'source',
+      path: 'assets/source.png',
+      role: 'edit_source',
+      strength: 1,
+      required: true,
+      preserve: ['subject identity', 'background geometry'],
+      may_change: ['headline copy'],
+      region_ids: [],
+    };
+    const defaulted = validateImageStudioManifest(manifest({
+      references: [{
+        ...editSource,
+        role: 'style',
+        required: false,
+      }],
+    }));
+    expect(defaulted.issues).toEqual([]);
+    expect(defaulted.manifest?.reference_intent).toEqual({
+      mode: 'guide',
+      basis: 'inferred',
+      instructions: [],
+      minimum_score: 70,
+    });
+
+    const editable = validateImageStudioManifest(manifest({
+      route: 'edit',
+      generation_budget: { max_calls: 1 },
+      references: [editSource],
+      reference_intent: {
+        mode: 'edit',
+        basis: 'user',
+        instructions: ['Replace only the headline copy.'],
+        minimum_score: 88,
+      },
+    }));
+    expect(editable.issues).toEqual([]);
+    expect(editable.manifest?.reference_intent).toMatchObject({ mode: 'edit', basis: 'user' });
+
+    const unboundedInferredEdit = validateImageStudioManifest(manifest({
+      route: 'edit',
+      generation_budget: { max_calls: 1 },
+      references: [editSource],
+    }));
+    expect(unboundedInferredEdit.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_EDIT_INSTRUCTIONS' }),
+    ]));
+
+    const weakReproduction = validateImageStudioManifest(manifest({
+      references: [{ ...editSource, role: 'composition', may_change: [] }],
+      reference_intent: { mode: 'reproduce', basis: 'user', instructions: [], minimum_score: 80 },
+    }));
+    expect(weakReproduction.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_REPRODUCE_SCORE_FLOOR' }),
+    ]));
+
+    const invalidBasis = validateImageStudioManifest(manifest({
+      references: [{ ...editSource, role: 'style', required: false }],
+      reference_intent: { mode: 'guide', basis: 'file-origin', instructions: [], minimum_score: 70 },
+    }));
+    expect(invalidBasis.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_INTENT_BASIS' }),
+    ]));
+  });
+
+  it('reports reference-local and reproduction blockers in one validation pass', () => {
+    const invalid = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'composition-source',
+        path: '/tmp/composition-source.png',
+        role: 'composition',
+        strength: 1,
+        required: false,
+        preserve: ['subject', 'crop', 'palette'],
+        may_change: [],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'reproduce',
+        basis: 'user',
+        instructions: ['Reproduce the supplied composition exactly.'],
+        minimum_score: 90,
+      },
+    }));
+
+    expect(invalid.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'E_MANIFEST_REFERENCE_PATH',
+        message: expect.stringContaining('references[0].path'),
+      }),
+      expect.objectContaining({
+        code: 'E_MANIFEST_REPRODUCE_REFERENCE_REQUIRED',
+        message: expect.stringContaining('references[0].required'),
+      }),
+    ]));
+
+    const repaired = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'composition-source',
+        path: 'assets/composition-source.png',
+        role: 'composition',
+        strength: 1,
+        required: true,
+        preserve: ['subject', 'crop', 'palette'],
+        may_change: [],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'reproduce',
+        basis: 'user',
+        instructions: ['Reproduce the supplied composition exactly.'],
+        minimum_score: 90,
+      },
+    }));
+    expect(repaired.issues).toEqual([]);
+  });
+
+  it('lists the accepted values when a reference role is invalid', () => {
+    const invalid = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'source',
+        path: 'assets/source.png',
+        role: 'photo',
+        strength: 1,
+        required: true,
+        preserve: [],
+        may_change: [],
+        region_ids: [],
+      }],
+    }));
+
+    expect(invalid.issues.find((issue) => issue.code === 'E_MANIFEST_REFERENCE_ROLE')?.message)
+      .toContain('style, identity, composition, structure, content, mask, or edit_source');
+  });
+
+  it('does not hide dependent reference or route blockers behind malformed child fields', () => {
+    const invalidReference = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'regional-source',
+        path: '/tmp/regional-source.png',
+        role: 'style',
+        strength: 1,
+        required: false,
+        preserve: [],
+        may_change: [],
+        region_ids: ['hero'],
+      }],
+    }));
+    expect(invalidReference.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_PATH' }),
+      expect.objectContaining({ code: 'E_MANIFEST_REFERENCE_REGION_PLAN_REQUIRED' }),
+    ]));
+
+    const invalidComposeControl = validateImageStudioManifest(manifest({
+      generation_contract: {
+        negative_prompt: [],
+        controls: [{
+          type: 'depth',
+          reference_id: 'missing-reference',
+          strength: 2,
+          start: 0,
+          end: 1,
+        }],
+      },
+    }));
+    expect(invalidComposeControl.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'E_MANIFEST_CONTROL_REFERENCE' }),
+      expect.objectContaining({ code: 'E_MANIFEST_CONTROL_STRENGTH' }),
+      expect.objectContaining({ code: 'E_COMPOSE_GENERATION_CONTROLS' }),
+    ]));
+  });
+
+  it('enforces the reference score declared by edit or reproduction intent', () => {
+    const scorecard = compileImageQualityScorecard({
+      intent_alignment: 92,
+      composition: 90,
+      craft: 88,
+      text_legibility: 94,
+      defect_freedom: 91,
+      specificity: 86,
+      reference_fidelity: 84,
+    }, true);
+    expect(() => assertImageQualityVerdict('passed', [], scorecard, 85))
+      .toThrow('E_IMAGE_REFERENCE_FIDELITY_BELOW_FLOOR');
+    expect(() => assertImageQualityVerdict('passed', [], { ...scorecard, reference_fidelity: 90 }, 85))
+      .not.toThrow();
+  });
+
+  it('supports a multi-image style anchor with the existing reference contract', () => {
+    const validated = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'style_anchor',
+        path: 'refs/style-anchor.png',
+        role: 'style',
+        strength: 1,
+        required: true,
+        preserve: [
+          'palette roles',
+          'typography roles',
+          'spacing and grid rhythm',
+          'shape and icon language',
+          'material treatment',
+          'signature device',
+        ],
+        may_change: ['content', 'local composition'],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'guide',
+        basis: 'inferred',
+        instructions: ['Keep this image in the same visual set as the style anchor.'],
+        minimum_score: 85,
+      },
+    }));
+
+    expect(validated.issues).toEqual([]);
+    expect(validated.manifest?.references?.[0]).toMatchObject({
+      role: 'style',
+      required: true,
+      may_change: ['content', 'local composition'],
+    });
+    expect(validated.manifest?.reference_intent?.minimum_score).toBe(85);
+    expect(validated.manifest?.reference_intent).toMatchObject({ mode: 'guide', basis: 'inferred' });
+  });
+
+  it('inspects local HTML, exact copy, and local resources into one signature', async () => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest(), null, 2));
+    fs.writeFileSync(path.join(root, 'texture.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+    fs.writeFileSync(path.join(root, 'index.html'), [
+      '<!doctype html><html><body>',
+      '<main><h1>Orkas Studio</h1><svg aria-hidden="true"></svg>',
+      '<img src="texture.svg" alt="">',
+      '</main></body></html>',
+    ].join(''));
+
+    const first = await inspectImageStudioProject(root);
+    expect(first.ok).toBe(true);
+    expect(first.resources).toEqual(['texture.svg']);
+    expect(first.signature).toMatch(/^[0-9a-f]{64}$/);
+
+    fs.appendFileSync(path.join(root, 'texture.svg'), '\n<!-- changed -->');
+    const changed = await inspectImageStudioProject(root);
+    expect(changed.ok).toBe(true);
+    expect(changed.signature).not.toBe(first.signature);
+  });
+
+  it('flags repeated model-authored English all caps but permits exact required copy', async () => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest(), null, 2));
+    fs.writeFileSync(path.join(root, 'index.html'), [
+      '<!doctype html><html><body>',
+      '<main><h1>Orkas Studio</h1><p>NOW AVAILABLE</p>',
+      '<p>RELIABILITY</p><p>FLEXIBILITY</p><svg aria-hidden="true"></svg></main>',
+      '</body></html>',
+    ].join(''));
+
+    const inspection = await inspectImageStudioProject(root);
+
+    expect(inspection.ok).toBe(true);
+    expect(inspection.advisories).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'A_ENGLISH_ALL_CAPS_OVERUSE' }),
+    ]));
+
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest({
+      brief: {
+        purpose: 'Launch poster',
+        audience: 'Product teams',
+        required_copy: ['Orkas Studio', 'NOW AVAILABLE', 'RELIABILITY', 'FLEXIBILITY'],
+        must_include: ['product mark'],
+        must_avoid: ['generic dashboard cards'],
+      },
+    }), null, 2));
+    const explicitlyRequired = await inspectImageStudioProject(root);
+    expect(explicitlyRequired.advisories).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'A_ENGLISH_ALL_CAPS_OVERUSE' }),
+    ]));
+  });
+
+  it('blocks an automatic one-glyph orphan line while preserving deliberate breaks and vertical type', () => {
+    expect(requiredCopyLayoutIssues([{
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [6, 1],
+      explicitBreak: false,
+      writingMode: 'horizontal-tb',
+    }])).toEqual([expect.objectContaining({
+      code: 'E_REQUIRED_COPY_ORPHAN_LINE',
+      message: expect.stringContaining('6+1'),
+    })]);
+
+    expect(requiredCopyLayoutIssues([{
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [4, 3],
+      explicitBreak: false,
+      writingMode: 'horizontal-tb',
+    }, {
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [6, 1],
+      explicitBreak: true,
+      writingMode: 'horizontal-tb',
+    }, {
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [1, 1, 1, 1, 1, 1, 1],
+      explicitBreak: false,
+      writingMode: 'vertical-rl',
+    }])).toEqual([]);
+  });
+
+  it('blocks missing required copy, remote resources, embedded pages, and traversal', async () => {
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest(), null, 2));
+    fs.writeFileSync(path.join(root, 'index.html'), [
+      '<!doctype html><html><body>',
+      '<iframe src="https://example.com"></iframe>',
+      '<script>document.body.textContent = "changed"</script>',
+      '<img src="../outside.png" alt="">',
+      '</body></html>',
+    ].join(''));
+
+    const inspection = await inspectImageStudioProject(root);
+    expect(inspection.ok).toBe(false);
+    expect(inspection.blockers.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+      'E_HTML_EMBED_FORBIDDEN',
+      'E_REMOTE_RESOURCE_FORBIDDEN',
+      'E_RESOURCE_OUTSIDE_PROJECT',
+      'E_REQUIRED_COPY_MISSING',
+    ]));
+  });
+
+  it('binds Omost-style visual regions and reference assets into the project signature', async () => {
+    const planned = manifest({
+      references: [{
+        id: 'hero-source',
+        path: 'assets/hero.svg',
+        role: 'content',
+        strength: 1,
+        required: true,
+        preserve: ['product silhouette'],
+        may_change: ['crop'],
+        region_ids: ['hero'],
+      }],
+      reference_intent: {
+        mode: 'guide',
+        instructions: ['Use the supplied product in the planned hero region.'],
+        minimum_score: 75,
+      },
+      visual_plan: {
+        global_description: 'A single product aperture balanced by an editorial title.',
+        reading_order: ['hero', 'copy'],
+        regions: [
+          {
+            id: 'hero',
+            bounds: { x: 0.45, y: 0.1, width: 0.5, height: 0.8 },
+            depth: 'foreground',
+            role: 'hero',
+            description: 'The supplied product silhouette inside a paper aperture.',
+            detail_prompts: [],
+            reference_ids: ['hero-source'],
+          },
+          {
+            id: 'copy',
+            bounds: { x: 0.05, y: 0.2, width: 0.35, height: 0.5 },
+            depth: 'midground',
+            role: 'copy',
+            description: 'The exact launch title.',
+            detail_prompts: [],
+            reference_ids: [],
+          },
+        ],
+      },
+    });
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'assets', 'hero.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>');
+    fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(planned, null, 2));
+    fs.writeFileSync(path.join(root, 'index.html'), [
+      '<!doctype html><html><body>',
+      '<main><h1 data-image-region="copy">Orkas Studio</h1>',
+      '<figure data-image-region="hero"><img src="assets/hero.svg" alt=""></figure>',
+      '<svg aria-hidden="true"></svg></main>',
+      '</body></html>',
+    ].join(''));
+
+    const first = await inspectImageStudioProject(root);
+    expect(first.ok).toBe(true);
+    expect(first.resources).toEqual(['assets/hero.svg']);
+
+    fs.appendFileSync(path.join(root, 'assets', 'hero.svg'), '<!-- updated reference -->');
+    const changed = await inspectImageStudioProject(root);
+    expect(changed.signature).not.toBe(first.signature);
+
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><html><body><h1 data-image-region="copy">Orkas Studio</h1><svg></svg></body></html>');
+    const unmapped = await inspectImageStudioProject(root);
+    expect(unmapped.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'E_VISUAL_REGION_UNMAPPED' })]));
+  });
+
+  it('rejects unknown reference ids and visual regions that leave the normalized canvas', () => {
+    const result = validateImageStudioManifest(manifest({
+      visual_plan: {
+        global_description: 'Invalid plan',
+        reading_order: ['hero'],
+        regions: [{
+          id: 'hero',
+          bounds: { x: 0.8, y: 0, width: 0.4, height: 1 },
+          depth: 'foreground',
+          role: 'hero',
+          description: 'Overflowing hero',
+          detail_prompts: [],
+          reference_ids: ['missing'],
+        }],
+      },
+    }));
+    expect(result.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+      'E_MANIFEST_REGION_BOUNDS',
+      'E_MANIFEST_REGION_REFERENCE_UNKNOWN',
+    ]));
+  });
+});
