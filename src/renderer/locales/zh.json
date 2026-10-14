@@ -1003,6 +1003,8 @@
   "agents.title": "AI 团队",
   "agents.subtitle": "每个成员都是一个智能体——@ 它、编成小队、派任务。",
   "agents.create_btn": "创建智能体",
+  "agents.import_template_btn": "导入编队模板",
+  "agents.import_template_sub": "一份 YAML，一键建队",
   "agents.market_btn": "Agent市场",
   "agents.connect_cli_btn": "接入智能体",
   "agents.connect_cli_sub": "Claude Code / Codex 等 CLI",

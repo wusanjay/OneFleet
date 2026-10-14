@@ -1003,6 +1003,8 @@
   "agents.title": "AI Team",
   "agents.subtitle": "Every member is an agent — @ it, form squads, assign tasks.",
   "agents.create_btn": "Create agent",
+  "agents.import_template_btn": "Import fleet template",
+  "agents.import_template_sub": "One YAML → a working team",
   "agents.market_btn": "Agent marketplace",
   "agents.connect_cli_btn": "Connect an agent",
   "agents.connect_cli_sub": "Claude Code / Codex CLIs",

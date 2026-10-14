@@ -23,6 +23,49 @@ const destDir = path.join(pcRoot, 'resources', 'embedding-model');
 const MODEL = EMBEDDING_MODEL_CONTRACT.id;
 const modelDir = path.join(destDir, MODEL);
 const tarballUrl = EMBEDDING_MODEL_CONTRACT.source;
+// China-network fallback: storage.googleapis.com is commonly unreachable, so
+// when the archive fetch fails we re-fetch the pinned files individually from
+// a mirror (default: hf-mirror.com fronting the same Qdrant/bge-small-zh-v1.5
+// repo the archive was published from). Every file is verified against the
+// contract's per-file sha256/bytes, so a mirror cannot serve different bytes.
+const MIRROR_FILES_BASE_DEFAULT = 'https://hf-mirror.com/Qdrant/bge-small-zh-v1.5/resolve/main';
+const mirrorFilesBase = process.env.ORKAS_EMBEDDING_MODEL_MIRROR || MIRROR_FILES_BASE_DEFAULT;
+
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = require('node:crypto').createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+/** Fetch the pinned files one by one into `extractionRoot` from the mirror,
+ *  verifying each against EMBEDDING_MODEL_CONTRACT.files. Throws on any
+ *  mismatch — the caller falls through to the original error. */
+async function downloadFilesFromMirror(extractionRoot, log) {
+  const files = EMBEDDING_MODEL_CONTRACT.files;
+  // The archive extracts to <root>/<model-id>/<file> (verifyResourceContract
+  // requires exactly that layout), so the mirror path mirrors it.
+  const modelRoot = path.join(extractionRoot, EMBEDDING_MODEL_CONTRACT.id);
+  fs.mkdirSync(modelRoot, { recursive: true });
+  for (const file of files) {
+    const url = `${mirrorFilesBase}/${file.name}`;
+    const outPath = path.join(modelRoot, file.name);
+    log(`[embedding-model] mirror fetch ${file.name} from ${mirrorFilesBase}`);
+    await download(url, outPath, { expectedBytes: file.bytes, model: EMBEDDING_MODEL_CONTRACT.id });
+    const digest = await sha256File(outPath);
+    if (digest !== file.sha256) {
+      throw new Error(`mirror file ${file.name} sha256 mismatch: got ${digest}`);
+    }
+    const bytes = fs.statSync(outPath).size;
+    if (bytes !== file.bytes) {
+      throw new Error(`mirror file ${file.name} size mismatch: got ${bytes}`);
+    }
+    log(`[embedding-model] mirror file ${file.name} verified`);
+  }
+}
 
 export const EMBEDDING_DOWNLOAD_INACTIVITY_TIMEOUT_MS = 60_000;
 export const EMBEDDING_DOWNLOAD_TOTAL_TIMEOUT_MS = 10 * 60_000;
@@ -281,9 +324,16 @@ export async function ensureEmbeddingModel({
 
   log(`[embedding-model] fetching ${sourceUrl}`);
   try {
-    await downloadArchive(sourceUrl, archivePath);
-    verifyArchive(archivePath);
-    await extractArchive(archivePath, extractionRoot);
+    try {
+      await downloadArchive(sourceUrl, archivePath);
+      verifyArchive(archivePath);
+      await extractArchive(archivePath, extractionRoot);
+    } catch (archiveErr) {
+      // Mirror fallback keeps the same trust contract: per-file sha256/bytes
+      // are pinned, so mirror bytes must equal archive bytes.
+      log(`[embedding-model] archive fetch failed (${firstError(archiveErr).message}); trying file mirror`);
+      await downloadFilesFromMirror(extractionRoot, log);
+    }
     verifyRoot(extractionRoot);
 
     // A concurrent installer may have completed while this process fetched.

@@ -482,6 +482,13 @@
                 <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
                 <span data-i18n="agents.create_btn">Create agent</span>
               </button>
+              <button class="btn header-entry-btn header-entry-btn-templates" id="team-template-import-btn">
+                <span data-ui-icon="sparkles" data-ui-icon-class="header-entry-icon"></span>
+                <span class="header-entry-copy">
+                  <span data-i18n="agents.import_template_btn">Import fleet template</span>
+                  <small data-i18n="agents.import_template_sub">One YAML → a working team</small>
+                </span>
+              </button>
               <button class="btn header-entry-btn header-entry-btn-cli" id="agents-connect-cli-btn">
                 <span data-ui-icon="terminal" data-ui-icon-class="header-entry-icon"></span>
                 <span class="header-entry-copy">
@@ -499,6 +506,7 @@
           <!-- Category chip strip — mirrors `.marketplace-categories` above the
                grid. Chips are injected by renderAgentsGrid() from the same
                `_mpCategoriesCache` that drives the marketplace strip. -->
+          <input type="file" id="team-template-file-input" accept=".yaml,.yml,.json,.md" style="display:none" />
           <div class="marketplace-categories agents-categories" id="agents-categories"></div>
           <div class="agents-grid-scroll">
             <div class="agents-grid" id="agents-grid"></div>
@@ -1984,6 +1992,7 @@
   <script src="./vendor/dompurify/purify.min.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
   <script src="./modules/agents.js"></script>
+  <script src="./modules/team-templates.js"></script>
   <script src="./modules/auto-title.js"></script>
   <script src="./modules/auto-events.js"></script>
   <script src="./modules/utils.js"></script>
