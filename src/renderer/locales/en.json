@@ -70,7 +70,7 @@
   "component.conv_agent_disabled_banner": "The agent for this task is disabled. Re-enable it on the Agents page to continue.",
   "sidebar.search": "Search",
   "sidebar.search_title": "Global search (Cmd/Ctrl+K)",
-  "sidebar.new_chat": "New Task",
+  "sidebar.new_chat": "New chat",
   "sidebar.auto": "Auto",
   "sidebar.agents": "AI Team",
   "sidebar.skills": "Skills",
@@ -267,7 +267,7 @@
   "agents.output_format_dashboard_hint": "Visual data charts.",
   "agents.output_format_artifact": "Interactive app",
   "agents.output_format_artifact_hint": "Interactive web app.",
-  "sidebar.conversations": "Tasks",
+  "sidebar.conversations": "All conversations",
   "sidebar.conv_empty": "No tasks yet",
   "sidebar.bucket.today": "Today",
   "sidebar.bucket.yesterday": "Yesterday",
@@ -275,7 +275,7 @@
   "sidebar.bucket.last30": "Last 30 days",
   "sidebar.bucket.older": "Older",
   "sidebar.projects": "Projects",
-  "sidebar.today_tasks": "Today's Tasks",
+  "sidebar.today_tasks": "Pinned & today",
   "sidebar.today_empty": "No tasks today",
   "sidebar.section_collapse": "Collapse {section}",
   "sidebar.section_expand": "Expand {section}",
@@ -2534,5 +2534,6 @@
   "quality.operator.reload": "Reload",
   "quality.operator.disabled": "Disabled on this device.",
   "quality.operator.ready": "Ready: {count} rules.",
-  "quality.operator.invalid": "Validation unavailable. Fix operator-policy.json or turn off custom validation, then retry."
+  "quality.operator.invalid": "Validation unavailable. Fix operator-policy.json or turn off custom validation, then retry.",
+  "sidebar.workbench": "Workbench"
 }

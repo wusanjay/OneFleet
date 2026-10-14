@@ -19884,3 +19884,38 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   outline: 2px solid var(--primary);
   outline-offset: -2px;
 }
+
+/* ─── IM-first sidebar: workbench (collapsed toolbox group) ─────────────
+   Fleet-form reshape: conversations own the rail; the six tool entries
+   (To-do / Auto / Skills / Connectors / Library / Apps) live in a collapsed
+   "Workbench" group above Settings, matching the IM app pattern (chat list
+   first, workspace behind a second-level entry). */
+.sidebar-workbench {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  padding: 4px 8px;
+}
+.sidebar-workbench-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 6px 8px;
+  color: var(--text-muted, inherit);
+  font: inherit;
+  text-align: left;
+  border-radius: 8px;
+}
+.sidebar-workbench-toggle:hover { background: var(--hover, rgba(0,0,0,0.04)); }
+.sidebar-workbench-toggle .sidebar-section-chevron { transition: transform 0.15s ease; }
+.sidebar-workbench-toggle[aria-expanded="true"] .sidebar-section-chevron { transform: rotate(90deg); }
+.sidebar-workbench-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 2px;
+}
+.sidebar-workbench-actions[hidden] { display: none; }

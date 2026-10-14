@@ -70,7 +70,7 @@
   "component.conv_agent_disabled_banner": "本任务的智能体已停用。请前往「智能体」页重新启用后继续。",
   "sidebar.search": "搜索",
   "sidebar.search_title": "全局搜索 (Cmd/Ctrl+K)",
-  "sidebar.new_chat": "新任务",
+  "sidebar.new_chat": "新对话",
   "sidebar.auto": "自动化",
   "sidebar.agents": "AI 团队",
   "sidebar.skills": "技能库",
@@ -267,7 +267,7 @@
   "agents.output_format_dashboard_hint": "可视化的数据图表",
   "agents.output_format_artifact": "交互应用",
   "agents.output_format_artifact_hint": "可交互的网页应用",
-  "sidebar.conversations": "任务",
+  "sidebar.conversations": "全部对话",
   "sidebar.conv_empty": "暂无任务",
   "sidebar.bucket.today": "今天",
   "sidebar.bucket.yesterday": "昨天",
@@ -275,7 +275,7 @@
   "sidebar.bucket.last30": "30 天内",
   "sidebar.bucket.older": "更早",
   "sidebar.projects": "项目",
-  "sidebar.today_tasks": "当天任务",
+  "sidebar.today_tasks": "最近对话",
   "sidebar.today_empty": "今天还没有任务",
   "sidebar.section_collapse": "折叠{section}",
   "sidebar.section_expand": "展开{section}",
@@ -2534,5 +2534,6 @@
   "quality.operator.reload": "重新加载",
   "quality.operator.disabled": "本机已停用。",
   "quality.operator.ready": "已加载 {count} 条规则。",
-  "quality.operator.invalid": "校验不可用。请修复 operator-policy.json，或停用自定义校验后重试。"
+  "quality.operator.invalid": "校验不可用。请修复 operator-policy.json，或停用自定义校验后重试。",
+  "sidebar.workbench": "工作台"
 }

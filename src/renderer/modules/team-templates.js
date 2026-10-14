@@ -56,9 +56,29 @@
     }
   }
 
+  /** Workbench group (collapsed toolbox) — persists open/closed per machine. */
+  function _bindWorkbench() {
+    const toggle = document.getElementById('workbench-toggle');
+    const actions = document.getElementById('workbench-actions');
+    if (!toggle || !actions) return;
+    const apply = (open) => {
+      toggle.setAttribute('aria-expanded', String(open));
+      actions.hidden = !open;
+    };
+    let saved = null;
+    try { saved = localStorage.getItem('onefleet.workbench'); } catch (_) {}
+    apply(saved === 'open');
+    toggle.addEventListener('click', () => {
+      const open = toggle.getAttribute('aria-expanded') !== 'true';
+      apply(open);
+      try { localStorage.setItem('onefleet.workbench', open ? 'open' : 'closed'); } catch (_) {}
+    });
+  }
+
   function _bind() {
     _btn()?.addEventListener('click', () => _fileInput()?.click());
     _fileInput()?.addEventListener('change', (e) => { void _onFileChosen(e); });
+    _bindWorkbench();
   }
 
   if (document.readyState === 'loading') {

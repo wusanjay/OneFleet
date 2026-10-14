@@ -25,15 +25,10 @@
           <span data-ui-icon="command" data-ui-icon-class="ui-icon sidebar-search-command-icon"></span><span>K</span>
         </span>
       </button>
-      <div class="sidebar-actions">
-        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New Task</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
-        <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span></button>
-        <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
+      <div class="sidebar-actions sidebar-actions-primary">
+        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New chat</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
+        <button class="sidebar-btn" id="team-template-import-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="agents.import_template_btn">Import fleet template</span></button>
         <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
-        <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
-        <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
-        <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="database" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Library</span></button>
-        <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">Apps</span></button>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-today-section">
@@ -41,7 +36,7 @@
             <button class="sidebar-section-toggle" id="today-section-toggle" type="button"
                     aria-controls="today-list" aria-expanded="true">
               <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
-              <span class="sidebar-section-title" data-i18n="sidebar.today_tasks">Today's Tasks</span>
+              <span class="sidebar-section-title" data-i18n="sidebar.today_tasks">Pinned &amp; today</span>
               <span class="task-unread-dot" id="today-unread-dot" hidden aria-hidden="true"></span>
             </button>
           </div>
@@ -75,6 +70,21 @@
           <div class="conversation-list" id="conversation-list">
             <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
           </div>
+        </div>
+      </div>
+      <div class="sidebar-workbench" id="sidebar-workbench">
+        <button class="sidebar-section-toggle sidebar-workbench-toggle" id="workbench-toggle" type="button"
+                aria-controls="workbench-actions" aria-expanded="false">
+          <span data-ui-icon="chevron-right" data-ui-icon-class="sidebar-section-chevron"></span>
+          <span class="sidebar-section-title" data-i18n="sidebar.workbench">Workbench</span>
+        </button>
+        <div class="sidebar-actions sidebar-workbench-actions" id="workbench-actions" hidden>
+          <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span></button>
+          <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
+          <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
+          <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
+          <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="database" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Library</span></button>
+          <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">Apps</span></button>
         </div>
       </div>
       <div class="sidebar-footer-actions">
@@ -481,13 +491,6 @@
               <button class="btn header-entry-btn header-entry-btn-create" id="create-agent-btn">
                 <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
                 <span data-i18n="agents.create_btn">Create agent</span>
-              </button>
-              <button class="btn header-entry-btn header-entry-btn-templates" id="team-template-import-btn">
-                <span data-ui-icon="sparkles" data-ui-icon-class="header-entry-icon"></span>
-                <span class="header-entry-copy">
-                  <span data-i18n="agents.import_template_btn">Import fleet template</span>
-                  <small data-i18n="agents.import_template_sub">One YAML → a working team</small>
-                </span>
               </button>
               <button class="btn header-entry-btn header-entry-btn-cli" id="agents-connect-cli-btn">
                 <span data-ui-icon="terminal" data-ui-icon-class="header-entry-icon"></span>

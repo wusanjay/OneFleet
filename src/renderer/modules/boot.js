@@ -368,6 +368,21 @@ function _restoreLastView() {
     _bootRestoreComplete = true;
     return;
   }
+  // Fleet-form landing: with any conversation on file, open the most recent
+  // one — an IM app opens into the chat list's top thread, never a blank
+  // composer. The task grid (new-chat) remains the true first-run state.
+  if (Array.isArray(conversations) && conversations.length > 0) {
+    const recent = conversations.reduce((a, b) => {
+      const ta = Date.parse(a.updated_at || a.created_at || '') || 0;
+      const tb = Date.parse(b.updated_at || b.created_at || '') || 0;
+      return tb > ta ? b : a;
+    });
+    if (recent?.conversation_id) {
+      setView('conversation', recent.conversation_id);
+      _bootRestoreComplete = true;
+      return;
+    }
+  }
   setView('new-chat', null, { forceEnter: true, entryPoint: 'startup' });
   _bootRestoreComplete = true;
 }
