@@ -2790,7 +2790,9 @@ function _refreshChatHeader() {
           extraClass: 'chat-header-meta-member',
         });
       }).join('');
-      parts.push(`<span class="chat-header-meta-members">${memberHtml}</span>`);
+      // Fleet-form: the stacked avatars + count are a button that opens the
+      // roster panel (group-chat counterpart of an IM room's member list).
+      parts.push(`<button class="chat-header-meta-members" id="group-roster-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="${escapeHtml(t('chat.header.roster_title'))}">${memberHtml}</button>`);
       if (agents.length) {
         const countTxt = t('chat.header.agent_count', { n: agents.length });
         const countLabel = (countTxt && countTxt !== 'chat.header.agent_count')
@@ -2800,7 +2802,129 @@ function _refreshChatHeader() {
       }
     }
     metaEl.innerHTML = parts.join('');
+    _bindGroupRosterButton();
   }
+
+// ─── Group roster panel (IM-style member list) ─────────────────────────────
+// Clicking the header's stacked avatars opens a lightweight popover listing
+// every room member — avatar, name, role, live status. The commander row is
+// marked as the room's coordinator (DS Bot's "admin" badge analog). Clicking
+// a member inserts an @mention into the composer, the way an IM room's member
+// chip does. Data comes from what the page already caches: _groupMembersCache
+// (roster), _agentsCache (profiles), _latestInFlight (who is running now).
+let _groupRosterOpen = false;
+
+function _groupRosterContainer() {
+  let el = document.getElementById('group-roster-panel');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'group-roster-panel';
+    el.className = 'group-roster-panel';
+    el.setAttribute('role', 'dialog');
+    el.hidden = true;
+    document.body.appendChild(el);
+    document.addEventListener('click', (e) => {
+      if (_groupRosterOpen && !el.contains(e.target)
+          && !(e.target.closest && e.target.closest('#group-roster-btn'))) {
+        _closeGroupRoster();
+      }
+    }, true);
+  }
+  return el;
+}
+
+function _closeGroupRoster() {
+  _groupRosterOpen = false;
+  const el = document.getElementById('group-roster-panel');
+  if (el) el.hidden = true;
+  const btn = document.getElementById('group-roster-btn');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function _groupRosterRowHtml(actor, ag) {
+  const cid = currentCid;
+  const inFlight = (cid && _latestInFlight.get(cid)) || [];
+  const running = inFlight.includes(actor.id);
+  const status = actor.kind === 'user'
+    ? t('chat.roster.status_owner')
+    : running ? t('chat.roster.status_running') : t('chat.roster.status_idle');
+  const roleText = actor.kind === 'commander'
+    ? t('chat.roster.role_commander')
+    : (ag?.profile?.role || ag?.description_zh || '');
+  const badge = actor.kind === 'commander'
+    ? `<span class="group-roster-badge">${escapeHtml(t('chat.roster.badge_admin'))}</span>`
+    : '';
+  const avatar = renderAvatarHtml(ag?.icon, ag?.color, {
+    size: 26,
+    seed: actor.id,
+    extraClass: 'group-roster-avatar',
+  });
+  const mention = actor.kind === 'agent' ? ` @${ag?.name || actor.id} ` : '';
+  return `<button class="group-roster-row${running ? ' is-running' : ''}" type="button"
+          data-roster-mention="${escapeHtml(mention.trim())}">
+    ${avatar}
+    <span class="group-roster-main">
+      <span class="group-roster-name">${escapeHtml(actor.kind === 'user' ? t('chat.roster.you') : (ag?.name || actor.name || actor.id))}${badge}</span>
+      ${roleText ? `<span class="group-roster-role">${escapeHtml(roleText)}</span>` : ''}
+    </span>
+    <span class="group-roster-status">${escapeHtml(status)}</span>
+  </button>`;
+}
+
+function _renderGroupRoster() {
+  const cid = currentCid;
+  if (!cid) return;
+  const members = _groupMembersCache.get(cid) || [];
+  if (!members.length) return;
+  const rows = [];
+  const order = { commander: 0, agent: 1, user: 2, worker: 3 };
+  const sorted = [...members].sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9));
+  for (const actor of sorted) {
+    const ag = actor.kind === 'agent' && Array.isArray(_agentsCache)
+      ? _agentsCache.find((x) => x && x.agent_id === actor.id)
+      : undefined;
+    rows.push(_groupRosterRowHtml(actor, ag));
+  }
+  const el = _groupRosterContainer();
+  el.innerHTML = `<div class="group-roster-title">${escapeHtml(t('chat.roster.title', { n: sorted.length }))}</div>`
+    + rows.join('');
+  el.querySelectorAll('.group-roster-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      const mention = row.getAttribute('data-roster-mention') || '';
+      if (mention) _insertRosterMention(mention);
+      _closeGroupRoster();
+    });
+  });
+}
+
+function _insertRosterMention(mention) {
+  const input = document.getElementById('chat-input');
+  if (!input) return;
+  const current = input.value || '';
+  const needsSpace = current && !/\s$/.test(current);
+  input.value = current + (needsSpace ? ' ' : '') + mention;
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function _bindGroupRosterButton() {
+  const btn = document.getElementById('group-roster-btn');
+  if (!btn || btn.dataset.rosterBound) return;
+  btn.dataset.rosterBound = '1';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (_groupRosterOpen) { _closeGroupRoster(); return; }
+    _renderGroupRoster();
+    const el = document.getElementById('group-roster-panel');
+    if (!el) return;
+    const rect = btn.getBoundingClientRect();
+    el.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 360)}px`;
+    el.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 300))}px`;
+    el.hidden = false;
+    _groupRosterOpen = true;
+    btn.setAttribute('aria-expanded', 'true');
+  });
+}
   // Reflect drawer-open state on the details button (existing toggle id is
   // reused; _syncChrome in conversation-info toggles is-active automatically).
 }
@@ -8758,9 +8882,23 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       || (t('chat.from_agent_unknown'));
   const headerActorId = role === 'user' ? '' : String(message._from || '');
   const avatarHtml = role === 'user' ? '' : _renderActorAvatarHtml(headerActorId);
+  // Fleet-form bubble identity: the sender's avatar palette also tints the
+  // name and a 3px left rail on the bubble, so a scrolling reader can track
+  // who is speaking by color the way IM apps color per-member. Commander
+  // additionally wears the room-admin badge.
+  const _senderPalette = (role === 'user' || typeof resolveAvatar !== 'function')
+    ? null
+    : (() => {
+        const _ag = Array.isArray(_agentsCache) ? _agentsCache.find((x) => x && x.agent_id === headerActorId) : undefined;
+        const a = resolveAvatar(_ag?.icon, _ag?.color, headerActorId || 'default');
+        return (a && a.bg) ? a : null;
+      })();
+  const _adminBadge = (role !== 'user' && headerActorId === 'commander')
+    ? `<span class="chat-msg-from-badge">${escapeHtml(t('chat.roster.badge_admin'))}</span>`
+    : '';
   const headerHtml = role === 'user'
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
-    : `<div class="chat-msg-header"><span class="chat-msg-avatar-slot" data-role="from-avatar">${avatarHtml}</span><span class="chat-msg-from${_isActorDetailTarget(headerActorId) ? ' is-agent-link' : ''}"${_actorLinkAttrs(headerActorId)}>${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
+    : `<div class="chat-msg-header"${_senderPalette ? ` style="--sender-bg:${_senderPalette.bg};--sender-fg:${_senderPalette.fg}"` : ''}><span class="chat-msg-avatar-slot" data-role="from-avatar">${avatarHtml}</span><span class="chat-msg-from${_isActorDetailTarget(headerActorId) ? ' is-agent-link' : ''}"${_actorLinkAttrs(headerActorId)}>${escapeHtml(headerName)}</span>${_adminBadge}<span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
     ? `<div class="chat-plan-announce">${_uiIconHtml('clipboard-list', 'ui-icon chat-plan-announce-icon')}<span>${escapeHtml(t('chat.plan_announce'))}</span></div>` : '';
   // Created-resource links live at the bottom of the bubble so hover-only
@@ -8776,6 +8914,10 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (message._render_key) msgDiv.dataset.renderKey = String(message._render_key);
   if (message._client_msg_id) msgDiv.dataset.clientMsgId = String(message._client_msg_id);
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
+  if (role !== 'user' && _senderPalette) {
+    msgDiv.style.setProperty('--sender-bg', _senderPalette.bg);
+    msgDiv.style.setProperty('--sender-fg', _senderPalette.fg);
+  }
   if (message._turn_id) msgDiv.dataset.turnId = String(message._turn_id);
   if (message._system_kind) msgDiv.dataset.systemKind = String(message._system_kind);
   if (message.failure_kind) msgDiv.dataset.failureKind = String(message.failure_kind);

@@ -2535,5 +2535,18 @@
   "quality.operator.disabled": "Disabled on this device.",
   "quality.operator.ready": "Ready: {count} rules.",
   "quality.operator.invalid": "Validation unavailable. Fix operator-policy.json or turn off custom validation, then retry.",
-  "sidebar.workbench": "Workbench"
+  "sidebar.workbench": "Workbench",
+  "chat.header.roster_title": "View fleet members",
+  "chat.roster.title": "Fleet members ({n})",
+  "chat.roster.you": "You",
+  "chat.roster.role_commander": "Commander · fleet coordinator",
+  "chat.roster.badge_admin": "Admin",
+  "chat.roster.status_owner": "Owner",
+  "chat.roster.status_running": "Running",
+  "chat.roster.status_idle": "Idle",
+  "onboarding.step1": "Configure a model — paste an API key",
+  "onboarding.step2": "Import a fleet template (one YAML → one team)",
+  "onboarding.step3": "Say the first word in the room — the fleet starts working",
+  "onboarding.go_config": "Configure",
+  "onboarding.go_import": "Import"
 }

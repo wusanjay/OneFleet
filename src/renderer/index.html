@@ -114,6 +114,25 @@
           <div class="new-chat-header">
             <h1 class="new-chat-greeting" id="new-chat-greeting" data-i18n="new_chat.title_fallback">Friend, what do you want to accomplish?</h1>
             <p class="new-chat-subtitle" data-i18n="new_chat.subtitle"></p>
+          <!-- Fleet-form first-run: the IM product's three-step onboarding.
+               Shown only when there is nothing yet (no conversation, no model
+               entry); hidden by modules/team-templates.js once either lands. -->
+          <div class="new-chat-onboarding" id="new-chat-onboarding" hidden>
+            <div class="onboarding-step" data-step="1">
+              <span class="onboarding-num">1</span>
+              <span data-i18n="onboarding.step1">配置模型 — 填一个 API Key</span>
+              <button class="btn onboarding-action" id="onboarding-model-btn" type="button" data-i18n="onboarding.go_config">去配置</button>
+            </div>
+            <div class="onboarding-step" data-step="2">
+              <span class="onboarding-num">2</span>
+              <span data-i18n="onboarding.step2">导入一支编队模板（YAML 一键建队）</span>
+              <button class="btn onboarding-action" id="onboarding-template-btn" type="button" data-i18n="onboarding.go_import">导入编队</button>
+            </div>
+            <div class="onboarding-step" data-step="3">
+              <span class="onboarding-num">3</span>
+              <span data-i18n="onboarding.step3">进群说第一句话 — 编队自动开工</span>
+            </div>
+          </div>
           </div>
           <div class="new-chat-input-wrapper">
             <div class="new-chat-input-area">

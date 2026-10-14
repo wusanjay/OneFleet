@@ -19919,3 +19919,139 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   padding-top: 2px;
 }
 .sidebar-workbench-actions[hidden] { display: none; }
+
+/* ─── Group roster panel (IM room member list) ────────────────────────── */
+.chat-header-meta-members {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  margin: 0;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.chat-header-meta-members:hover { background: var(--hover, rgba(0,0,0,0.05)); }
+.group-roster-panel {
+  position: fixed;
+  z-index: 900;
+  width: 280px;
+  max-height: 340px;
+  overflow-y: auto;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #ddd);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+  padding: 8px;
+}
+.group-roster-panel[hidden] { display: none; }
+.group-roster-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted, #888);
+  padding: 6px 8px 8px;
+  border-bottom: 1px solid var(--border, #eee);
+  margin-bottom: 4px;
+}
+.group-roster-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 7px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.group-roster-row:hover { background: var(--hover, rgba(0,0,0,0.05)); }
+.group-roster-row.is-running { background: rgba(46, 170, 100, 0.08); }
+.group-roster-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.group-roster-name {
+  font-size: 13px;
+  font-weight: 600;
+  display: flex; align-items: center; gap: 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.group-roster-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent, #4a7dff);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.group-roster-role {
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.group-roster-status { font-size: 11px; color: var(--text-muted, #999); flex-shrink: 0; }
+.group-roster-row.is-running .group-roster-status { color: #2eaa64; font-weight: 600; }
+
+/* ─── Fleet-form bubble identity (per-member color rail + admin badge) ── */
+.chat-message .chat-bubble { position: relative; }
+.chat-message.assistant[style*="--sender-bg"] .chat-bubble {
+  border-left: 3px solid var(--sender-bg);
+}
+.chat-message.assistant[style*="--sender-fg"] > .chat-msg-header .chat-msg-from {
+  color: var(--sender-fg);
+}
+.chat-msg-from-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent, #4a7dff);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
+/* ─── First-run onboarding (three steps to a working fleet) ────────────── */
+.new-chat-onboarding {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 18px auto 6px;
+  max-width: 460px;
+  width: 100%;
+  text-align: left;
+}
+.new-chat-onboarding[hidden] { display: none; }
+.onboarding-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 10px;
+  background: var(--surface-2, rgba(0,0,0,0.02));
+  font-size: 14px;
+}
+.onboarding-num {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--accent, #4a7dff);
+  color: #fff;
+  font-size: 12px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.onboarding-step.is-done .onboarding-num { background: #2eaa64; }
+.onboarding-step.is-done { opacity: 0.65; }
+.onboarding-action {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.onboarding-action:hover { background: var(--hover, rgba(0,0,0,0.05)); }

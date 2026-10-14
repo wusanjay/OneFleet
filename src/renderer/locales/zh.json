@@ -2535,5 +2535,18 @@
   "quality.operator.disabled": "本机已停用。",
   "quality.operator.ready": "已加载 {count} 条规则。",
   "quality.operator.invalid": "校验不可用。请修复 operator-policy.json，或停用自定义校验后重试。",
-  "sidebar.workbench": "工作台"
+  "sidebar.workbench": "工作台",
+  "chat.header.roster_title": "查看编队成员",
+  "chat.roster.title": "编队成员（{n}）",
+  "chat.roster.you": "你",
+  "chat.roster.role_commander": "指挥官 · 编队协调者",
+  "chat.roster.badge_admin": "管理员",
+  "chat.roster.status_owner": "群主",
+  "chat.roster.status_running": "执行中",
+  "chat.roster.status_idle": "空闲",
+  "onboarding.step1": "配置模型 — 填一个 API Key",
+  "onboarding.step2": "导入一支编队模板（YAML 一键建队）",
+  "onboarding.step3": "进群说第一句话 — 编队自动开工",
+  "onboarding.go_config": "去配置",
+  "onboarding.go_import": "导入编队"
 }

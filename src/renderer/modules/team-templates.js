@@ -75,10 +75,36 @@
     });
   }
 
+  /** First-run onboarding strip: show while the user has neither a model
+   *  entry nor any conversation; hide permanently once either exists. */
+  async function _refreshOnboarding() {
+    const el = document.getElementById('new-chat-onboarding');
+    if (!el) return;
+    try {
+      const convs = await window.orkas.invoke('conversations.list', {});
+      const hasConv = Array.isArray(convs.conversations) && convs.conversations.length > 0;
+      let hasModel = false;
+      try {
+        const entries = await window.orkas.invoke('auth.listComposerEntries', {});
+        hasModel = Array.isArray(entries.entries) && entries.entries.length > 0;
+      } catch (_) { /* keep showing step 1 */ }
+      el.hidden = hasConv || hasModel;
+      const step1 = el.querySelector('[data-step="1"]');
+      if (step1) step1.classList.toggle('is-done', hasModel);
+      const step3 = el.querySelector('[data-step="3"]');
+      if (step3) step3.classList.toggle('is-done', hasConv);
+    } catch (_) { /* list unavailable — keep hidden default */ }
+  }
+
   function _bind() {
     _btn()?.addEventListener('click', () => _fileInput()?.click());
     _fileInput()?.addEventListener('change', (e) => { void _onFileChosen(e); });
     _bindWorkbench();
+    document.getElementById('onboarding-model-btn')
+      ?.addEventListener('click', () => { if (typeof setView === 'function') setView('settings'); });
+    document.getElementById('onboarding-template-btn')
+      ?.addEventListener('click', () => _fileInput()?.click());
+    void _refreshOnboarding();
   }
 
   if (document.readyState === 'loading') {
