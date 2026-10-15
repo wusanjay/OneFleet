@@ -267,7 +267,7 @@
   "agents.output_format_dashboard_hint": "Visual data charts.",
   "agents.output_format_artifact": "Interactive app",
   "agents.output_format_artifact_hint": "Interactive web app.",
-  "sidebar.conversations": "All conversations",
+  "sidebar.conversations": "Conversations",
   "sidebar.conv_empty": "No tasks yet",
   "sidebar.bucket.today": "Today",
   "sidebar.bucket.yesterday": "Yesterday",
@@ -2571,5 +2571,6 @@
   "workbench.connectors_desc": "Connect external apps & data",
   "workbench.contexts_desc": "The fleet's shared knowledge base",
   "workbench.apps_desc": "Fleet-built mini apps",
-  "chat.cost_milestone": "Fleet has used {n} tokens so far"
+  "chat.cost_milestone": "Fleet has used {n} tokens so far",
+  "workbench.projects_desc": "Archive fleets & chats by business line"
 }

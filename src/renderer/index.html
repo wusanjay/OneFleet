@@ -56,32 +56,6 @@
                 data-i18n-title="agents.import_template_btn" title="导入编队模板" aria-label="导入编队模板">＋</button>
       </div>
       <div class="sidebar-conversation-nav">
-        <div class="sidebar-section sidebar-today-section">
-          <div class="sidebar-section-title-row">
-            <button class="sidebar-section-toggle" id="today-section-toggle" type="button"
-                    aria-controls="today-list" aria-expanded="true">
-              <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
-              <span class="sidebar-section-title" data-i18n="sidebar.today_tasks">Pinned &amp; today</span>
-              <span class="task-unread-dot" id="today-unread-dot" hidden aria-hidden="true"></span>
-            </button>
-          </div>
-          <div class="today-list" id="today-list"></div>
-        </div>
-        <div class="sidebar-section sidebar-projects-section">
-          <div class="sidebar-section-title-row">
-            <button class="sidebar-section-toggle" id="projects-section-toggle" type="button"
-                    aria-controls="projects-list" aria-expanded="true">
-              <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
-              <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
-              <span class="task-unread-dot" id="projects-unread-dot" hidden aria-hidden="true"></span>
-            </button>
-            <button class="sidebar-section-add" id="projects-add-btn"
-                    data-i18n-title="sidebar.project_create_title"
-                    data-i18n-aria-label="sidebar.project_create_title"
-                    title="New project" aria-label="New project">+</button>
-          </div>
-          <div class="projects-list" id="projects-list"></div>
-        </div>
         <div class="sidebar-section sidebar-conversations-section">
           <div class="sidebar-section-title-row">
             <button class="sidebar-section-toggle" id="tasks-section-toggle" type="button"
@@ -1108,6 +1082,21 @@
           <div class="agents-grid-scroll">
             <div class="apps-grid" id="apps-grid"></div>
             <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No apps</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Projects — workbench section (fleet-form: moved out of the midbar;
+           the owner organizes business lines here). The projects-list
+           container id is reused so projects.js keeps rendering into it. -->
+      <section class="panel" id="panel-projects-list">
+        <div class="workbench-wrap">
+          <div class="workbench-projects">
+            <div class="workbench-projects-header">
+              <span class="workbench-card-title" data-i18n="sidebar.projects">Projects</span>
+              <button type="button" class="workbench-projects-add" id="projects-add-btn" data-i18n-title="sidebar.project_create_title" title="New project">＋ 新建项目</button>
+            </div>
+            <div class="projects-list" id="projects-list"></div>
           </div>
         </div>
       </section>

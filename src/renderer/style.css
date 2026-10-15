@@ -20306,3 +20306,22 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   color: #8a6d1a;
 }
 .chat-cost-card-icon { font-size: 14px; }
+
+/* ─── Workbench projects section ──────────────────────────────────────── */
+.workbench-projects { margin-top: 36px; }
+.workbench-projects-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.workbench-projects-add {
+  padding: 6px 14px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  cursor: pointer;
+}
+.workbench-projects-add:hover { background: var(--hover, rgba(0,0,0,0.05)); }
+.panel-projects-list .projects-list .conv-item { border-radius: 10px; }

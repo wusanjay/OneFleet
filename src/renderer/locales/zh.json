@@ -267,7 +267,7 @@
   "agents.output_format_dashboard_hint": "可视化的数据图表",
   "agents.output_format_artifact": "交互应用",
   "agents.output_format_artifact_hint": "可交互的网页应用",
-  "sidebar.conversations": "全部对话",
+  "sidebar.conversations": "对话",
   "sidebar.conv_empty": "暂无任务",
   "sidebar.bucket.today": "今天",
   "sidebar.bucket.yesterday": "昨天",
@@ -2571,5 +2571,6 @@
   "workbench.connectors_desc": "接入外部应用与数据",
   "workbench.contexts_desc": "编队共享的知识底座",
   "workbench.apps_desc": "编队产出的小工具",
-  "chat.cost_milestone": "本编队累计已消耗 {n} tokens"
+  "chat.cost_milestone": "本编队累计已消耗 {n} tokens",
+  "workbench.projects_desc": "按业务线归档编队与会话"
 }

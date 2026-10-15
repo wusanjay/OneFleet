@@ -81,11 +81,14 @@
       try {
         const res = await window.orkas.invoke('conversations.list', {});
         const convs = (res && res.conversations) || [];
-        const recent = convs.reduce((a, b) => {
-          const ta = Date.parse(a.updated_at || a.created_at || '') || 0;
-          const tb = Date.parse(b.updated_at || b.created_at || '') || 0;
-          return tb > ta ? b : a;
-        }, null);
+        // No null initial: the first element seeds the accumulator (reading
+        // updated_at off a null accumulator was the crash).
+        const recent = convs.reduce((best, c) => {
+          if (!best) return c;
+          const ta = Date.parse(best.updated_at || best.created_at || '') || 0;
+          const tb = Date.parse(c.updated_at || c.created_at || '') || 0;
+          return tb > ta ? c : best;
+        });
         if (recent && typeof setView === 'function') { setView('conversation', recent.conversation_id); return; }
       } catch (_) { /* fall through */ }
       if (typeof setView === 'function') setView('new-chat');
