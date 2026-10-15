@@ -56,22 +56,39 @@
     }
   }
 
-  /** Workbench group (collapsed toolbox) — persists open/closed per machine. */
-  function _bindWorkbench() {
-    const toggle = document.getElementById('workbench-toggle');
-    const actions = document.getElementById('workbench-actions');
-    if (!toggle || !actions) return;
-    const apply = (open) => {
-      toggle.setAttribute('aria-expanded', String(open));
-      actions.hidden = !open;
-    };
-    let saved = null;
-    try { saved = localStorage.getItem('onefleet.workbench'); } catch (_) {}
-    apply(saved === 'open');
-    toggle.addEventListener('click', () => {
-      const open = toggle.getAttribute('aria-expanded') !== 'true';
-      apply(open);
-      try { localStorage.setItem('onefleet.workbench', open ? 'open' : 'closed'); } catch (_) {}
+  /** Midbar filter (全部 / 机器人 / 群组) — repaints the conversation lists. */
+  function _bindConvFilter() {
+    const bar = document.getElementById('conv-filter');
+    if (!bar) return;
+    bar.querySelectorAll('button[data-filter]').forEach((b) => {
+      b.addEventListener('click', () => {
+        bar.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
+        b.classList.add('active');
+        if (typeof window !== 'undefined') window.__onefleetConvFilter = b.dataset.filter;
+        if (typeof renderConversationList === 'function') renderConversationList();
+        else if (typeof _markBootUserNavigation === 'function') { /* boot not done */ }
+      });
+    });
+  }
+
+  /** Rail 消息 — land in the most recent conversation (IM apps open into the
+   *  top thread); true first-run falls back to the composer. */
+  function _bindRailMessages() {
+    const btn = document.getElementById('rail-messages-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
+      try {
+        const res = await window.orkas.invoke('conversations.list', {});
+        const convs = (res && res.conversations) || [];
+        const recent = convs.reduce((a, b) => {
+          const ta = Date.parse(a.updated_at || a.created_at || '') || 0;
+          const tb = Date.parse(b.updated_at || b.created_at || '') || 0;
+          return tb > ta ? b : a;
+        }, null);
+        if (recent && typeof setView === 'function') { setView('conversation', recent.conversation_id); return; }
+      } catch (_) { /* fall through */ }
+      if (typeof setView === 'function') setView('new-chat');
     });
   }
 
@@ -99,7 +116,8 @@
   function _bind() {
     _btn()?.addEventListener('click', () => _fileInput()?.click());
     _fileInput()?.addEventListener('change', (e) => { void _onFileChosen(e); });
-    _bindWorkbench();
+    _bindConvFilter();
+    _bindRailMessages();
     document.getElementById('onboarding-model-btn')
       ?.addEventListener('click', () => { if (typeof setView === 'function') setView('settings'); });
     document.getElementById('onboarding-template-btn')

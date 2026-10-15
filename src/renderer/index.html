@@ -12,23 +12,48 @@
 </head>
 <body>
   <div class="app-container">
-    <aside class="sidebar">
-      <div class="sidebar-logo">
-        <img class="logo-icon" src="../resources/icons/logo.png" alt="" draggable="false" />
-        <div class="logo-text">Orkas</div>
-        <button class="sidebar-logo-version" id="sidebar-version" type="button"></button>
+        <nav class="rail" id="rail">
+      <div class="rail-logo">
+        <img class="rail-logo-img" src="../resources/icons/logo.png" alt="" draggable="false" />
       </div>
-      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (Cmd/Ctrl+K)">
-        <span data-ui-icon="search" data-ui-icon-class="sidebar-search-icon"></span>
-        <span class="sidebar-search-label" data-i18n="sidebar.search">Search</span>
-        <span class="sidebar-search-kbd">
-          <span data-ui-icon="command" data-ui-icon-class="ui-icon sidebar-search-command-icon"></span><span>K</span>
-        </span>
+      <button class="rail-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (Cmd/Ctrl+K)">
+        <span data-ui-icon="search" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_search">搜索</span>
       </button>
-      <div class="sidebar-actions sidebar-actions-primary">
-        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New chat</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
-        <button class="sidebar-btn" id="team-template-import-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="agents.import_template_btn">Import fleet template</span></button>
-        <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
+      <button class="rail-btn rail-btn-new" id="new-chat-btn">
+        <span data-ui-icon="plus" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_new">新对话</span>
+      </button>
+      <button class="rail-btn" id="rail-messages-btn">
+        <span data-ui-icon="message-square" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_messages">消息</span>
+        <span class="rail-badge" id="rail-messages-badge" hidden></span>
+      </button>
+      <button class="rail-btn" id="agents-btn">
+        <span data-ui-icon="users" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_agents">智能体</span>
+      </button>
+      <button class="rail-btn" id="workbench-btn">
+        <span data-ui-icon="layout-grid" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_workbench">工作台</span>
+      </button>
+      <div class="rail-spacer"></div>
+      <button class="rail-btn" id="settings-btn">
+        <span data-ui-icon="settings" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_settings">设置</span>
+      </button>
+      <span id="sidebar-version" hidden></span>
+    </nav>
+    <aside class="midbar" id="midbar">
+      <div class="midbar-header">
+        <span class="midbar-title" data-i18n="midbar.title">消息</span>
+        <div class="midbar-filter" id="conv-filter" role="tablist">
+          <button type="button" data-filter="all" class="active" data-i18n="midbar.filter_all">全部</button>
+          <button type="button" data-filter="bots" data-i18n="midbar.filter_bots">机器人</button>
+          <button type="button" data-filter="groups" data-i18n="midbar.filter_groups">群组</button>
+        </div>
+        <button class="midbar-add" id="team-template-import-btn" type="button"
+                data-i18n-title="agents.import_template_btn" title="导入编队模板" aria-label="导入编队模板">＋</button>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-today-section">
@@ -72,35 +97,7 @@
           </div>
         </div>
       </div>
-      <div class="sidebar-workbench" id="sidebar-workbench">
-        <button class="sidebar-section-toggle sidebar-workbench-toggle" id="workbench-toggle" type="button"
-                aria-controls="workbench-actions" aria-expanded="false">
-          <span data-ui-icon="chevron-right" data-ui-icon-class="sidebar-section-chevron"></span>
-          <span class="sidebar-section-title" data-i18n="sidebar.workbench">Workbench</span>
-        </button>
-        <div class="sidebar-actions sidebar-workbench-actions" id="workbench-actions" hidden>
-          <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span></button>
-          <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
-          <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
-          <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
-          <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="database" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Library</span></button>
-          <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">Apps</span></button>
-        </div>
-      </div>
-      <div class="sidebar-footer-actions">
-        <div class="sidebar-footer-action-row">
-          <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
-            <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
-            <span class="sidebar-footer-label" data-i18n="sidebar.settings">Settings</span>
-          </button>
-        </div>
-      </div>
-      <div class="sidebar-resize-handle" id="sidebar-resize-handle"
-           role="separator" aria-orientation="vertical" tabindex="0"
-           data-i18n-aria-label="sidebar.resize_title"
-           aria-label="Drag to resize · double-click to reset"
-           data-i18n-title="sidebar.resize_title"
-           title="Drag to resize · double-click to reset"></div>
+      <input type="file" id="team-template-file-input" accept=".yaml,.yml,.json,.md" style="display:none" />
     </aside>
 
     <main class="main-content">
@@ -1111,6 +1108,48 @@
           <div class="agents-grid-scroll">
             <div class="apps-grid" id="apps-grid"></div>
             <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No apps</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Workbench — fleet-form P1: tools become cards in the content area
+           (rail → 工作台). The six tool buttons keep their historical IDs so
+           the existing setView bindings in boot.js/state.js keep working. -->
+      <section class="panel" id="panel-workbench">
+        <div class="workbench-wrap">
+          <h1 class="workbench-title" data-i18n="workbench.title">工作台</h1>
+          <p class="workbench-subtitle" data-i18n="workbench.subtitle">老板自己的工具箱 — 编队在消息里，工具在这里。</p>
+          <div class="workbench-grid">
+            <button type="button" class="workbench-card" id="todos-btn">
+              <span data-ui-icon="clipboard-list" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="project.todo.title">待办</span>
+              <span class="workbench-card-desc" data-i18n="workbench.todos_desc">今天要做的事和进度</span>
+            </button>
+            <button type="button" class="workbench-card" id="auto-btn">
+              <span data-ui-icon="clock" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="sidebar.auto">自动化</span>
+              <span class="workbench-card-desc" data-i18n="workbench.auto_desc">定时与触发的编队任务</span>
+            </button>
+            <button type="button" class="workbench-card" id="skills-btn">
+              <span data-ui-icon="sparkles" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="sidebar.skills">技能库</span>
+              <span class="workbench-card-desc" data-i18n="workbench.skills_desc">给机器人装上新本领</span>
+            </button>
+            <button type="button" class="workbench-card" id="connectors-btn">
+              <span data-ui-icon="plug" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="sidebar.connectors">连接器</span>
+              <span class="workbench-card-desc" data-i18n="workbench.connectors_desc">接入外部应用与数据</span>
+            </button>
+            <button type="button" class="workbench-card" id="contexts-btn">
+              <span data-ui-icon="database" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="sidebar.contexts">资料库</span>
+              <span class="workbench-card-desc" data-i18n="workbench.contexts_desc">编队共享的知识底座</span>
+            </button>
+            <button type="button" class="workbench-card" id="apps-btn">
+              <span data-ui-icon="layout-grid" data-ui-icon-class="workbench-card-icon"></span>
+              <span class="workbench-card-title" data-i18n="sidebar.apps">应用</span>
+              <span class="workbench-card-desc" data-i18n="workbench.apps_desc">编队产出的小工具</span>
+            </button>
           </div>
         </div>
       </section>

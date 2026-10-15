@@ -1,10 +1,29 @@
 import type { LLMProvider } from '#core-agent';
 import { isOverTaskBudget, recordUsageTokens } from '../../util/conversation-cost-meter';
+import { recordProviderUsage } from '../../util/usage-ledger';
 
 /** Per-request runaway backstop. Already-issued calls settle normally; only
  * subsequent calls are refused. Wrap each candidate so retries also pass here. */
-export function withTaskBudget(provider: LLMProvider, cid?: string): LLMProvider {
+export interface TaskBudgetMeta {
+  provider?: string;
+  model?: string;
+}
+
+export function withTaskBudget(provider: LLMProvider, cid?: string, meta?: TaskBudgetMeta): LLMProvider {
   if (!cid) return provider;
+  // Cost-visibility ledger (v1: conversation+model; actor arrives in a later
+  // pass). Best-effort inside the ledger — never throws into the model call.
+  const charge = (inputTokens?: number, outputTokens?: number) => {
+    if (meta && (inputTokens || outputTokens)) {
+      recordProviderUsage({
+        cid,
+        provider: meta.provider || provider.id,
+        model: meta.model || provider.name,
+        inputTokens,
+        outputTokens,
+      });
+    }
+  };
   const admit = () => {
     if (isOverTaskBudget(cid)) {
       throw Object.assign(new Error('Task token limit reached'), { code: 'TASK_TOKEN_LIMIT_REACHED' });
@@ -18,6 +37,7 @@ export function withTaskBudget(provider: LLMProvider, cid?: string): LLMProvider
       admit();
       const result = await provider.complete(params);
       recordUsageTokens(cid, { inputTokens: result.usage?.inputTokens, outputTokens: result.usage?.outputTokens });
+      charge(result.usage?.inputTokens, result.usage?.outputTokens);
       return result;
     },
     async *stream(params) {
@@ -36,6 +56,7 @@ export function withTaskBudget(provider: LLMProvider, cid?: string): LLMProvider
         }
       } finally {
         recordUsageTokens(cid, { inputTokens, outputTokens });
+        charge(inputTokens, outputTokens);
       }
     },
   };

@@ -1983,6 +1983,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // ── Team templates (编队模板) — YAML ⇄ group fleet, composition-only ──
 
+  'usage.forConversation': async ({ cid }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const { conversationUsageSummary } = await import('../util/usage-ledger');
+    return conversationUsageSummary(cid);
+  },
+
   'teamTemplates.parse': async ({ yaml_text }) => {
     const text = String(yaml_text || '');
     if (!text.trim()) throw new Error('yaml_text required');

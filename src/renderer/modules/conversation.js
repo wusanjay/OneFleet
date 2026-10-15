@@ -2887,7 +2887,20 @@ function _renderGroupRoster() {
   }
   const el = _groupRosterContainer();
   el.innerHTML = `<div class="group-roster-title">${escapeHtml(t('chat.roster.title', { n: sorted.length }))}</div>`
-    + rows.join('');
+    + rows.join('')
+    + `<div class="group-roster-cost" id="group-roster-cost" hidden></div>`;
+  // Fleet cost footer — persisted per-request usage ledger (tokens; pricing
+  // is per-provider and deliberately not hardcoded here).
+  void window.orkas.invoke('usage.forConversation', { cid }).then((u) => {
+    const costEl = document.getElementById('group-roster-cost');
+    if (!costEl || !u || u.ok !== true) return;
+    if (!u.requests) return;
+    const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+    costEl.hidden = false;
+    const models = (u.by_model || []).map((m) => `${m.model} ${fmt(m.input_tokens)}→${fmt(m.output_tokens)}`).join(' · ');
+    costEl.innerHTML = `<span class="group-roster-cost-sum">${escapeHtml(t('chat.roster.cost_total', { i: fmt(u.input_tokens), o: fmt(u.output_tokens), n: u.requests }))}</span>`
+      + (models ? `<span class="group-roster-cost-models">${escapeHtml(models)}</span>` : '');
+  }).catch(() => { /* ledger miss — footer stays hidden */ });
   el.querySelectorAll('.group-roster-row').forEach((row) => {
     row.addEventListener('click', () => {
       const mention = row.getAttribute('data-roster-mention') || '';
@@ -5980,8 +5993,26 @@ function _conversationActivityIso(c) {
   return (c && (c.last_active_at || c.updated_at || c.created_at)) || '';
 }
 
+// Fleet-form midbar filter — 全部 / 机器人 / 群组. Classification heuristic:
+// 2+ bound agents = 群组 (a fleet room), exactly 1 = 机器人 (single-agent
+// chat), 0 = commander-only 对话. Projected rows bypass this helper (they
+// render inside their project), so the filter governs the catch-all lists.
+function _convMatchesMidbarFilter(c) {
+  const f = (typeof window !== 'undefined' && window.__onefleetConvFilter) || 'all';
+  if (f === 'all') return true;
+  const n = Array.isArray(c && c.agent_ids) ? c.agent_ids.length : 0;
+  if (f === 'groups') return n >= 2;
+  if (f === 'bots') return n === 1;
+  return true;
+}
+
 function _renderConversationTimeBucketList(items, itemOpts = {}) {
   const rows = (Array.isArray(items) ? items : []).filter(Boolean).slice();
+  const filtered = rows.filter((c) => _convMatchesMidbarFilter(c));
+  if (rows.length !== filtered.length) {
+    rows.length = 0;
+    rows.push(...filtered);
+  }
   rows.sort(_compareConversationsForSidebar);
   const pinned = [];
   const rest = [];
@@ -6151,8 +6182,29 @@ function _renderConversationSidebarItem(c, opts = {}) {
     ? `<input type="text" class="conv-item-title-input" data-conv-rename-cid="${cid}"
               value="${escapeHtml(_conversationInlineRenameDraft)}" autocomplete="off" spellcheck="false" />`
     : `<div class="conv-item-title" title="${title}">${title}</div>`;
+  // Fleet-form row identity: avatar (agent / stacked fleet) + type chip.
+  const agentIds = Array.isArray(c.agent_ids) ? c.agent_ids : [];
+  const fleetAgents = agentIds
+    .map((id) => (Array.isArray(_agentsCache) ? _agentsCache.find((x) => x && x.agent_id === id) : undefined))
+    .filter(Boolean);
+  let avatarHtml = '';
+  if (agentIds.length >= 2) {
+    avatarHtml = `<span class="conv-item-avatar conv-item-avatar-stack">${fleetAgents.slice(0, 2).map((a) => renderAvatarHtml(a.icon, a.color, { size: 20, seed: a.agent_id })).join('')}</span>`;
+  } else if (agentIds.length === 1) {
+    const a0 = fleetAgents[0];
+    avatarHtml = renderAvatarHtml(a0?.icon, a0?.color, { size: 34, seed: agentIds[0] }).replace('avatar-circle', 'conv-item-avatar avatar-circle');
+  } else if (typeof _commanderAvatar === 'function') {
+    const av = _commanderAvatar();
+    avatarHtml = renderAvatarHtml(av.icon, av.color, { size: 34, seed: 'commander' }).replace('avatar-circle', 'conv-item-avatar avatar-circle');
+  }
+  const kindChip = agentIds.length >= 2
+    ? `<span class="conv-item-chip chip-group">${escapeHtml(t('midbar.chip_group'))}</span>`
+    : agentIds.length === 1
+      ? `<span class="conv-item-chip">${escapeHtml(t('midbar.chip_bot'))}</span>`
+      : '';
   const classes = [
     'conv-item',
+    'has-avatar',
     opts.nested ? 'conv-item-nested' : '',
     currentCid === c.conversation_id ? 'active' : '',
     isPinned ? 'is-pinned' : '',
@@ -6169,9 +6221,14 @@ function _renderConversationSidebarItem(c, opts = {}) {
   return `
     <div class="${classes}" data-cid="${cid}">
       <div class="conv-item-row">
-        ${statusDotHtml}
-        ${autoIconHtml}
-        ${titleNode}
+        ${avatarHtml}
+        <div class="conv-item-main">
+          <div class="conv-item-row conv-item-title-row">
+            ${titleNode}
+            ${kindChip}
+          </div>
+          <div class="conv-item-sub">${escapeHtml(t('midbar.sub_agents', { n: agentIds.length }))}</div>
+        </div>
         ${statusLabelHtml}
         ${actionsHtml}
       </div>

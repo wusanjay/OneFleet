@@ -307,7 +307,11 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
         const title = row.querySelector?.('.conv-item-title, .conv-item-title-input');
         // Keep the dot immediately after the visible title, matching the
         // Settings label-dot treatment instead of leading the task text.
-        row.insertBefore?.(dot, title?.nextSibling || null);
+        // Insert within the title's OWN parent — the fleet-form row nests the
+        // title inside .conv-item-main, so anchoring on `row` would throw
+        // NotFoundError (title.nextSibling is not row's child).
+        const anchorParent = title?.parentElement || row;
+        anchorParent.insertBefore?.(dot, title?.nextSibling || null);
       }
     }
   }

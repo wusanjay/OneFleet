@@ -439,9 +439,18 @@ function setView(view, cid, opts = {}) {
                 : view === 'project' ? 'panel-project'
                 : view === 'todos' ? 'panel-todos'
                 : view === 'marketplace' ? 'panel-marketplace'
+                : view === 'workbench' ? 'panel-workbench'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
+  // Fleet-form chrome: rail active states + midbar visibility (IM apps keep
+  // the chat list column only for message surfaces; tool sections take the
+  // full content width).
+  const messagingView = view === 'conversation' || view === 'new-chat';
+  const midbar = document.getElementById('midbar');
+  if (midbar) midbar.hidden = !messagingView;
+  document.getElementById('rail-messages-btn')?.classList.toggle('active', messagingView);
+  document.getElementById('workbench-btn')?.classList.toggle('active', view === 'workbench');
   document.getElementById('new-chat-btn').classList.toggle('active', view === 'new-chat');
   document.getElementById('auto-btn')?.classList.toggle('active', view === 'auto');
   document.getElementById('todos-btn')?.classList.toggle('active', view === 'todos');

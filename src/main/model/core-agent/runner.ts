@@ -1848,7 +1848,7 @@ async function buildRotatingProvider(
         : {}),
       build: async () => {
         if (isExternal) {
-          return withTaskBudget(await buildExternalProvider(choice, usageContext), cid);
+          return withTaskBudget(await buildExternalProvider(choice, usageContext), cid, { provider: candProviderId, model: candModelId });
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
@@ -1867,7 +1867,7 @@ async function buildRotatingProvider(
             buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
           ),
           googleNativeSearch: shouldUseGoogleNativeSearch,
-        }), cid);
+        }), cid, { provider: candProviderId, model: candModelId });
       },
     };
   });
