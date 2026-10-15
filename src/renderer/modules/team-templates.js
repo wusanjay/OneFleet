@@ -105,8 +105,14 @@
     wrap.innerHTML = '';
     if (empty) empty.style.display = '';
     try {
-      const res = await window.orkas.invoke('fleets.list', {});
-      const fleets = (res && res.fleets) || [];
+      const [res, convsRes] = await Promise.all([
+        window.orkas.invoke('fleets.list', {}),
+        window.orkas.invoke('conversations.list', {}).catch(() => ({ conversations: [] })),
+      ]);
+      // Defensive: a fleet whose room conversation was deleted is an orphan —
+      // don't render a card that would navigate nowhere.
+      const liveCids = new Set((convsRes.conversations || []).map((c) => c.conversation_id));
+      const fleets = ((res && res.fleets) || []).filter((f) => f.conversation_id && liveCids.has(f.conversation_id));
       if (!fleets.length) return;
       if (empty) empty.style.display = 'none';
       for (const f of fleets) {
@@ -138,26 +144,18 @@
     list.innerHTML = '';
     if (empty) empty.style.display = '';
     try {
-      const [agentsRes, fleetsRes, convsRes] = await Promise.all([
+      const [agentsRes, fleetsRes] = await Promise.all([
         window.orkas.invoke('agents.list', {}),
         window.orkas.invoke('fleets.list', {}).catch(() => ({ fleets: [] })),
-        window.orkas.invoke('conversations.list', {}),
       ]);
       const agents = (agentsRes.agents || []).filter((a) => a && a.agent_id && a.agent_id !== 'commander');
       const fleets = fleetsRes.fleets || [];
       const fleetByAgent = new Map();
       for (const f of fleets) for (const aid of f.agent_ids || []) fleetByAgent.set(aid, f);
-      // agent_id → 已存在的 DM 会话（列表行 agent_id 与机器人一致即为它的专属对话）
-      const convs = convsRes.conversations || [];
-      const dmByAgent = new Map();
-      for (const c of convs) {
-        if (c.agent_id && !dmByAgent.has(c.agent_id)) dmByAgent.set(c.agent_id, c.conversation_id);
-      }
       const rows = agents.map((a) => {
         const fleet = fleetByAgent.get(a.agent_id);
         const role = a.profile?.role || a.description_zh || '';
-        const dm = dmByAgent.get(a.agent_id);
-        return `<button type="button" class="employee-row" data-agent-id="${_esc(a.agent_id)}" data-dm-cid="${_esc(dm || '')}">
+        return `<button type="button" class="employee-row" data-agent-id="${_esc(a.agent_id)}">
           <span class="employee-avatar">${_esc('🤖')}</span>
           <span class="employee-main">
             <span class="employee-name">${_esc(a.name || a.agent_id)}${fleet ? `<span class="employee-fleet">${_esc(fleet.name)}</span>` : ''}</span>
@@ -172,26 +170,22 @@
         row.addEventListener('click', async () => {
           const agentId = row.dataset.agentId;
           if (!agentId) return;
-          // 已有该机器人的 DM → 直接进。服务端为准（而非渲染时快照），
-          // 防止重复点击时建出多条 DM。
+          // IM 语义：对话列表里每一条都真的说过话。点击不落盘——
+          //  已有该机器人的 DM（createConversation 绑定走 agent_id，
+          //  composer 首聊走单成员 agent_ids）→ 直接进那张桌子；
+          //  还没有 → useAgent 预选 recipient 进 composer，用户发出
+          //  第一句话时 Orkas 才真正建会话。
           try {
             const list2 = await window.orkas.invoke('conversations.list', {});
-            const existing = (list2.conversations || []).find((c) => c.agent_id === agentId);
+            const existing = (list2.conversations || []).find((c) =>
+              c.agent_id === agentId
+              || (Array.isArray(c.agent_ids) && c.agent_ids.length === 1 && c.agent_ids[0] === agentId));
             if (existing && typeof setView === 'function') {
               setView('conversation', existing.conversation_id);
               return;
             }
-          } catch (_) { /* fall through to create */ }
-          const name = row.querySelector('.employee-name')?.childNodes?.[0]?.textContent?.trim() || '';
-          try {
-            const res = await window.orkas.invoke('conversations.create', { agentId, title: name });
-            if (res?.conversation?.conversation_id && typeof setView === 'function') {
-              setView('conversation', res.conversation.conversation_id);
-            }
-          } catch (e) {
-            // 兜底：Orkas 原生路径（composer 指定 recipient）
-            if (typeof useAgent === 'function') useAgent(agentId);
-          }
+          } catch (_) { /* prefill fallback below */ }
+          if (typeof useAgent === 'function') useAgent(agentId);
         });
       });
     } catch (err) {
