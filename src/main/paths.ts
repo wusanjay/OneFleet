@@ -357,6 +357,10 @@ export const agentPrivateSkillsDir = (uid: string, agentId: string) => path.join
 // Cross-device user preferences (language, etc.)
 export const userCloudConfigDir  = (uid: string) => path.join(userCloudRoot(uid), 'config');
 export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir(uid), 'preferences.json');
+// Fleet registry (编队模板导入产物): one JSON file describing each imported
+// fleet — members, conversation binding, template provenance. Cloud-synced
+// like preferences so a fleet survives device moves.
+export const userFleetsFile = (uid: string) => path.join(userCloudConfigDir(uid), 'fleets.json');
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');

@@ -29,6 +29,10 @@
         <span class="rail-label" data-i18n="sidebar.rail_messages">消息</span>
         <span class="rail-badge" id="rail-messages-badge" hidden></span>
       </button>
+      <button class="rail-btn" id="rail-fleets-btn">
+        <span data-ui-icon="layout-grid" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_fleets">编队</span>
+      </button>
       <button class="rail-btn" id="agents-btn">
         <span data-ui-icon="users" data-ui-icon-class="rail-icon"></span>
         <span class="rail-label" data-i18n="sidebar.rail_agents">智能体</span>
@@ -54,6 +58,18 @@
         </div>
         <button class="midbar-add" id="team-template-import-btn" type="button"
                 data-i18n-title="agents.import_template_btn" title="导入编队模板" aria-label="导入编队模板">＋</button>
+      </div>
+      <div class="midbar-fleets" id="midbar-fleets" hidden>
+        <div class="midbar-fleets-actions">
+          <button type="button" class="midbar-fleets-import" id="midbar-import-template-btn" data-i18n="midbar.import_template">导入编队模板</button>
+        </div>
+        <div id="midbar-fleet-cards"></div>
+        <div class="conv-empty" id="midbar-fleets-empty" data-i18n="midbar.fleets_empty">还没有编队 — 导入一份模板，一键建队。</div>
+      </div>
+      <div class="midbar-employees" id="midbar-employees" hidden>
+        <div class="midbar-employees-hint" data-i18n="midbar.employees_hint">全部机器人都在这里 — 点一个，直接跟他说话。</div>
+        <div id="midbar-employee-list"></div>
+        <div class="conv-empty" id="midbar-employees-empty" data-i18n="midbar.employees_empty">还没有机器人 — 从「编队」导入一支，或单独创建。</div>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-conversations-section">

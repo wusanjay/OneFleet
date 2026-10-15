@@ -53,9 +53,12 @@
 
 import YAML from 'yaml';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { userFleetsFile } from '../paths';
 
 import { createLogger } from '../logger';
-import { safeId, genId12 } from '../storage';
+import { safeId, genId12, readJson, writeJson } from '../storage';
+import { nowIso } from '../storage';
 import * as avatars from './avatars';
 import * as agents from './agents';
 import * as auth from './auth';
@@ -304,6 +307,52 @@ async function _ensureModelEntry(model: TeamTemplateModel): Promise<{ entryId: s
 
 // ── Import ───────────────────────────────────────────────────────────────
 
+export interface FleetRecord {
+  fleet_id: string;
+  name: string;
+  template_id: string;
+  agent_ids: string[];
+  conversation_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+async function readFleetRegistry(userId: string): Promise<Record<string, FleetRecord>> {
+  try {
+    const list = await readJson<FleetRecord[]>(userFleetsFile(userId));
+    return (Array.isArray(list) ? list : []).reduce<Record<string, FleetRecord>>((acc, f) => {
+      if (f && f.fleet_id) acc[f.fleet_id] = f;
+      return acc;
+    }, {});
+  } catch {
+    return {};
+  }
+}
+
+async function writeFleetRegistry(userId: string, records: Record<string, FleetRecord>): Promise<void> {
+  fs.mkdirSync(path.dirname(userFleetsFile(userId)), { recursive: true });
+  writeJson(userFleetsFile(userId), Object.values(records));
+}
+
+/** Upsert one fleet record (import creates; re-import of the same template
+ *  id replaces that fleet's record). Best-effort: the import itself must not
+ *  fail because bookkeeping did. */
+async function upsertFleetRecord(userId: string, record: FleetRecord): Promise<void> {
+  try {
+    const records = await readFleetRegistry(userId);
+    records[record.fleet_id] = record;
+    await writeFleetRegistry(userId, records);
+  } catch (err) {
+    log.warn(`fleet registry write failed: ${(err as Error).message}`);
+  }
+}
+
+export async function listFleets(userId: string): Promise<FleetRecord[]> {
+  return Object.values(await readFleetRegistry(userId)).sort((a, b) =>
+    (b.updated_at || '').localeCompare(a.updated_at || ''),
+  );
+}
+
 export interface ImportTeamTemplateResult {
   ok: true;
   conversation_id: string;
@@ -345,30 +394,56 @@ export async function importTeamTemplate(
 
   const created: Array<{ template_id: string; name: string; agent_id: string }> = [];
   try {
+    // Idempotent re-import: an agent with the same display name is UPDATED in
+    // place (profile/skills) instead of failing the whole import — re-running
+    // a template refreshes the team. Name-uniqueness is the match key, which
+    // is also what @mention routing resolves by.
+    const existingByName = new Map<string, { agent_id: string }>();
+    for (const a of await agents.listAgents()) {
+      if (a && a.name) existingByName.set(a.name, a);
+    }
     for (const member of template.members) {
-      const agent = await agents.createCustomAgent({
-        name: member.name,
-        description_zh: member.role || member.name,
-        category: template.team.category,
-        profile: {
-          ...(member.role ? { role: member.role } : {}),
-          ...(member.dispatch ? { dispatch: member.dispatch } : {}),
-        },
-        // Guidance lists go through the TOP-LEVEL options, not profile:
-        // createCustomAgent's normalizeAgentProfile prefers the outer keys
-        // whenever they exist, and it always calls with both keys present —
-        // profile-embedded lists would be shadowed by undefined (observed
-        // 2026-10-14: profile-only import produced agents without guidance).
-        ...(member.notes?.length ? { knowhow: member.notes } : {}),
-        ...(member.instructions?.length ? { standards: member.instructions } : {}),
-        ...(member.icon ? { icon: member.icon } : {}),
-        ...(member.color ? { color: member.color } : {}),
-        ...(member.skills?.length ? { skill_list: member.skills } : {}),
-        interactive: true,
-      });
-      if (!agent) throw new Error(`failed to create agent "${member.name}"`);
-      created.push({ template_id: member.id, name: member.name, agent_id: agent.agent_id });
-      log.info(`template ${template.team.id}: agent ${agent.agent_id} (${member.name}) created`);
+      const guidance = {
+        ...(member.role ? { role: member.role } : {}),
+        ...(member.dispatch ? { dispatch: member.dispatch } : {}),
+      };
+      const existing = existingByName.get(member.name);
+      let agentId: string;
+      if (existing) {
+        await agents.updateCustomAgent(existing.agent_id, {
+          ...(member.role || member.name ? { description_zh: member.role || member.name } : {}),
+          ...(template.team.category ? { category: template.team.category } : {}),
+          profile: guidance,
+          ...(member.notes?.length ? { knowhow: member.notes } : {}),
+          ...(member.instructions?.length ? { standards: member.instructions } : {}),
+          ...(member.icon ? { icon: member.icon } : {}),
+          ...(member.color ? { color: member.color } : {}),
+        });
+        agentId = existing.agent_id;
+        log.info(`template ${template.team.id}: agent ${agentId} (${member.name}) updated`);
+      } else {
+        const agent = await agents.createCustomAgent({
+          name: member.name,
+          description_zh: member.role || member.name,
+          category: template.team.category,
+          profile: guidance,
+          // Guidance lists go through the TOP-LEVEL options, not profile:
+          // createCustomAgent's normalizeAgentProfile prefers the outer keys
+          // whenever they exist, and it always calls with both keys present —
+          // profile-embedded lists would be shadowed by undefined (observed
+          // 2026-10-14: profile-only import produced agents without guidance).
+          ...(member.notes?.length ? { knowhow: member.notes } : {}),
+          ...(member.instructions?.length ? { standards: member.instructions } : {}),
+          ...(member.icon ? { icon: member.icon } : {}),
+          ...(member.color ? { color: member.color } : {}),
+          ...(member.skills?.length ? { skill_list: member.skills } : {}),
+          interactive: true,
+        });
+        if (!agent) throw new Error(`failed to create agent "${member.name}"`);
+        agentId = agent.agent_id;
+      }
+      created.push({ template_id: member.id, name: member.name, agent_id: agentId });
+      log.info(`template ${template.team.id}: agent ${agentId} (${member.name}) ready`);
     }
 
     const conv = await chats.createConversation(userId, {
@@ -378,6 +453,16 @@ export async function importTeamTemplate(
     const text = buildWelcomeText(template);
     const sent = await groupChat.send({ userId, cid: conv.conversation_id, text });
     if (!sent.ok) throw new Error(`welcome task failed: ${sent.error ?? 'unknown error'}`);
+
+    upsertFleetRecord(userId, {
+      fleet_id: template.team.id,
+      name: template.team.name,
+      template_id: template.team.id,
+      agent_ids: created.map((m) => m.agent_id),
+      conversation_id: conv.conversation_id,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
 
     log.info(`template ${template.team.id}: team imported, cid=${conv.conversation_id}, members=${created.length}`);
     return {

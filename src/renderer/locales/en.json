@@ -2572,5 +2572,8 @@
   "workbench.contexts_desc": "The fleet's shared knowledge base",
   "workbench.apps_desc": "Fleet-built mini apps",
   "chat.cost_milestone": "Fleet has used {n} tokens so far",
-  "workbench.projects_desc": "Archive fleets & chats by business line"
+  "workbench.projects_desc": "Archive fleets & chats by business line",
+  "sidebar.rail_fleets": "Fleets",
+  "midbar.import_template": "Import fleet template",
+  "midbar.fleets_empty": "No fleets yet — import a template to build one."
 }

@@ -20325,3 +20325,38 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 }
 .workbench-projects-add:hover { background: var(--hover, rgba(0,0,0,0.05)); }
 .panel-projects-list .projects-list .conv-item { border-radius: 10px; }
+
+/* ─── Fleets mode (midbar fleet cards) ────────────────────────────────── */
+.midbar-fleets { padding: 8px; }
+.midbar-fleets[hidden] { display: none; }
+.midbar-fleets-actions { padding: 2px 0 8px; }
+.midbar-fleets-import {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px dashed var(--accent, #4a7dff);
+  border-radius: 10px;
+  background: var(--accent-soft, rgba(74,125,255,0.06));
+  color: var(--accent, #4a7dff);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.midbar-fleets-import:hover { background: var(--accent-soft, rgba(74,125,255,0.12)); }
+.fleet-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.fleet-card:hover { border-color: var(--accent, #4a7dff); }
+.fleet-card-name { font-size: 14px; font-weight: 700; }
+.fleet-card-meta { font-size: 11px; color: var(--text-muted, #999); }
