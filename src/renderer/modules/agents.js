@@ -3070,8 +3070,9 @@ function closeAgentModal(options = {}) {
 window.closeAgentModal = closeAgentModal;
 
 function cancelAgentModal() {
-  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
-  if (activeTab === 'external')
+  // Cancel closes the modal from BOTH tabs. (An earlier revision gated this
+  // on the external tab without braces, so the create tab's Cancel silently
+  // did nothing — reported 2026-10-15.)
   closeAgentModal({ restoreFocus: true });
 }
 window.cancelAgentModal = cancelAgentModal;
