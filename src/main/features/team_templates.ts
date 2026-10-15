@@ -109,6 +109,11 @@ export interface TeamTemplate {
   members: TeamTemplateMember[];
   welcome_task: { text: string };
   acceptance?: string[];
+  /** Plan-first contract: the fleet's first turn must post an execution
+   *  plan (goal / steps / division of labor) and wait for the user's
+   *  explicit go-ahead before doing any real work. Prompt-level only —
+   *  no engine gating. */
+  plan_required?: boolean;
 }
 
 export interface ParsedTeamTemplate {
@@ -243,6 +248,7 @@ export function parseTeamTemplateYaml(text: string): ParsedTeamTemplate {
   if (!welcomeText) throw new Error('welcome_task.text is required');
 
   const acceptance = _strList(root.acceptance, 'acceptance', warnings);
+  const planRequired = root.plan_required === true;
 
   return {
     template: {
@@ -256,6 +262,7 @@ export function parseTeamTemplateYaml(text: string): ParsedTeamTemplate {
       members,
       welcome_task: { text: welcomeText },
       ...(acceptance && acceptance.length ? { acceptance } : {}),
+      ...(planRequired ? { plan_required: true } : {}),
     },
     warnings,
   };
@@ -273,6 +280,14 @@ export function buildWelcomeText(template: TeamTemplate): string {
   const lines: string[] = [];
   lines.push(`${mentions} 编队已就位。`);
   lines.push('');
+  if (template.plan_required) {
+    // Plan-first contract: the fleet posts its plan as the FIRST reply and
+    // stops — real work starts only after the user explicitly confirms.
+    lines.push('执行方式（必读）：先由指挥官汇总各成员意见，输出一份执行计划');
+    lines.push('（目标 / 步骤 / 分工 / 预计产出），然后停下等我回复"确认"后再开工。');
+    lines.push('确认之前不要执行任何实际任务。');
+    lines.push('');
+  }
   lines.push(template.welcome_task.text.trim());
   if (template.acceptance?.length) {
     lines.push('');

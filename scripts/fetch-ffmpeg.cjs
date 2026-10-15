@@ -417,18 +417,41 @@ function verifySha(buf, expected, label) {
 
 async function downloadCrossFfmpeg(expectedSha) {
   const release = require('ffmpeg-static/package.json')['ffmpeg-static']['binary-release-tag'];
-  const url = `https://github.com/eugeneware/ffmpeg-static/releases/download/${release}/ffmpeg-${platformKey}.gz`;
-  const bin = zlib.gunzipSync(await httpGetBuffer(url));
-  verifySha(bin, expectedSha, `ffmpeg ${platformKey} (${release})`);
-  return bin;
+  const file = `ffmpeg-${platformKey}.gz`;
+  const githubUrl = `https://github.com/eugeneware/ffmpeg-static/releases/download/${release}/${file}`;
+  // Mirror fallback (China-network reality: github release assets are the
+  // single most common timeout in this script). npmmirror fronts the same
+  // release asset; verifySha still pins the exact bytes, so a mirror cannot
+  // substitute different content.
+  const mirrorBase = process.env.FFMPEG_STATIC_MIRROR
+    || 'https://registry.npmmirror.com/-/binary/ffmpeg-static';
+  try {
+    const bin = zlib.gunzipSync(await httpGetBuffer(githubUrl));
+    verifySha(bin, expectedSha, `ffmpeg ${platformKey} (${release})`);
+    return bin;
+  } catch (err) {
+    const mirrorUrl = `${mirrorBase.replace(/\/$/, '')}/${release}/${file}`;
+    console.warn(`[fetch-ffmpeg] github download failed (${err && err.message ? err.message : err}); trying mirror ${mirrorUrl}`);
+    const bin = zlib.gunzipSync(await httpGetBuffer(mirrorUrl));
+    verifySha(bin, expectedSha, `ffmpeg ${platformKey} (${release})`);
+    return bin;
+  }
 }
 
 async function downloadCrossFfprobe(expectedSha) {
   const optionalDeps = require('@ffprobe-installer/ffprobe/package.json').optionalDependencies || {};
   const version = optionalDeps[`@ffprobe-installer/${platformKey}`];
   if (!version) throw new Error(`@ffprobe-installer has no pinned version for ${platformKey}`);
-  const url = `https://registry.npmjs.org/@ffprobe-installer/${platformKey}/-/${platformKey}-${version}.tgz`;
-  const tgz = await httpGetBuffer(url);
+  const tgzUrls = [
+    `https://registry.npmjs.org/@ffprobe-installer/${platformKey}/-/${platformKey}-${version}.tgz`,
+    `https://registry.npmmirror.com/@ffprobe-installer/${platformKey}/-/${platformKey}-${version}.tgz`,
+  ];
+  let tgz = null;
+  let tgzErr = null;
+  for (const url of tgzUrls) {
+    try { tgz = await httpGetBuffer(url); break; } catch (err) { tgzErr = err; }
+  }
+  if (!tgz) throw tgzErr;
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ffprobe-'));
   try {
     const tgzPath = path.join(tmp, 'pkg.tgz');

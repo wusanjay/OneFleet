@@ -101,3 +101,28 @@ describe('team_templates.roundtrip', () => {
     expect(second.welcome_task.text).toBe(first.welcome_task.text);
   });
 });
+
+describe('team_templates.plan_required', () => {
+  it('parses plan_required and renders the plan-first contract', () => {
+    const { template } = parseTeamTemplateYaml(
+      MINIMAL.replace('welcome_task:', 'plan_required: true\nwelcome_task:'),
+    );
+    expect(template.plan_required).toBe(true);
+    const text = buildWelcomeText(template);
+    expect(text).toContain('先由指挥官汇总各成员意见，输出一份执行计划');
+    expect(text).toContain('等我回复"确认"后再开工');
+  });
+
+  it('omits the plan-first contract when plan_required is absent', () => {
+    const text = buildWelcomeText(parseTeamTemplateYaml(MINIMAL).template);
+    expect(text).not.toContain('执行方式');
+  });
+
+  it('accepts false explicitly', () => {
+    const { template } = parseTeamTemplateYaml(
+      MINIMAL.replace('team:', 'plan_required: false\nteam:'),
+    );
+    expect(template.plan_required).toBeUndefined();
+    expect(buildWelcomeText(template)).not.toContain('执行方式');
+  });
+});
