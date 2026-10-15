@@ -6229,7 +6229,12 @@ function _renderConversationSidebarItem(c, opts = {}) {
     .map((id) => (Array.isArray(_agentsCache) ? _agentsCache.find((x) => x && x.agent_id === id) : undefined))
     .filter(Boolean);
   let avatarHtml = '';
-  if (agentIds.length >= 2) {
+  if (agentIds.length >= 2 && fleetAgents.length === 0) {
+    // Dangling roster reference (agents deleted after the conversation was
+    // created): fall back to one generic seeded avatar instead of an empty
+    // stack, so the row never renders headless.
+    avatarHtml = renderAvatarHtml(undefined, undefined, { size: 34, seed: agentIds[0] }).replace('avatar-circle', 'conv-item-avatar avatar-circle');
+  } else if (agentIds.length >= 2) {
     avatarHtml = `<span class="conv-item-avatar conv-item-avatar-stack">${fleetAgents.slice(0, 2).map((a) => renderAvatarHtml(a.icon, a.color, { size: 20, seed: a.agent_id })).join('')}</span>`;
   } else if (agentIds.length === 1) {
     const a0 = fleetAgents[0];
@@ -6268,7 +6273,7 @@ function _renderConversationSidebarItem(c, opts = {}) {
             ${titleNode}
             ${kindChip}
           </div>
-          <div class="conv-item-sub">${escapeHtml(t('midbar.sub_agents', { n: agentIds.length }))}</div>
+          <div class="conv-item-sub">${escapeHtml(t('midbar.sub_agents', { n: agentIds.length >= 2 ? fleetAgents.length || agentIds.length : agentIds.length }))}</div>
         </div>
         ${statusLabelHtml}
         ${actionsHtml}
