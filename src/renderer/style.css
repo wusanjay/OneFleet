@@ -20217,3 +20217,92 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 .workbench-card-icon { width: 22px; height: 22px; color: var(--accent, #4a7dff); }
 .workbench-card-title { font-size: 15px; font-weight: 700; }
 .workbench-card-desc { font-size: 12px; color: var(--text-muted, #999); }
+
+/* ─── P2 status lights: avatar as presence lamp ──────────────────────────
+   Grok Bot pattern: the avatar itself carries the agent lifecycle. Three
+   rendered states for now (idle / working / failed-label); the ring draws
+   attention without words. */
+.conv-item.is-live .conv-item-avatar .avatar-circle {
+  box-shadow: 0 0 0 2px #2eaa64;
+  animation: fleet-status-pulse 1.6s ease-in-out infinite;
+}
+.conv-item.is-live .conv-item-avatar.avatar-circle {
+  box-shadow: 0 0 0 2px #2eaa64;
+  animation: fleet-status-pulse 1.6s ease-in-out infinite;
+}
+@keyframes fleet-status-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px #2eaa64, 0 0 0 6px rgba(46,170,100,0.18); }
+  50%      { box-shadow: 0 0 0 2px #2eaa64, 0 0 0 9px rgba(46,170,100,0.05); }
+}
+.group-roster-row.is-running .group-roster-avatar .avatar-circle,
+.group-roster-row.is-running .group-roster-avatar.avatar-circle {
+  box-shadow: 0 0 0 2px #2eaa64;
+  animation: fleet-status-pulse 1.6s ease-in-out infinite;
+}
+
+/* ─── P2 deliverable card: produced files as distinct artifact cards ────
+   Fleet deliverables are the product's proof of work — upgrade the inline
+   row chip into a bordered card with a corner tag so a scrolling reader
+   spots "this thread produced a file" instantly. */
+.chat-message .chat-msg-produced-media {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-message .chat-msg-produced-item {
+  position: relative;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(74,125,255,0.04), rgba(74,125,255,0.01));
+  padding: 10px 8px;
+  min-height: 46px;
+}
+.chat-message .chat-msg-produced-item::before {
+  content: "交付物";
+  position: absolute;
+  top: -8px;
+  right: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent, #4a7dff);
+  background: var(--surface, #fff);
+  border: 1px solid rgba(74,125,255,0.35);
+  border-radius: 4px;
+  padding: 0 5px;
+  line-height: 1.5;
+}
+.chat-message .chat-msg-produced-item .chat-msg-produced-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: rgba(74,125,255,0.10);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.chat-message .chat-msg-produced-item .chat-msg-produced-label {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── P2 cost milestone card (usage ledger → timeline) ────────────────── */
+.chat-cost-card {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 10px auto;
+  max-width: 70%;
+  padding: 7px 14px;
+  border: 1px dashed rgba(255, 200, 80, 0.7);
+  border-radius: 999px;
+  background: rgba(255, 200, 80, 0.08);
+  font-size: 12px;
+  color: #8a6d1a;
+}
+.chat-cost-card-icon { font-size: 14px; }

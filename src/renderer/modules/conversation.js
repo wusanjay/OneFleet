@@ -2871,6 +2871,40 @@ function _groupRosterRowHtml(actor, ag) {
   </button>`;
 }
 
+// ─── Cost milestone cards (usage ledger → message timeline) ────────────────
+// Interleaves a small card at each 100k cumulative-token crossing so the
+// stream itself tells the cost story. Idempotent: cards carry data-ms, and
+// injections re-run safely after history reloads.
+let _costMilestoneSeq = 0;
+function _injectCostMilestoneCards(cid) {
+  if (!cid || cid !== currentCid) return;
+  const container = document.getElementById('chat-history');
+  if (!container || !container.querySelector('.chat-message')) return;
+  void window.orkas.invoke('usage.forConversation', { cid }).then((u) => {
+    if (!u || u.ok !== true || !Array.isArray(u.milestones) || !u.milestones.length) return;
+    if (currentCid !== cid) return;
+    for (const ms of u.milestones) {
+      const marker = `data-ms="${ms.total_tokens}"`;
+      if (container.querySelector(`.chat-cost-card[${marker}]`)) continue;
+      const card = document.createElement('div');
+      card.className = 'chat-cost-card';
+      card.setAttribute('data-ms', String(ms.total_tokens));
+      const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n));
+      card.innerHTML = `<span class="chat-cost-card-icon">💰</span>`
+        + `<span>${escapeHtml(t('chat.cost_milestone', { n: fmt(ms.total_tokens) }))}</span>`;
+      // Insert before the first message rendered AFTER this crossing so the
+      // card lands at the moment the budget was actually reached. dataset.ts
+      // is epoch-ms while the ledger ts is ISO — compare numerically.
+      const msTsNum = Date.parse(ms.ts) || 0;
+      const msgs = [...container.querySelectorAll('.chat-message')];
+      const anchorMsg = msgs.find((m) => Number(m.dataset.ts || 0) >= msTsNum);
+      if (anchorMsg && anchorMsg.parentNode) anchorMsg.parentNode.insertBefore(card, anchorMsg);
+      else container.appendChild(card);
+      _costMilestoneSeq += 1;
+    }
+  }).catch(() => { /* ledger miss — no cards */ });
+}
+
 function _renderGroupRoster() {
   const cid = currentCid;
   if (!cid) return;
@@ -2909,6 +2943,12 @@ function _renderGroupRoster() {
     });
   });
 }
+
+// These roster/milestone helpers live inside _refreshChatHeader's scope
+// (historical insertion point). The P2 milestone hooks run from TOP-LEVEL
+// functions elsewhere in this file, so expose the injector on the global
+// object — bare-identifier lookups in those scopes resolve through it.
+window._injectCostMilestoneCards = _injectCostMilestoneCards;
 
 function _insertRosterMention(mention) {
   const input = document.getElementById('chat-input');
@@ -4010,6 +4050,7 @@ async function _refreshGroupMembers(cid) {
       // reply, and the button must hide as soon as that happens.
       if (cid === currentCid) {
         try { _ensureConvCreateAgentInline(); } catch (_) { /* non-fatal */ }
+  if (typeof _injectCostMilestoneCards === 'function') { try { _injectCostMilestoneCards(currentCid || cid); } catch (_) {} }
       }
       return data.actors;
     }
@@ -6769,6 +6810,7 @@ function renderConversationList() {
 // spacer is present then) so it doesn't tempt the user to sediment a
 // half-finished reply.
 function _ensureConvCreateAgentInline() {
+  if (typeof _injectCostMilestoneCards === 'function') { try { _injectCostMilestoneCards(currentCid || cid); } catch (_) {} }
   const container = document.getElementById('chat-history');
   if (!container) return;
   let el = document.getElementById('conv-create-agent-inline');
@@ -7369,6 +7411,7 @@ function _ensureCreateAgentInlineObserver() {
   _createAgentInlineObserver = new MutationObserver(_ensureConvCreateAgentInline);
   _createAgentInlineObserver.observe(target, { childList: true });
   _ensureConvCreateAgentInline();
+  if (typeof _injectCostMilestoneCards === 'function') { try { _injectCostMilestoneCards(currentCid || cid); } catch (_) {} }
 }
 
 /**
@@ -7881,6 +7924,7 @@ async function loadConversationHistory(cid, opts = {}) {
     // scrollHeight when we jump to the bottom — otherwise the MutationObserver
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
+  if (typeof _injectCostMilestoneCards === 'function') { try { _injectCostMilestoneCards(currentCid || cid); } catch (_) {} }
     if (cid !== currentCid) return;
     if (preserveScroll) _restoreHistoryReloadScroll(container, scrollSnapshot);
     else if (!searchTargetRevealed) _scrollToBottomNoAnim(container);
@@ -16760,6 +16804,7 @@ function _updateConvSendUI(cid) {
   }
   const pending = isConvPending(cid);
   _ensureConvCreateAgentInline();
+  if (typeof _injectCostMilestoneCards === 'function') { try { _injectCostMilestoneCards(currentCid || cid); } catch (_) {} }
   // While `.aborting` is set, pin the button as send-style + disabled. The
   // class self-clears once the stream truly terminates (pending flips false).
   if (sendBtn.classList.contains('aborting')) {
@@ -16952,6 +16997,9 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
     return;
   }
   items.forEach((item) => {
+    // Fleet-form status light: the row avatar doubles as the presence lamp
+    // (green pulse while any actor is running; rests back to idle).
+    item.classList.toggle('is-live', !!pending);
     const existing = item.querySelector('.conv-status-badge');
     // Preserve an unchanged running indicator and its breathing animation.
     if (existing?.classList.contains('is-streaming')) return;

@@ -2570,5 +2570,6 @@
   "workbench.skills_desc": "Teach your bots new tricks",
   "workbench.connectors_desc": "Connect external apps & data",
   "workbench.contexts_desc": "The fleet's shared knowledge base",
-  "workbench.apps_desc": "Fleet-built mini apps"
+  "workbench.apps_desc": "Fleet-built mini apps",
+  "chat.cost_milestone": "Fleet has used {n} tokens so far"
 }

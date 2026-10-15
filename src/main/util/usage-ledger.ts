@@ -40,6 +40,11 @@ export interface ModelUsage {
   output_tokens: number;
 }
 
+export interface UsageMilestone {
+  ts: string;
+  total_tokens: number;
+}
+
 export interface ConversationUsageSummary {
   ok: true;
   cid: string;
@@ -47,6 +52,9 @@ export interface ConversationUsageSummary {
   input_tokens: number;
   output_tokens: number;
   by_model: ModelUsage[];
+  /** Cumulative-token crossings (every MILESTONE_STEP tokens) so the chat UI
+   *  can interleave cost milestone cards into the message timeline. */
+  milestones: UsageMilestone[];
   first_ts: string | null;
   last_ts: string | null;
 }
@@ -102,6 +110,7 @@ export async function conversationUsageSummary(cid: string): Promise<Conversatio
     input_tokens: 0,
     output_tokens: 0,
     by_model: [],
+    milestones: [],
     first_ts: null,
     last_ts: null,
   };
@@ -137,6 +146,20 @@ export async function conversationUsageSummary(cid: string): Promise<Conversatio
     bucket.output_tokens += l.output_tokens || 0;
     byModel.set(key, bucket);
   }
+  // Milestones: every MILESTONE_STEP cumulative (in+out) tokens emits one
+  // crossing point, timestamped at the request that crossed it.
+  const MILESTONE_STEP = 100_000;
+  const milestones: UsageMilestone[] = [];
+  const sorted = [...lines].sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+  let cumulative = 0;
+  let nextAt = MILESTONE_STEP;
+  for (const l of sorted) {
+    cumulative += (l.input_tokens || 0) + (l.output_tokens || 0);
+    while (cumulative >= nextAt) {
+      milestones.push({ ts: l.ts, total_tokens: nextAt });
+      nextAt += MILESTONE_STEP;
+    }
+  }
   return {
     ok: true,
     cid,
@@ -144,6 +167,7 @@ export async function conversationUsageSummary(cid: string): Promise<Conversatio
     input_tokens: inSum,
     output_tokens: outSum,
     by_model: [...byModel.values()].sort((a, b) => b.output_tokens - a.output_tokens),
+    milestones,
     first_ts: first,
     last_ts: last,
   };

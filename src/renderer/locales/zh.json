@@ -2570,5 +2570,6 @@
   "workbench.skills_desc": "给机器人装上新本领",
   "workbench.connectors_desc": "接入外部应用与数据",
   "workbench.contexts_desc": "编队共享的知识底座",
-  "workbench.apps_desc": "编队产出的小工具"
+  "workbench.apps_desc": "编队产出的小工具",
+  "chat.cost_milestone": "本编队累计已消耗 {n} tokens"
 }
