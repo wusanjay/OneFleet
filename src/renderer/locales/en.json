@@ -2575,5 +2575,7 @@
   "workbench.projects_desc": "Archive fleets & chats by business line",
   "sidebar.rail_fleets": "Fleets",
   "midbar.import_template": "Import fleet template",
-  "midbar.fleets_empty": "No fleets yet — import a template to build one."
+  "midbar.fleets_empty": "No fleets yet — import a template to build one.",
+  "midbar.employees_hint": "All your bots in one place — click one to start talking.",
+  "midbar.employees_empty": "No bots yet — import a fleet or create one."
 }

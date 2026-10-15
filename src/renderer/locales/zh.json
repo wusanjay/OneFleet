@@ -2575,5 +2575,7 @@
   "workbench.projects_desc": "按业务线归档编队与会话",
   "sidebar.rail_fleets": "编队",
   "midbar.import_template": "导入编队模板",
-  "midbar.fleets_empty": "还没有编队 — 导入一份模板，一键建队。"
+  "midbar.fleets_empty": "还没有编队 — 导入一份模板，一键建队。",
+  "midbar.employees_hint": "全部机器人都在这里 — 点一个，直接跟他说话。",
+  "midbar.employees_empty": "还没有机器人 — 从「编队」导入一支，或单独创建。"
 }

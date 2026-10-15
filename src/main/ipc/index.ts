@@ -1136,7 +1136,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return conversationOutputs.listConversationOutputs(ctx.userId, cid);
   },
 
-  'conversations.create': async ({ title = '', projectId = '', assistance } = {}, ctx) => {
+  'conversations.create': async ({ title = '', projectId = '', agentId = '', assistance } = {}, ctx) => {
     const normalizedAssistance = chats.normalizeConversationAssistance(assistance);
     const validatedAssistance = assistance === undefined ? undefined
       : normalizedAssistance?.kind === 'app_creation' ? normalizedAssistance
@@ -1154,6 +1154,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const conv = await chats.createConversation(ctx.userId, {
       kind: 'normal',
       title,
+      ...(agentId && safeId(agentId) ? { agentId } : {}),
       ...(validProjectId ? { projectId: validProjectId } : {}),
       ...(validatedAssistance ? { assistance: validatedAssistance } : {}),
     });

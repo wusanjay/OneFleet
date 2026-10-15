@@ -133,34 +133,65 @@
    *  click = useAgent (walk to that employee's desk and talk). */
   async function _renderEmployeeList() {
     const list = document.getElementById('midbar-employee-list');
+    const empty = document.getElementById('midbar-employees-empty');
     if (!list) return;
-    list.innerHTML = '<div class="conv-empty">…</div>';
+    list.innerHTML = '';
+    if (empty) empty.style.display = '';
     try {
-      const [agentsRes, fleetsRes] = await Promise.all([
+      const [agentsRes, fleetsRes, convsRes] = await Promise.all([
         window.orkas.invoke('agents.list', {}),
         window.orkas.invoke('fleets.list', {}).catch(() => ({ fleets: [] })),
+        window.orkas.invoke('conversations.list', {}),
       ]);
       const agents = (agentsRes.agents || []).filter((a) => a && a.agent_id && a.agent_id !== 'commander');
       const fleets = fleetsRes.fleets || [];
       const fleetByAgent = new Map();
       for (const f of fleets) for (const aid of f.agent_ids || []) fleetByAgent.set(aid, f);
+      // agent_id → 已存在的 DM 会话（列表行 agent_id 与机器人一致即为它的专属对话）
+      const convs = convsRes.conversations || [];
+      const dmByAgent = new Map();
+      for (const c of convs) {
+        if (c.agent_id && !dmByAgent.has(c.agent_id)) dmByAgent.set(c.agent_id, c.conversation_id);
+      }
       const rows = agents.map((a) => {
         const fleet = fleetByAgent.get(a.agent_id);
-        return `<button type="button" class="conv-item has-avatar employee-row" data-agent-id="${_esc(a.agent_id)}">
-          <span class="conv-item-avatar avatar-circle" style="--avatar-bg:var(--accent-soft,rgba(74,125,255,0.12));--avatar-fg:var(--accent,#4a7dff);width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center">🤖</span>
-          <span class="conv-item-main">
-            <span class="conv-item-title-row"><span class="conv-item-title">${_esc(a.name || a.agent_id)}</span></span>
-            <span class="conv-item-sub">${_esc(a.profile?.role || a.description_zh || fleet?.name || (a.category || ''))}</span>
+        const role = a.profile?.role || a.description_zh || '';
+        const dm = dmByAgent.get(a.agent_id);
+        return `<button type="button" class="employee-row" data-agent-id="${_esc(a.agent_id)}" data-dm-cid="${_esc(dm || '')}">
+          <span class="employee-avatar">${_esc('🤖')}</span>
+          <span class="employee-main">
+            <span class="employee-name">${_esc(a.name || a.agent_id)}${fleet ? `<span class="employee-fleet">${_esc(fleet.name)}</span>` : ''}</span>
+            <span class="employee-role">${_esc(role)}</span>
           </span>
-          <span class="employee-row-go">›</span>
+          <span class="employee-go">›</span>
         </button>`;
       });
-      list.innerHTML = rows.join('') || '';
-      const empty = document.getElementById('midbar-employees-empty');
+      list.innerHTML = rows.join('');
       if (empty) empty.style.display = rows.length ? 'none' : '';
       list.querySelectorAll('.employee-row').forEach((row) => {
-        row.addEventListener('click', () => {
-          if (typeof useAgent === 'function') useAgent(row.dataset.agentId);
+        row.addEventListener('click', async () => {
+          const agentId = row.dataset.agentId;
+          if (!agentId) return;
+          // 已有该机器人的 DM → 直接进。服务端为准（而非渲染时快照），
+          // 防止重复点击时建出多条 DM。
+          try {
+            const list2 = await window.orkas.invoke('conversations.list', {});
+            const existing = (list2.conversations || []).find((c) => c.agent_id === agentId);
+            if (existing && typeof setView === 'function') {
+              setView('conversation', existing.conversation_id);
+              return;
+            }
+          } catch (_) { /* fall through to create */ }
+          const name = row.querySelector('.employee-name')?.childNodes?.[0]?.textContent?.trim() || '';
+          try {
+            const res = await window.orkas.invoke('conversations.create', { agentId, title: name });
+            if (res?.conversation?.conversation_id && typeof setView === 'function') {
+              setView('conversation', res.conversation.conversation_id);
+            }
+          } catch (e) {
+            // 兜底：Orkas 原生路径（composer 指定 recipient）
+            if (typeof useAgent === 'function') useAgent(agentId);
+          }
         });
       });
     } catch (err) {
