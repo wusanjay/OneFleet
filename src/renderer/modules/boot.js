@@ -449,6 +449,12 @@ function setView(view, cid, opts = {}) {
   const messagingView = view === 'conversation' || view === 'new-chat';
   const midbar = document.getElementById('midbar');
   if (midbar) midbar.hidden = !messagingView;
+  // 远程/编队是中栏模式而非 view：任何 setView 都退出远程模式（恢复默认
+  // 头部、收起远程容器、摘掉 rail 高亮），否则消息列表会残留远程配置。
+  if (midbar) midbar.classList.remove('mode-remote');
+  document.getElementById('midbar-remote')?.setAttribute('hidden', '');
+  document.getElementById('rail-remote-btn')?.classList.remove('active');
+  document.getElementById('rail-fleets-btn')?.classList.remove('active');
   document.getElementById('rail-messages-btn')?.classList.toggle('active', messagingView);
   document.getElementById('workbench-btn')?.classList.toggle('active', view === 'workbench');
   document.getElementById('new-chat-btn').classList.toggle('active', view === 'new-chat');

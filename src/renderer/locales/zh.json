@@ -2587,5 +2587,17 @@
   "remote.bind_label": "值班机器人",
   "remote.bind_placeholder": "选择一个机器人…",
   "remote.disconnect": "断开连接",
-  "remote.more_channels": "更多渠道（飞书 / Telegram）接入开发中。"
+  "remote.more_channels": "更多渠道（飞书 / Telegram）接入开发中。",
+  "sidebar.rail_remote_title": "微信远程接入",
+  "remote.head_title": "微信远程",
+  "remote.head_desc": "在微信里直接指挥你的机器人",
+  "remote.step1": "扫码绑定微信",
+  "remote.step2": "选一个值班机器人",
+  "remote.step3": "在微信里发消息遥控",
+  "remote.state_scanning": "等待扫码…",
+  "remote.state_scanned": "已扫码 — 请在手机上确认",
+  "remote.state_expired": "二维码已过期，请刷新",
+  "remote.state_stalled": "已断开",
+  "remote.qr_refresh": "刷新二维码",
+  "remote.hint_phone": "绑定后，在微信里给机器人发消息即可遥控。"
 }

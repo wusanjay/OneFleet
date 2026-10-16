@@ -20411,3 +20411,190 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   overflow: hidden;
 }
 .employee-go { color: var(--text-muted, #bbb); font-size: 16px; flex-shrink: 0; }
+
+/* ─── Remote channels (微信远程接入) ─────────────────────────────────────
+   The rail hosts the WeChat brand mark (C 端心智：一眼知道这里是配微信).
+   Brand icons keep their official colors — .rail-icon's single-color rules
+   must not flatten them. */
+.rail-btn .rail-icon-brand {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+}
+.rail-btn.active .rail-icon-brand { transform: scale(1.08); }
+
+/* Remote mode owns the midbar: the default 消息 header (title + filters +
+   import) is noise here, so mode-remote hides it and #midbar-remote renders
+   its own head. */
+.midbar.mode-remote .midbar-header { display: none; }
+.midbar-remote {
+  padding: 10px 10px 12px;
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.midbar-remote[hidden] { display: none; }
+
+.remote-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 2px 2px 0;
+}
+.remote-head-icon { width: 30px; height: 30px; flex-shrink: 0; }
+.remote-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.remote-head-title { font-size: 14px; font-weight: 700; }
+.remote-head-desc {
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.remote-state-pill {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted, #888);
+  border: 1px solid var(--border, #ddd);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.remote-state-pill.is-on {
+  color: #0d7a3f;
+  border-color: rgba(7, 193, 96, 0.55);
+  background: rgba(7, 193, 96, 0.08);
+}
+
+.remote-steps {
+  margin: 0;
+  padding: 8px 10px;
+  list-style: none;
+  counter-reset: remote-step;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border, #eee);
+  border-radius: 10px;
+  background: var(--accent-soft, rgba(74,125,255,0.04));
+}
+.remote-steps li {
+  counter-increment: remote-step;
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.remote-steps li::before {
+  content: counter(remote-step);
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  background: var(--accent, #4a7dff);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.remote-channel-card {
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.remote-connect-btn {
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 10px;
+  background: #07C160;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.remote-connect-btn:hover { background: #06ad56; }
+.remote-error {
+  font-size: 11px;
+  color: #c62828;
+  background: rgba(198, 40, 40, 0.06);
+  border: 1px solid rgba(198, 40, 40, 0.25);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.remote-qr-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+/* The main process renders a 320px data URL; the midbar is 300px wide —
+   constrain instead of overflowing. */
+.remote-qr-img {
+  width: 190px;
+  height: 190px;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 10px;
+  background: #fff;
+}
+.remote-qr-status { font-size: 12px; font-weight: 600; }
+.remote-qr-hint { font-size: 11px; color: var(--text-muted, #999); }
+.remote-qr-refresh {
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  background: none;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text, inherit);
+}
+.remote-qr-refresh:hover { background: var(--hover, rgba(0,0,0,0.05)); }
+
+.remote-bound { display: flex; flex-direction: column; gap: 8px; }
+.remote-bind-label { font-size: 12px; font-weight: 600; }
+.remote-bind-select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 9px;
+  background: var(--surface, #fff);
+  font: inherit;
+  font-size: 13px;
+  color: inherit;
+}
+.remote-bound-hint { font-size: 11px; color: var(--text-muted, #999); line-height: 1.5; }
+.remote-disconnect-btn {
+  align-self: flex-start;
+  border: 1px solid rgba(198, 40, 40, 0.4);
+  color: #c62828;
+  border-radius: 8px;
+  background: none;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.remote-disconnect-btn:hover { background: rgba(198, 40, 40, 0.06); }
+
+.remote-future {
+  font-size: 11px;
+  color: var(--text-muted, #aaa);
+  text-align: center;
+  padding: 4px 0 0;
+  border-top: 1px dashed var(--border, #eee);
+  padding-top: 10px;
+}
+
+/* `hidden` 属性的 UA display:none 会被作者级 display:flex 覆盖 — 远程面板
+   三个可切换区块都是 flex 容器，必须显式声明，否则已连接时二维码照常显示。 */
+.remote-channel-body[hidden],
+.remote-qr-flow[hidden],
+.remote-bound[hidden],
+.remote-error[hidden] { display: none; }

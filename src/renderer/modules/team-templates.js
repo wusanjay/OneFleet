@@ -79,6 +79,8 @@
     const fleets = document.getElementById('midbar-fleets');
     const remote = document.getElementById('midbar-remote');
     const convNav = document.querySelector('.sidebar-conversation-nav');
+    const midbar = document.getElementById('midbar');
+    if (midbar) midbar.classList.toggle('mode-remote', filter === 'remote');
     if (fleets) fleets.hidden = filter !== 'fleets';
     if (remote) remote.hidden = filter !== 'remote';
     if (filter === 'remote') {
@@ -263,10 +265,16 @@
     });
     document.getElementById('midbar-import-template-btn')
       ?.addEventListener('click', () => _fileInput()?.click());
-    // Rail 远程 — remote channels mode (WeChat first).
+    // Rail 远程 — remote channels mode (WeChat first). From non-messaging
+    // views setView() has hidden the midbar; reveal it and own the rail
+    // highlight until the next setView clears it.
     document.getElementById('rail-remote-btn')?.addEventListener('click', () => {
       if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
+      const midbar = document.getElementById('midbar');
+      if (midbar) midbar.hidden = false;
       document.getElementById('conv-filter')?.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
+      document.getElementById('rail-remote-btn')?.classList.add('active');
+      document.getElementById('rail-messages-btn')?.classList.remove('active');
       _applyMidbarMode('remote');
     });
     _bindRemotePanel();
@@ -280,20 +288,41 @@
 
   let _remotePollTimer = null;
 
+  function _remoteEls() {
+    return {
+      stateEl: document.getElementById('remote-weixin-state'),
+      bodyEl: document.getElementById('remote-weixin-body'),
+      qrEl: document.getElementById('remote-weixin-qr'),
+      qrStatusEl: document.getElementById('remote-weixin-qr-status'),
+      errorEl: document.getElementById('remote-weixin-error'),
+      boundEl: document.getElementById('remote-weixin-bound'),
+    };
+  }
+
+  function _setRemoteError(message) {
+    const { errorEl } = _remoteEls();
+    if (!errorEl) return;
+    errorEl.textContent = message || '';
+    errorEl.hidden = !message;
+  }
+
   async function _renderRemotePanel() {
     let st;
     try { st = await window.orkas.invoke('channels.status', {}); } catch (_) { return; }
-    const stateEl = document.getElementById('remote-weixin-state');
-    const bodyEl = document.getElementById('remote-weixin-body');
-    const qrEl = document.getElementById('remote-weixin-qr');
-    const boundEl = document.getElementById('remote-weixin-bound');
+    const { stateEl, bodyEl, qrEl, boundEl } = _remoteEls();
     if (!stateEl || !bodyEl) return;
     const connected = !!(st && st.connected);
     stateEl.textContent = connected ? (i18nText('remote.state_on') || '已连接') : (i18nText('remote.state_off') || '未连接');
     stateEl.classList.toggle('is-on', connected);
+    // 已连接但轮询循环没在跑（如凭据失效后自愈失败）也如实展示。
+    if (connected && st.looping === false) {
+      stateEl.textContent = i18nText('remote.state_stalled') || '已断开';
+      stateEl.classList.toggle('is-on', false);
+    }
     bodyEl.hidden = connected;
     qrEl.hidden = true;
     boundEl.hidden = !connected;
+    _setRemoteError('');
     if (connected) {
       await _fillRemoteAgentSelect(st.account && st.account.agentId);
     }
@@ -318,17 +347,26 @@
     sel.value = selectedId || '';
   }
 
+  async function _beginRemoteLogin() {
+    const qrEl = document.getElementById('remote-weixin-qr');
+    const imgEl = document.getElementById('remote-weixin-qr-img');
+    const { bodyEl, qrStatusEl } = _remoteEls();
+    try {
+      const session = await window.orkas.invoke('channels.beginLogin', {});
+      if (imgEl && session.qrDataUrl) imgEl.src = session.qrDataUrl;
+      if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_scanning') || '等待扫码…';
+      if (qrEl) qrEl.hidden = false;
+      if (bodyEl) bodyEl.hidden = true;
+      _setRemoteError('');
+      _pollRemoteLogin(session.intervalMs || 3000, session.expiresAt || Date.now() + 120000);
+    } catch (err) {
+      _setRemoteError(`⚠️ ${err && err.message ? err.message : '登录会话发起失败'}`);
+    }
+  }
+
   function _bindRemotePanel() {
-    document.getElementById('remote-weixin-connect')?.addEventListener('click', async () => {
-      const qrEl = document.getElementById('remote-weixin-qr');
-      const imgEl = document.getElementById('remote-weixin-qr-img');
-      try {
-        const session = await window.orkas.invoke('channels.beginLogin', {});
-        if (imgEl && session.qrDataUrl) imgEl.src = session.qrDataUrl;
-        if (qrEl) qrEl.hidden = false;
-        _pollRemoteLogin(session.intervalMs || 3000, session.expiresAt || Date.now() + 120000);
-      } catch (_) { /* keep panel state */ }
-    });
+    document.getElementById('remote-weixin-connect')?.addEventListener('click', () => { void _beginRemoteLogin(); });
+    document.getElementById('remote-weixin-qr-refresh')?.addEventListener('click', () => { void _beginRemoteLogin(); });
     document.getElementById('remote-weixin-disconnect')?.addEventListener('click', async () => {
       try { await window.orkas.invoke('channels.disconnect', {}); } catch (_) {}
       void _renderRemotePanel();
@@ -336,23 +374,38 @@
     document.getElementById('remote-weixin-agent')?.addEventListener('change', async (e) => {
       const agentId = e.target && e.target.value;
       if (!agentId) return;
-      try { await window.orkas.invoke('channels.bindAgent', { agent_id: agentId }); } catch (_) {}
+      try {
+        await window.orkas.invoke('channels.bindAgent', { agent_id: agentId });
+        _setRemoteError('');
+      } catch (err) {
+        _setRemoteError(`⚠️ ${err && err.message ? err.message : '绑定失败'}`);
+      }
     });
   }
 
   function _pollRemoteLogin(intervalMs, expiresAt) {
     if (_remotePollTimer) clearInterval(_remotePollTimer);
     _remotePollTimer = setInterval(async () => {
-      if (Date.now() > expiresAt) { clearInterval(_remotePollTimer); _remotePollTimer = null; return; }
+      if (Date.now() > expiresAt) {
+        clearInterval(_remotePollTimer); _remotePollTimer = null;
+        const { qrStatusEl } = _remoteEls();
+        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_expired') || '二维码已过期，请刷新';
+        return;
+      }
       let res;
       try { res = await window.orkas.invoke('channels.pollLogin', {}); } catch (_) { return; }
+      const { qrStatusEl } = _remoteEls();
       if (res && res.status === 'success') {
         clearInterval(_remotePollTimer); _remotePollTimer = null;
         void _renderRemotePanel();
+      } else if (res && res.status === 'scanned') {
+        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_scanned') || '已扫码 — 请在手机上确认';
       } else if (res && res.status === 'expired') {
         clearInterval(_remotePollTimer); _remotePollTimer = null;
-        const qrEl = document.getElementById('remote-weixin-qr');
-        if (qrEl) qrEl.hidden = true;
+        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_expired') || '二维码已过期，请刷新';
+      } else if (res && res.status === 'error') {
+        clearInterval(_remotePollTimer); _remotePollTimer = null;
+        if (qrStatusEl) qrStatusEl.textContent = (res && res.message) || '登录失败，请重试';
       }
     }, intervalMs);
   }

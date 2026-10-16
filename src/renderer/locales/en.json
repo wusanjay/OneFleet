@@ -2587,5 +2587,17 @@
   "remote.bind_label": "On-duty bot",
   "remote.bind_placeholder": "Pick a bot…",
   "remote.disconnect": "Disconnect",
-  "remote.more_channels": "More channels (Feishu / Telegram) coming soon."
+  "remote.more_channels": "More channels (Feishu / Telegram) coming soon.",
+  "sidebar.rail_remote_title": "Control bots from WeChat",
+  "remote.head_title": "WeChat Remote",
+  "remote.head_desc": "Command your bots right from WeChat",
+  "remote.step1": "Scan to link WeChat",
+  "remote.step2": "Pick an on-duty bot",
+  "remote.step3": "Message the bot in WeChat",
+  "remote.state_scanning": "Waiting for scan…",
+  "remote.state_scanned": "Scanned — confirm on your phone",
+  "remote.state_expired": "QR expired, refresh it",
+  "remote.state_stalled": "Disconnected",
+  "remote.qr_refresh": "Refresh QR",
+  "remote.hint_phone": "Once linked, message the bot in WeChat to steer it."
 }
