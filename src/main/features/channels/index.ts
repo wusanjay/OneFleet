@@ -15,7 +15,7 @@ import * as chats from '../chats';
 import * as groupChat from '../group_chat';
 import * as agents from '../agents';
 import { weixinAdapter } from './weixin-ilink';
-import type { ChannelAccount, ChannelAdapter, ChannelId } from './types';
+import type { ChannelAccount, ChannelAdapter, ChannelId, ChannelInboundMessage } from './types';
 
 const log = createLogger('channels');
 
@@ -155,19 +155,31 @@ async function pollLoop(uid: string, channel: ChannelId, signal: AbortSignal): P
   log.info(`[${key}] 入站循环结束`);
 }
 
-async function handleInbound(uid: string, account: ChannelAccount, message: { senderId: string; text: string }): Promise<void> {
+async function handleInbound(uid: string, account: ChannelAccount, message: ChannelInboundMessage): Promise<void> {
   if (!account.agentId) {
     log.info(`[channels] 微信消息到达但未绑定机器人: ${message.text.slice(0, 40)}`);
     return;
   }
   const cid = await ensureConversation(uid, account);
   await groupChat.setFloor(uid, cid, account.agentId!);
-  const reply = await injectAndWaitReply(uid, cid, account.agentId, message.text);
   const adapter = ADAPTERS[account.channel];
+  // 对方正在输入…：生成回复期间每 5s 续发一次 typing（微信端会自动过期）。
+  // status 由 sendmessage 落消息自然终止，这里只负责生成期间的续期。
+  let typingTimer: ReturnType<typeof setInterval> | null = null;
+  if (adapter.sendTyping) {
+    const tick = () => {
+      void adapter.sendTyping!(account, message.senderId, message.replyContext).catch(() => {});
+    };
+    tick();
+    typingTimer = setInterval(tick, 5000);
+  }
   try {
+    const reply = await injectAndWaitReply(uid, cid, account.agentId, message.text);
     await adapter.sendText(account, message.senderId, reply || '（机器人本轮没有产出文本回复）');
   } catch (error) {
     log.warn('[channels] 回复投递失败:', error instanceof Error ? error.message : error);
+  } finally {
+    if (typingTimer) clearInterval(typingTimer);
   }
 }
 

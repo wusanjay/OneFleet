@@ -190,6 +190,12 @@ export function modelInputImageLimit(
 export const PI_MODEL_PROVIDER_ALIAS: Readonly<Record<string, string>> = {
   'minimax-portal-cn': 'minimax-cn',
   'minimax-portal':    'minimax',
+  // zai profiles hold mainland-issued Zhipu keys (catalog docsUrl is
+  // open.bigmodel.cn). Resolve models onto pi-ai's zai-coding-cn catalog so
+  // the request hits open.bigmodel.cn; api.z.ai (intl coding endpoint) is
+  // unreachable from CN networks and was observed returning transport errors
+  // even through a working proxy (2026-10-16). Same key works on both.
+  'zai':               'zai-coding-cn',
 };
 
 const PI_MODEL_TEMPLATE_ALIAS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
