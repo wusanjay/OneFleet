@@ -1425,8 +1425,9 @@ if (!gotLock) {
     );
     await initialBundledContent.promise;
     // Source-run macOS uses Electron.app's own Info.plist, so set the dock
-    // icon at runtime. Packaged builds still pick up the configured icns.
-    if (process.platform === 'darwin' && app.dock) {
+    // icon at runtime. Packaged builds must keep the configured icns —
+    // overriding it here would replace the tiled icon with the bare glyph.
+    if (process.platform === 'darwin' && app.dock && !app.isPackaged) {
       const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png');
       const img = nativeImage.createFromPath(iconPath);
       if (!img.isEmpty()) app.dock.setIcon(img);
