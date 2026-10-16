@@ -33,6 +33,10 @@
         <span data-ui-icon="layout-grid" data-ui-icon-class="rail-icon"></span>
         <span class="rail-label" data-i18n="sidebar.rail_fleets">编队</span>
       </button>
+      <button class="rail-btn" id="rail-remote-btn">
+        <span data-ui-icon="message-circle-more" data-ui-icon-class="rail-icon"></span>
+        <span class="rail-label" data-i18n="sidebar.rail_remote">远程</span>
+      </button>
       <button class="rail-btn" id="agents-btn">
         <span data-ui-icon="users" data-ui-icon-class="rail-icon"></span>
         <span class="rail-label" data-i18n="sidebar.rail_agents">智能体</span>
@@ -70,6 +74,27 @@
         <div class="midbar-employees-hint" data-i18n="midbar.employees_hint">全部机器人都在这里 — 点一个，直接跟他说话。</div>
         <div id="midbar-employee-list"></div>
         <div class="conv-empty" id="midbar-employees-empty" data-i18n="midbar.employees_empty">还没有机器人 — 从「编队」导入一支，或单独创建。</div>
+      </div>
+      <div class="midbar-remote" id="midbar-remote" hidden>
+        <div class="midbar-remote-card" id="remote-weixin-card">
+          <div class="remote-channel-head">
+            <span class="remote-channel-name" data-i18n="remote.weixin_name">微信</span>
+            <span class="remote-channel-state" id="remote-weixin-state" data-i18n="remote.state_off">未连接</span>
+          </div>
+          <div class="remote-channel-body" id="remote-weixin-body">
+            <button type="button" class="remote-connect-btn" id="remote-weixin-connect" data-i18n="remote.connect">扫码接入微信</button>
+          </div>
+          <div class="remote-qr-flow" id="remote-weixin-qr" hidden>
+            <img class="remote-qr-img" id="remote-weixin-qr-img" alt="QR" />
+            <div class="remote-qr-hint" data-i18n="remote.qr_hint">微信扫一扫，登录机器人</div>
+          </div>
+          <div class="remote-bound" id="remote-weixin-bound" hidden>
+            <label class="remote-bind-label" data-i18n="remote.bind_label">值班机器人</label>
+            <select class="remote-bind-select" id="remote-weixin-agent"></select>
+            <button type="button" class="remote-disconnect-btn" id="remote-weixin-disconnect" data-i18n="remote.disconnect">断开连接</button>
+          </div>
+        </div>
+        <div class="conv-empty" data-i18n="remote.more_channels">更多渠道（飞书 / Telegram）接入开发中。</div>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-conversations-section">

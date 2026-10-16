@@ -361,6 +361,9 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 // fleet — members, conversation binding, template provenance. Cloud-synced
 // like preferences so a fleet survives device moves.
 export const userFleetsFile = (uid: string) => path.join(userCloudConfigDir(uid), 'fleets.json');
+// Remote channel accounts (远程渠道, e.g. WeChat iLink). Tokens are device-local
+// credentials; keep this file out of any cloud-sync allowlist.
+export const userChannelsFile = (uid: string) => path.join(userCloudConfigDir(uid), 'channels.json');
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');

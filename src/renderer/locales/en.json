@@ -2577,5 +2577,15 @@
   "midbar.import_template": "Import fleet template",
   "midbar.fleets_empty": "No fleets yet — import a template to build one.",
   "midbar.employees_hint": "All your bots in one place — click one to start talking.",
-  "midbar.employees_empty": "No bots yet — import a fleet or create one."
+  "midbar.employees_empty": "No bots yet — import a fleet or create one.",
+  "sidebar.rail_remote": "Remote",
+  "remote.weixin_name": "WeChat",
+  "remote.state_off": "Not connected",
+  "remote.state_on": "Connected",
+  "remote.connect": "Scan to connect WeChat",
+  "remote.qr_hint": "Scan with WeChat to link the bot",
+  "remote.bind_label": "On-duty bot",
+  "remote.bind_placeholder": "Pick a bot…",
+  "remote.disconnect": "Disconnect",
+  "remote.more_channels": "More channels (Feishu / Telegram) coming soon."
 }

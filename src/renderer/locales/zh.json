@@ -2577,5 +2577,15 @@
   "midbar.import_template": "导入编队模板",
   "midbar.fleets_empty": "还没有编队 — 导入一份模板，一键建队。",
   "midbar.employees_hint": "全部机器人都在这里 — 点一个，直接跟他说话。",
-  "midbar.employees_empty": "还没有机器人 — 从「编队」导入一支，或单独创建。"
+  "midbar.employees_empty": "还没有机器人 — 从「编队」导入一支，或单独创建。",
+  "sidebar.rail_remote": "远程",
+  "remote.weixin_name": "微信",
+  "remote.state_off": "未连接",
+  "remote.state_on": "已连接",
+  "remote.connect": "扫码接入微信",
+  "remote.qr_hint": "微信扫一扫，登录机器人",
+  "remote.bind_label": "值班机器人",
+  "remote.bind_placeholder": "选择一个机器人…",
+  "remote.disconnect": "断开连接",
+  "remote.more_channels": "更多渠道（飞书 / Telegram）接入开发中。"
 }

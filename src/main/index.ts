@@ -877,6 +877,14 @@ async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
 
       await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
 
+      // 远程渠道（微信等）— 恢复已连接账号的入站轮询循环。
+      try {
+        const channels = await import('./features/channels/index');
+        void channels.bootstrapAllLoops(uid);
+      } catch (err) {
+        marketplaceBootLog.warn('channels bootstrap failed', { error: logErrorSummary(err) });
+      }
+
       if (await mp.hasKnownDefaultInstallWork(uid)) {
         m.setDefaultInstallSeedStatus(true);
         defaultSeedStatusActive = true;

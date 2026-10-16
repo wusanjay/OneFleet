@@ -77,8 +77,16 @@
   function _applyMidbarMode(filter) {
     const emp = document.getElementById('midbar-employees');
     const fleets = document.getElementById('midbar-fleets');
+    const remote = document.getElementById('midbar-remote');
     const convNav = document.querySelector('.sidebar-conversation-nav');
     if (fleets) fleets.hidden = filter !== 'fleets';
+    if (remote) remote.hidden = filter !== 'remote';
+    if (filter === 'remote') {
+      if (emp) emp.hidden = true;
+      if (convNav) convNav.style.display = 'none';
+      void _renderRemotePanel();
+      return;
+    }
     if (filter === 'fleets') {
       if (emp) emp.hidden = true;
       if (convNav) convNav.style.display = 'none';
@@ -255,7 +263,106 @@
     });
     document.getElementById('midbar-import-template-btn')
       ?.addEventListener('click', () => _fileInput()?.click());
+    // Rail 远程 — remote channels mode (WeChat first).
+    document.getElementById('rail-remote-btn')?.addEventListener('click', () => {
+      if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
+      document.getElementById('conv-filter')?.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
+      _applyMidbarMode('remote');
+    });
+    _bindRemotePanel();
     void _refreshOnboarding();
+  }
+
+
+  // ── 远程（Remote channels）──────────────────────────────────────────────
+  // 微信 iLink 渠道卡：未连接 → 扫码 → 已连接（绑定值班机器人）。协议轮询
+  // 与消息注入都在主进程，这里只做登录会话与绑定表单。
+
+  let _remotePollTimer = null;
+
+  async function _renderRemotePanel() {
+    let st;
+    try { st = await window.orkas.invoke('channels.status', {}); } catch (_) { return; }
+    const stateEl = document.getElementById('remote-weixin-state');
+    const bodyEl = document.getElementById('remote-weixin-body');
+    const qrEl = document.getElementById('remote-weixin-qr');
+    const boundEl = document.getElementById('remote-weixin-bound');
+    if (!stateEl || !bodyEl) return;
+    const connected = !!(st && st.connected);
+    stateEl.textContent = connected ? (i18nText('remote.state_on') || '已连接') : (i18nText('remote.state_off') || '未连接');
+    stateEl.classList.toggle('is-on', connected);
+    bodyEl.hidden = connected;
+    qrEl.hidden = true;
+    boundEl.hidden = !connected;
+    if (connected) {
+      await _fillRemoteAgentSelect(st.account && st.account.agentId);
+    }
+  }
+
+  async function _fillRemoteAgentSelect(selectedId) {
+    const sel = document.getElementById('remote-weixin-agent');
+    if (!sel) return;
+    let agents = [];
+    try { const res = await window.orkas.invoke('channels.agents', {}); agents = (res && res.agents) || []; } catch (_) {}
+    sel.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = i18nText('remote.bind_placeholder') || '选择一个机器人…';
+    sel.appendChild(placeholder);
+    for (const a of agents) {
+      const opt = document.createElement('option');
+      opt.value = a.agent_id || a.id || '';
+      opt.textContent = a.name || a.agent_id || a.id || '';
+      sel.appendChild(opt);
+    }
+    sel.value = selectedId || '';
+  }
+
+  function _bindRemotePanel() {
+    document.getElementById('remote-weixin-connect')?.addEventListener('click', async () => {
+      const qrEl = document.getElementById('remote-weixin-qr');
+      const imgEl = document.getElementById('remote-weixin-qr-img');
+      try {
+        const session = await window.orkas.invoke('channels.beginLogin', {});
+        if (imgEl && session.qrDataUrl) imgEl.src = session.qrDataUrl;
+        if (qrEl) qrEl.hidden = false;
+        _pollRemoteLogin(session.intervalMs || 3000, session.expiresAt || Date.now() + 120000);
+      } catch (_) { /* keep panel state */ }
+    });
+    document.getElementById('remote-weixin-disconnect')?.addEventListener('click', async () => {
+      try { await window.orkas.invoke('channels.disconnect', {}); } catch (_) {}
+      void _renderRemotePanel();
+    });
+    document.getElementById('remote-weixin-agent')?.addEventListener('change', async (e) => {
+      const agentId = e.target && e.target.value;
+      if (!agentId) return;
+      try { await window.orkas.invoke('channels.bindAgent', { agent_id: agentId }); } catch (_) {}
+    });
+  }
+
+  function _pollRemoteLogin(intervalMs, expiresAt) {
+    if (_remotePollTimer) clearInterval(_remotePollTimer);
+    _remotePollTimer = setInterval(async () => {
+      if (Date.now() > expiresAt) { clearInterval(_remotePollTimer); _remotePollTimer = null; return; }
+      let res;
+      try { res = await window.orkas.invoke('channels.pollLogin', {}); } catch (_) { return; }
+      if (res && res.status === 'success') {
+        clearInterval(_remotePollTimer); _remotePollTimer = null;
+        void _renderRemotePanel();
+      } else if (res && res.status === 'expired') {
+        clearInterval(_remotePollTimer); _remotePollTimer = null;
+        const qrEl = document.getElementById('remote-weixin-qr');
+        if (qrEl) qrEl.hidden = true;
+      }
+    }, intervalMs);
+  }
+
+  function i18nText(key) {
+    try {
+      const boot = window.__orkasI18nBoot;
+      const table = boot && boot.tables && boot.tables[boot.lang];
+      return (table && typeof table[key] === 'string') ? table[key] : '';
+    } catch (_) { return ''; }
   }
 
   if (document.readyState === 'loading') {

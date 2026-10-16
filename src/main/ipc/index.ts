@@ -1989,6 +1989,40 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { fleets: await listFleets(ctx.userId) };
   },
 
+  // ── Remote channels (远程渠道: 微信 iLink first) ──
+
+  'channels.status': async ({ channel }, ctx) => {
+    const { status } = await import('../features/channels');
+    return status(ctx.userId, channel ?? 'weixin');
+  },
+
+  'channels.beginLogin': async ({ channel }, ctx) => {
+    const { beginLogin } = await import('../features/channels');
+    return beginLogin(ctx.userId, channel ?? 'weixin');
+  },
+
+  'channels.pollLogin': async ({ channel }, ctx) => {
+    const { pollLogin } = await import('../features/channels');
+    return pollLogin(ctx.userId, channel ?? 'weixin');
+  },
+
+  'channels.bindAgent': async ({ channel, agent_id }, ctx) => {
+    if (!safeId(agent_id)) throw new Error('invalid agent id');
+    const { bindAgent } = await import('../features/channels');
+    return { account: await bindAgent(ctx.userId, agent_id, channel ?? 'weixin') };
+  },
+
+  'channels.disconnect': async ({ channel }, ctx) => {
+    const { disconnect } = await import('../features/channels');
+    await disconnect(ctx.userId, channel ?? 'weixin');
+    return { ok: true };
+  },
+
+  'channels.agents': async (_args, ctx) => {
+    const { listAgents } = await import('../features/agents');
+    return { agents: await listAgents() };
+  },
+
   'usage.forConversation': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const { conversationUsageSummary } = await import('../util/usage-ledger');
