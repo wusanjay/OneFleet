@@ -85,8 +85,8 @@
     if (remote) remote.hidden = filter !== 'remote';
     if (filter === 'remote') {
       if (emp) emp.hidden = true;
-      // 会话列表保留：右栏是管理页，中栏留着微信 DM 入口（与 setView('remote') 一致）。
-      if (convNav) convNav.style.display = '';
+      // 远程模式中栏只留配置卡——微信消息入口在右栏管理页，不在这里重复。
+      if (convNav) convNav.style.display = 'none';
       void _renderRemotePanel();
       return;
     }

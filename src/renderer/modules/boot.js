@@ -458,8 +458,12 @@ function setView(view, cid, opts = {}) {
   if (midbar) midbar.classList.toggle('mode-remote', remoteMode);
   if (remoteMode) {
     document.getElementById('midbar-remote')?.removeAttribute('hidden');
+    // 远程中栏只留配置卡；会话导航（Tasks 列表）在远程语义下是噪音。
+    document.querySelector('.sidebar-conversation-nav').style.display = 'none';
   } else {
     document.getElementById('midbar-remote')?.setAttribute('hidden', '');
+    const convNav = document.querySelector('.sidebar-conversation-nav');
+    if (convNav) convNav.style.display = '';
   }
   document.getElementById('rail-remote-btn')?.classList.toggle('active', remoteMode);
   document.getElementById('rail-fleets-btn')?.classList.remove('active');
