@@ -440,20 +440,28 @@ function setView(view, cid, opts = {}) {
                 : view === 'todos' ? 'panel-todos'
                 : view === 'marketplace' ? 'panel-marketplace'
                 : view === 'workbench' ? 'panel-workbench'
+                : view === 'remote' ? 'panel-remote'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
   // Fleet-form chrome: rail active states + midbar visibility (IM apps keep
   // the chat list column only for message surfaces; tool sections take the
-  // full content width).
+  // full content width). 'remote' is a real view whose midbar column hosts
+  // the compact channel card, so it keeps the midbar visible.
   const messagingView = view === 'conversation' || view === 'new-chat';
+  const midbarView = messagingView || view === 'remote';
   const midbar = document.getElementById('midbar');
-  if (midbar) midbar.hidden = !messagingView;
-  // 远程/编队是中栏模式而非 view：任何 setView 都退出远程模式（恢复默认
-  // 头部、收起远程容器、摘掉 rail 高亮），否则消息列表会残留远程配置。
-  if (midbar) midbar.classList.remove('mode-remote');
-  document.getElementById('midbar-remote')?.setAttribute('hidden', '');
-  document.getElementById('rail-remote-btn')?.classList.remove('active');
+  if (midbar) midbar.hidden = !midbarView;
+  // 远程模式进出：view==='remote' 时中栏持有紧凑卡（mode-remote 隐藏默认
+  // 消息头部）；离开时恢复默认头部、收起远程容器、摘掉 rail 高亮，防止残留。
+  const remoteMode = view === 'remote';
+  if (midbar) midbar.classList.toggle('mode-remote', remoteMode);
+  if (remoteMode) {
+    document.getElementById('midbar-remote')?.removeAttribute('hidden');
+  } else {
+    document.getElementById('midbar-remote')?.setAttribute('hidden', '');
+  }
+  document.getElementById('rail-remote-btn')?.classList.toggle('active', remoteMode);
   document.getElementById('rail-fleets-btn')?.classList.remove('active');
   document.getElementById('rail-messages-btn')?.classList.toggle('active', messagingView);
   document.getElementById('workbench-btn')?.classList.toggle('active', view === 'workbench');
@@ -470,6 +478,9 @@ function setView(view, cid, opts = {}) {
   document.querySelectorAll('.conv-item').forEach(it => {
     it.classList.toggle('active', view === 'conversation' && it.dataset.cid === cid);
   });
+  if (view === 'remote') {
+    window.dispatchEvent(new CustomEvent('remote-view-enter'));
+  }
 
   // Memory lives in the Settings feature bundle. Reached only from Settings,
   // so loading it here keeps its 32 KB parser/evaluator cost off chat first paint.

@@ -2599,5 +2599,8 @@
   "remote.state_expired": "QR expired, refresh it",
   "remote.state_stalled": "Disconnected",
   "remote.qr_refresh": "Refresh QR",
-  "remote.hint_phone": "Once linked, message the bot in WeChat to steer it."
+  "remote.hint_phone": "Once linked, message the bot in WeChat to steer it.",
+  "remote.view_subtitle": "Link once, then steer your bot fleet from WeChat wherever you are.",
+  "remote.recent_title": "WeChat threads",
+  "remote.recent_empty": "No WeChat threads yet — message the bot once after linking."
 }

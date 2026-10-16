@@ -1154,6 +1154,54 @@
         </div>
       </section>
 
+      <!-- Remote (远程) — WeChat channel management. Right-panel twin of the
+           midbar compact card: full-width status, big QR, and the WeChat
+           conversation entries. setView('remote') activates this panel. -->
+      <section class="panel" id="panel-remote">
+        <div class="remote-view-wrap">
+          <div class="remote-view-head">
+            <img class="remote-view-icon" src="../resources/icons/wechat.svg" alt="" draggable="false" />
+            <div class="remote-view-head-main">
+              <h1 class="remote-view-title" data-i18n="remote.head_title">微信远程</h1>
+              <p class="remote-view-subtitle" data-i18n="remote.view_subtitle">扫码绑定，随时随地用微信指挥你的机器人编队。</p>
+            </div>
+            <span class="remote-state-pill" id="remote-view-state" data-i18n="remote.state_off">未连接</span>
+          </div>
+          <div class="remote-view-grid">
+            <div class="remote-channel-card remote-view-card">
+              <div class="remote-channel-body" id="remote-view-body">
+                <button type="button" class="remote-connect-btn" id="remote-view-connect" data-i18n="remote.connect">扫码接入微信</button>
+                <div class="remote-error" id="remote-view-error" hidden></div>
+              </div>
+              <div class="remote-qr-flow" id="remote-view-qr" hidden>
+                <img class="remote-qr-img remote-qr-img-lg" id="remote-view-qr-img" alt="QR" />
+                <div class="remote-qr-status" id="remote-view-qr-status" data-i18n="remote.state_scanning">等待扫码…</div>
+                <div class="remote-qr-hint" data-i18n="remote.qr_hint">微信扫一扫，登录机器人</div>
+                <button type="button" class="remote-qr-refresh" id="remote-view-qr-refresh" data-i18n="remote.qr_refresh">刷新二维码</button>
+              </div>
+              <div class="remote-bound" id="remote-view-bound" hidden>
+                <label class="remote-bind-label" data-i18n="remote.bind_label">值班机器人</label>
+                <select class="remote-bind-select" id="remote-view-agent"></select>
+                <div class="remote-bound-hint" data-i18n="remote.hint_phone">绑定后，在微信里给机器人发消息即可遥控。</div>
+                <button type="button" class="remote-disconnect-btn" id="remote-view-disconnect" data-i18n="remote.disconnect">断开连接</button>
+              </div>
+            </div>
+            <div class="remote-view-side">
+              <ol class="remote-steps">
+                <li data-i18n="remote.step1">扫码绑定微信</li>
+                <li data-i18n="remote.step2">选一个值班机器人</li>
+                <li data-i18n="remote.step3">在微信里发消息遥控</li>
+              </ol>
+              <div class="remote-recent">
+                <div class="remote-recent-title" data-i18n="remote.recent_title">微信消息</div>
+                <div id="remote-view-convos"></div>
+                <div class="conv-empty" id="remote-view-convos-empty" data-i18n="remote.recent_empty">还没有微信消息 — 绑定后给机器人发一条就会出现在这里。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Workbench — fleet-form P1: tools become cards in the content area
            (rail → 工作台). The six tool buttons keep their historical IDs so
            the existing setView bindings in boot.js/state.js keep working. -->

@@ -2599,5 +2599,8 @@
   "remote.state_expired": "二维码已过期，请刷新",
   "remote.state_stalled": "已断开",
   "remote.qr_refresh": "刷新二维码",
-  "remote.hint_phone": "绑定后，在微信里给机器人发消息即可遥控。"
+  "remote.hint_phone": "绑定后，在微信里给机器人发消息即可遥控。",
+  "remote.view_subtitle": "扫码绑定，随时随地用微信指挥你的机器人编队。",
+  "remote.recent_title": "微信消息",
+  "remote.recent_empty": "还没有微信消息 — 绑定后给机器人发一条就会出现在这里。"
 }

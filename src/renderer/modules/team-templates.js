@@ -85,7 +85,8 @@
     if (remote) remote.hidden = filter !== 'remote';
     if (filter === 'remote') {
       if (emp) emp.hidden = true;
-      if (convNav) convNav.style.display = 'none';
+      // 会话列表保留：右栏是管理页，中栏留着微信 DM 入口（与 setView('remote') 一致）。
+      if (convNav) convNav.style.display = '';
       void _renderRemotePanel();
       return;
     }
@@ -257,19 +258,28 @@
       ?.addEventListener('click', () => { if (typeof setView === 'function') setView('settings'); });
     document.getElementById('onboarding-template-btn')
       ?.addEventListener('click', () => _fileInput()?.click());
-    // Rail 编队 — fleets mode in the midbar (cards + import).
+    // Rail 编队 — fleets mode in the midbar (cards + import). From tool views
+    // setView() has hidden the midbar; reveal it and own the rail highlight
+    // (same contract as the remote button below).
     document.getElementById('rail-fleets-btn')?.addEventListener('click', () => {
       if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
+      const midbar = document.getElementById('midbar');
+      if (midbar) midbar.hidden = false;
       document.getElementById('conv-filter')?.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
+      document.getElementById('rail-fleets-btn')?.classList.add('active');
+      document.getElementById('rail-messages-btn')?.classList.remove('active');
+      document.getElementById('rail-remote-btn')?.classList.remove('active');
       _applyMidbarMode('fleets');
     });
     document.getElementById('midbar-import-template-btn')
       ?.addEventListener('click', () => _fileInput()?.click());
-    // Rail 远程 — remote channels mode (WeChat first). From non-messaging
-    // views setView() has hidden the midbar; reveal it and own the rail
-    // highlight until the next setView clears it.
+    // Rail 远程 — a real view now: setView('remote') activates panel-remote,
+    // keeps the midbar visible with the compact card, and owns the rail
+    // highlight. setView dispatches 'remote-view-enter' for the refresh below.
     document.getElementById('rail-remote-btn')?.addEventListener('click', () => {
       if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
+      if (typeof setView === 'function') { setView('remote'); return; }
+      // Fallback: setView unavailable — at least flip the midbar into remote mode.
       const midbar = document.getElementById('midbar');
       if (midbar) midbar.hidden = false;
       document.getElementById('conv-filter')?.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
@@ -286,101 +296,174 @@
   // 微信 iLink 渠道卡：未连接 → 扫码 → 已连接（绑定值班机器人）。协议轮询
   // 与消息注入都在主进程，这里只做登录会话与绑定表单。
 
-  let _remotePollTimer = null;
+  // 双表面：bar = 中栏紧凑卡（mode-remote 时可见），view = 右栏管理页
+  // (panel-remote)。状态渲染/登录轮询驱动同一份逻辑，按 scope 取元素，
+  // 两个表面始终同步——用户看哪个都一致。
+  const REMOTE_SCOPES = {
+    bar: {
+      state: 'remote-weixin-state', body: 'remote-weixin-body',
+      qr: 'remote-weixin-qr', qrImg: 'remote-weixin-qr-img',
+      qrStatus: 'remote-weixin-qr-status', error: 'remote-weixin-error',
+      bound: 'remote-weixin-bound', agent: 'remote-weixin-agent',
+      connect: 'remote-weixin-connect', refresh: 'remote-weixin-qr-refresh',
+      disconnect: 'remote-weixin-disconnect',
+    },
+    view: {
+      state: 'remote-view-state', body: 'remote-view-body',
+      qr: 'remote-view-qr', qrImg: 'remote-view-qr-img',
+      qrStatus: 'remote-view-qr-status', error: 'remote-view-error',
+      bound: 'remote-view-bound', agent: 'remote-view-agent',
+      connect: 'remote-view-connect', refresh: 'remote-view-qr-refresh',
+      disconnect: 'remote-view-disconnect',
+    },
+  };
 
-  function _remoteEls() {
-    return {
-      stateEl: document.getElementById('remote-weixin-state'),
-      bodyEl: document.getElementById('remote-weixin-body'),
-      qrEl: document.getElementById('remote-weixin-qr'),
-      qrStatusEl: document.getElementById('remote-weixin-qr-status'),
-      errorEl: document.getElementById('remote-weixin-error'),
-      boundEl: document.getElementById('remote-weixin-bound'),
-    };
+  function _remoteEls(scope) {
+    const ids = REMOTE_SCOPES[scope];
+    const els = {};
+    for (const [key, id] of Object.entries(ids)) els[key] = document.getElementById(id);
+    return els;
   }
 
-  function _setRemoteError(message) {
-    const { errorEl } = _remoteEls();
+  function _setRemoteError(scope, message) {
+    const { error: errorEl } = _remoteEls(scope);
     if (!errorEl) return;
     errorEl.textContent = message || '';
     errorEl.hidden = !message;
   }
 
+  let _remotePollTimer = null;
+  let _remoteLastState = null;
+
   async function _renderRemotePanel() {
     let st;
     try { st = await window.orkas.invoke('channels.status', {}); } catch (_) { return; }
-    const { stateEl, bodyEl, qrEl, boundEl } = _remoteEls();
-    if (!stateEl || !bodyEl) return;
+    _remoteLastState = st;
     const connected = !!(st && st.connected);
-    stateEl.textContent = connected ? (i18nText('remote.state_on') || '已连接') : (i18nText('remote.state_off') || '未连接');
-    stateEl.classList.toggle('is-on', connected);
-    // 已连接但轮询循环没在跑（如凭据失效后自愈失败）也如实展示。
-    if (connected && st.looping === false) {
-      stateEl.textContent = i18nText('remote.state_stalled') || '已断开';
-      stateEl.classList.toggle('is-on', false);
+    const stalled = connected && st.looping === false;
+    for (const scope of Object.keys(REMOTE_SCOPES)) {
+      const { state: stateEl, body: bodyEl, qr: qrEl, bound: boundEl, error: errorEl } = _remoteEls(scope);
+      if (!stateEl || !bodyEl) continue;
+      stateEl.textContent = connected
+        ? (stalled ? (i18nText('remote.state_stalled') || '已断开') : (i18nText('remote.state_on') || '已连接'))
+        : (i18nText('remote.state_off') || '未连接');
+      stateEl.classList.toggle('is-on', connected && !stalled);
+      // 已连接但轮询循环没在跑（凭据失效自愈失败）也如实展示为断开。
+      bodyEl.hidden = connected;
+      qrEl.hidden = true;
+      boundEl.hidden = !connected;
+      if (errorEl) { errorEl.hidden = true; errorEl.textContent = ''; }
     }
-    bodyEl.hidden = connected;
-    qrEl.hidden = true;
-    boundEl.hidden = !connected;
-    _setRemoteError('');
-    if (connected) {
-      await _fillRemoteAgentSelect(st.account && st.account.agentId);
-    }
+    if (connected) await _fillRemoteAgentSelect(st.account && st.account.agentId);
+    void _renderRemoteConvos(st);
   }
 
   async function _fillRemoteAgentSelect(selectedId) {
-    const sel = document.getElementById('remote-weixin-agent');
-    if (!sel) return;
     let agents = [];
     try { const res = await window.orkas.invoke('channels.agents', {}); agents = (res && res.agents) || []; } catch (_) {}
-    sel.innerHTML = '';
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = i18nText('remote.bind_placeholder') || '选择一个机器人…';
-    sel.appendChild(placeholder);
-    for (const a of agents) {
-      const opt = document.createElement('option');
-      opt.value = a.agent_id || a.id || '';
-      opt.textContent = a.name || a.agent_id || a.id || '';
-      sel.appendChild(opt);
+    for (const scope of Object.keys(REMOTE_SCOPES)) {
+      const sel = _remoteEls(scope).agent;
+      if (!sel) continue;
+      sel.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = i18nText('remote.bind_placeholder') || '选择一个机器人…';
+      sel.appendChild(placeholder);
+      for (const a of agents) {
+        const opt = document.createElement('option');
+        opt.value = a.agent_id || a.id || '';
+        opt.textContent = a.name || a.agent_id || a.id || '';
+        sel.appendChild(opt);
+      }
+      sel.value = selectedId || '';
     }
-    sel.value = selectedId || '';
+  }
+
+  /** 微信消息入口 — 值班机器人的 DM 会话（微信入站都落在它的 DM 里）。
+   *  点击即进聊天：配置面在这里，聊点进去聊。 */
+  async function _renderRemoteConvos(st) {
+    const wrap = document.getElementById('remote-view-convos');
+    const empty = document.getElementById('remote-view-convos-empty');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    const agentId = st && st.account && st.account.agentId;
+    if (!agentId) { if (empty) empty.style.display = ''; return; }
+    try {
+      const res = await window.orkas.invoke('conversations.list', {});
+      const convs = (res.conversations || [])
+        .filter((c) => c.agent_id === agentId
+          || (Array.isArray(c.agent_ids) && c.agent_ids.includes(agentId)))
+        .sort((a, b) => {
+          const ta = Date.parse(a.updated_at || a.created_at || '') || 0;
+          const tb = Date.parse(b.updated_at || b.created_at || '') || 0;
+          return tb - ta;
+        })
+        .slice(0, 6);
+      const hasAny = convs.length > 0;
+      if (empty) empty.style.display = hasAny ? 'none' : '';
+      for (const c of convs) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'remote-convo-row';
+        const when = String(c.updated_at || c.created_at || '').slice(5, 16).replace('T', ' ');
+        row.innerHTML = `<span class="remote-convo-name">${_esc(c.title || c.conversation_id)}</span>`
+          + `<span class="remote-convo-time">${_esc(when)}</span>`;
+        row.addEventListener('click', () => {
+          if (typeof setView === 'function') setView('conversation', c.conversation_id);
+        });
+        wrap.appendChild(row);
+      }
+    } catch (_) { if (empty) empty.style.display = ''; }
   }
 
   async function _beginRemoteLogin() {
-    const qrEl = document.getElementById('remote-weixin-qr');
-    const imgEl = document.getElementById('remote-weixin-qr-img');
-    const { bodyEl, qrStatusEl } = _remoteEls();
+    let session;
     try {
-      const session = await window.orkas.invoke('channels.beginLogin', {});
+      session = await window.orkas.invoke('channels.beginLogin', {});
+    } catch (err) {
+      for (const scope of Object.keys(REMOTE_SCOPES)) {
+        _setRemoteError(scope, `⚠️ ${err && err.message ? err.message : '登录会话发起失败'}`);
+      }
+      return;
+    }
+    for (const scope of Object.keys(REMOTE_SCOPES)) {
+      const { body: bodyEl, qr: qrEl, qrImg: imgEl, qrStatus: qrStatusEl, error: errorEl } = _remoteEls(scope);
       if (imgEl && session.qrDataUrl) imgEl.src = session.qrDataUrl;
       if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_scanning') || '等待扫码…';
       if (qrEl) qrEl.hidden = false;
       if (bodyEl) bodyEl.hidden = true;
-      _setRemoteError('');
-      _pollRemoteLogin(session.intervalMs || 3000, session.expiresAt || Date.now() + 120000);
-    } catch (err) {
-      _setRemoteError(`⚠️ ${err && err.message ? err.message : '登录会话发起失败'}`);
+      if (errorEl) { errorEl.hidden = true; errorEl.textContent = ''; }
     }
+    _pollRemoteLogin(session.intervalMs || 3000, session.expiresAt || Date.now() + 120000);
   }
 
   function _bindRemotePanel() {
-    document.getElementById('remote-weixin-connect')?.addEventListener('click', () => { void _beginRemoteLogin(); });
-    document.getElementById('remote-weixin-qr-refresh')?.addEventListener('click', () => { void _beginRemoteLogin(); });
-    document.getElementById('remote-weixin-disconnect')?.addEventListener('click', async () => {
-      try { await window.orkas.invoke('channels.disconnect', {}); } catch (_) {}
-      void _renderRemotePanel();
-    });
-    document.getElementById('remote-weixin-agent')?.addEventListener('change', async (e) => {
-      const agentId = e.target && e.target.value;
-      if (!agentId) return;
-      try {
-        await window.orkas.invoke('channels.bindAgent', { agent_id: agentId });
-        _setRemoteError('');
-      } catch (err) {
-        _setRemoteError(`⚠️ ${err && err.message ? err.message : '绑定失败'}`);
-      }
-    });
+    const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+    const change = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('change', fn); };
+    for (const scope of Object.keys(REMOTE_SCOPES)) {
+      const ids = REMOTE_SCOPES[scope];
+      bind(ids.connect, () => { void _beginRemoteLogin(); });
+      bind(ids.refresh, () => { void _beginRemoteLogin(); });
+      bind(ids.disconnect, async () => {
+        try { await window.orkas.invoke('channels.disconnect', {}); } catch (_) {}
+        void _renderRemotePanel();
+      });
+      change(ids.agent, async (e) => {
+        const agentId = e.target && e.target.value;
+        if (!agentId) return;
+        try {
+          await window.orkas.invoke('channels.bindAgent', { agent_id: agentId });
+          for (const s2 of Object.keys(REMOTE_SCOPES)) _setRemoteError(s2, '');
+          const st = _remoteLastState;
+          void _renderRemoteConvos(st);
+        } catch (err) {
+          for (const s2 of Object.keys(REMOTE_SCOPES)) {
+            _setRemoteError(s2, `⚠️ ${err && err.message ? err.message : '绑定失败'}`);
+          }
+        }
+      });
+    }
+    window.addEventListener('remote-view-enter', () => { void _renderRemotePanel(); });
   }
 
   function _pollRemoteLogin(intervalMs, expiresAt) {
@@ -388,24 +471,30 @@
     _remotePollTimer = setInterval(async () => {
       if (Date.now() > expiresAt) {
         clearInterval(_remotePollTimer); _remotePollTimer = null;
-        const { qrStatusEl } = _remoteEls();
-        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_expired') || '二维码已过期，请刷新';
+        for (const scope of Object.keys(REMOTE_SCOPES)) {
+          const { qrStatus: qrStatusEl } = _remoteEls(scope);
+          if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_expired') || '二维码已过期，请刷新';
+        }
         return;
       }
       let res;
       try { res = await window.orkas.invoke('channels.pollLogin', {}); } catch (_) { return; }
-      const { qrStatusEl } = _remoteEls();
       if (res && res.status === 'success') {
         clearInterval(_remotePollTimer); _remotePollTimer = null;
         void _renderRemotePanel();
-      } else if (res && res.status === 'scanned') {
-        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_scanned') || '已扫码 — 请在手机上确认';
-      } else if (res && res.status === 'expired') {
+        return;
+      }
+      const text = (res && res.status === 'scanned') ? (i18nText('remote.state_scanned') || '已扫码 — 请在手机上确认')
+        : (res && res.status === 'expired') ? (i18nText('remote.state_expired') || '二维码已过期，请刷新')
+        : (res && res.status === 'error') ? ((res && res.message) || '登录失败，请重试')
+        : null;
+      if (!text) return;
+      if (res && (res.status === 'expired' || res.status === 'error')) {
         clearInterval(_remotePollTimer); _remotePollTimer = null;
-        if (qrStatusEl) qrStatusEl.textContent = i18nText('remote.state_expired') || '二维码已过期，请刷新';
-      } else if (res && res.status === 'error') {
-        clearInterval(_remotePollTimer); _remotePollTimer = null;
-        if (qrStatusEl) qrStatusEl.textContent = (res && res.message) || '登录失败，请重试';
+      }
+      for (const scope of Object.keys(REMOTE_SCOPES)) {
+        const { qrStatus: qrStatusEl } = _remoteEls(scope);
+        if (qrStatusEl) qrStatusEl.textContent = text;
       }
     }, intervalMs);
   }
