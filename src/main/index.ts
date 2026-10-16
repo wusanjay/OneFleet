@@ -56,8 +56,8 @@ import {
 } from './util/renderer-channel';
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
-const APP_USER_MODEL_ID = 'com.orkas.desktop';
-const APP_DISPLAY_NAME = 'Orkas';
+const APP_USER_MODEL_ID = 'com.onefleet.desktop';
+const APP_DISPLAY_NAME = 'OneFleet';
 const E2E_USER_DATA_DIR = !app.isPackaged
   ? String(process.env.ORKAS_E2E_USER_DATA_DIR || '').trim()
   : '';
@@ -78,7 +78,7 @@ const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
 // Source and packaged builds share one app identity and one server
 // environment: global prod. This keeps local data paths and OS app grouping
 // stable across run modes.
-app.setName('Orkas');
+app.setName('OneFleet');
 try {
   if (IS_PACKAGED_LAUNCH_SMOKE) {
     app.setPath('userData', path.join(path.dirname(PACKAGED_LAUNCH_SMOKE_FILE), 'user-data'));
@@ -382,7 +382,7 @@ function showMainWindow(): BrowserWindow {
 
 function createAppTray(): void {
   const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons',
-    process.platform === 'darwin' ? 'whaleTemplate.png' : 'icon.ico');
+    process.platform === 'darwin' ? 'octopusTemplate.png' : 'icon.ico');
   appTray = createOptionalTray({
     platform: process.platform,
     iconPath,

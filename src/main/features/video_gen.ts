@@ -252,7 +252,7 @@ async function resolveReferenceUrls(input: GenerateVideoInput): Promise<{
     onProgress: input.onProgress,
   });
   if ([...referenceImageUrls, ...referenceVideoUrls].some((url) => !/^https:\/\//i.test(url))) {
-    throw new Error('Orkas API video references must use public HTTPS URLs');
+    throw new Error('OneFleet API video references must use public HTTPS URLs');
   }
   return { referenceImageUrls, referenceVideoUrls };
 }
@@ -281,7 +281,7 @@ function normalizeVideoInput(input: GenerateVideoInput): NormalizedVideoInput {
 
 async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResult> {
   throwIfAborted(req.signal);
-  emitProgress(req.onProgress, 'create_task', 'Creating Orkas API video task');
+  emitProgress(req.onProgress, 'create_task', 'Creating OneFleet API video task');
   const { body: createdData } = await fetchAndReadWithTimeout(
     `${ORKAS_API_BASE_URL}/videos`,
     {
@@ -306,12 +306,12 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
     },
     CREATE_TIMEOUT_MS,
     req.signal,
-    'Orkas API video create request timed out',
+    'OneFleet API video create request timed out',
     (response) => readOrkasVideoResponse(response, 'create'),
   );
   let data = createdData;
   const taskId = String(data?.id || '').trim();
-  if (!taskId) throw new Error('Orkas API video create returned no task id');
+  if (!taskId) throw new Error('OneFleet API video create returned no task id');
   emitProgress(req.onProgress, 'task_created', `Video task created: ${taskId}`, { taskId });
 
   const started = Date.now();
@@ -321,7 +321,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
     throwIfAborted(req.signal);
     const status = String(data?.status || 'processing').toLowerCase();
     if (['failed', 'cancelled', 'canceled'].includes(status)) {
-      throw new Error(`Orkas API video task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
+      throw new Error(`OneFleet API video task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
     }
     const url = String(data?.url || '').trim();
     if (url) {
@@ -353,7 +353,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
         },
         POLL_TIMEOUT_MS,
         req.signal,
-        'Orkas API video status request timed out',
+        'OneFleet API video status request timed out',
         (response) => readOrkasVideoResponse(response, 'status'),
       );
       data = statusData;
@@ -369,7 +369,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
       if (consecutiveTimeouts >= MAX_CONSECUTIVE_POLL_TIMEOUTS) throw err;
     }
   }
-  throw new Error(`Orkas API video task ${taskId} timed out after ${Math.round(req.timeoutMs / 1000)} seconds`);
+  throw new Error(`OneFleet API video task ${taskId} timed out after ${Math.round(req.timeoutMs / 1000)} seconds`);
 }
 
 async function readOrkasVideoResponse(resp: Response, phase: string): Promise<any> {
@@ -379,7 +379,7 @@ async function readOrkasVideoResponse(resp: Response, phase: string): Promise<an
   if (!resp.ok) {
     const error = data?.error || {};
     const message = error.message || text || `HTTP ${resp.status}`;
-    const detail = `Orkas API video ${phase} ${resp.status}: ${truncate(String(message), 500)}`;
+    const detail = `OneFleet API video ${phase} ${resp.status}: ${truncate(String(message), 500)}`;
     if (resp.status === 402 || error.type === 'insufficient_quota' || /quota_exceeded/.test(String(error.code || ''))) {
       throw new OrkasApiQuotaError(detail);
     }
@@ -398,7 +398,7 @@ async function downloadVideo(
   const timeout = composeAbortSignal(signal, DOWNLOAD_TIMEOUT_MS, 'video download timed out');
   try {
     const result = await downloadBinaryWithProxyPolicy(url, {
-      label: 'Orkas API generated video download',
+      label: 'OneFleet API generated video download',
       signal: timeout.signal,
       maxBytes: 512 * 1024 * 1024,
       validate: validateDownloadedVideo,

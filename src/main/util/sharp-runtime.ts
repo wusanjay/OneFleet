@@ -28,7 +28,7 @@ function imageClient(): ImageClient {
         onDiagnostic: () => createLogger('image-runtime').warn('image engine emitted native diagnostics'),
       });
     } catch {
-      throw Object.assign(new Error('E_IMAGE_RUNTIME_MISSING: The bundled image runtime is unavailable. Prepare the app runtimes or reinstall Orkas.'), { code: 'E_IMAGE_RUNTIME_MISSING' });
+      throw Object.assign(new Error('E_IMAGE_RUNTIME_MISSING: The bundled image runtime is unavailable. Prepare the app runtimes or reinstall OneFleet.'), { code: 'E_IMAGE_RUNTIME_MISSING' });
     }
   }
   return client;

@@ -499,7 +499,7 @@ function _assertMarketplaceAppCompatible(kind: MarketplaceInstallKind, id: strin
     kind,
     id,
     name,
-    `requires Orkas >= ${min}; current ${current || 'unknown'}`,
+    `requires OneFleet >= ${min}; current ${current || 'unknown'}`,
     { appUpdateRequired: true, minAppVersion: min, currentAppVersion: current || '' },
   );
 }
@@ -1234,7 +1234,7 @@ async function _seedAgentSkillDependencies(
       _assertApprovedDependencySkill(sid, meta.name || sid, meta);
       const minAppVersion = _normalizeMarketplaceMinAppVersion(meta);
       if (!_isMarketplaceAppCompatible(minAppVersion)) {
-        throw new Error(`requires Orkas >= ${minAppVersion}; current ${_currentAppVersion() || 'unknown'}`);
+        throw new Error(`requires OneFleet >= ${minAppVersion}; current ${_currentAppVersion() || 'unknown'}`);
       }
       if (!shouldContinue()) return { seeded, blocked: true };
       const applied = await addSkillInstall(uid, {
@@ -1404,7 +1404,7 @@ export async function ensureDefaultInstalls(
       try {
         const minAppVersion = _normalizeMarketplaceMinAppVersion(a);
         if (!_isMarketplaceAppCompatible(minAppVersion)) {
-          log.info(`skip default agent ${a.id}; requires Orkas >= ${minAppVersion}`);
+          log.info(`skip default agent ${a.id}; requires OneFleet >= ${minAppVersion}`);
           continue;
         }
         const depSeed = await _seedAgentSkillDependencies(uid, a.id, installedSkills, deletedSkills, canContinue);
@@ -1436,7 +1436,7 @@ export async function ensureDefaultInstalls(
       try {
         const minAppVersion = _normalizeMarketplaceMinAppVersion(s);
         if (!_isMarketplaceAppCompatible(minAppVersion)) {
-          log.info(`skip default skill ${s.id}; requires Orkas >= ${minAppVersion}`);
+          log.info(`skip default skill ${s.id}; requires OneFleet >= ${minAppVersion}`);
           continue;
         }
         const applied = await addSkillInstall(uid, {

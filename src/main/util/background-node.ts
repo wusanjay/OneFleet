@@ -40,8 +40,8 @@ export function resolveBackgroundNodeRuntime(
   const platform = options.platform || process.platform;
   if (platform === 'darwin') {
     const err = new Error(
-      'Bundled Node runtime is required for Orkas background helpers on macOS. '
-      + 'Run the runtime preparation step and restart Orkas.',
+      'Bundled Node runtime is required for OneFleet background helpers on macOS. '
+      + 'Run the runtime preparation step and restart OneFleet.',
     ) as Error & { code?: string };
     err.code = 'E_BACKGROUND_NODE_MISSING';
     throw err;

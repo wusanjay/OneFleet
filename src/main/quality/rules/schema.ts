@@ -167,7 +167,7 @@ export function validateSkillFrontmatter(
       rule: 'frontmatter_extension_field',
       field: `frontmatter:${key}`,
       snippet: String(frontmatter[key] || '').slice(0, 120),
-      suggested_fix: 'Keep SKILL.md frontmatter portable (`name` and `description` only); store Orkas metadata in `_meta.json`.',
+      suggested_fix: 'Keep SKILL.md frontmatter portable (`name` and `description` only); store OneFleet metadata in `_meta.json`.',
     });
   }
 
@@ -277,7 +277,7 @@ export function skillMetaParseViolation(message: string): Violation {
     rule: 'skill_meta_unparseable',
     field: '_meta.json',
     snippet: message.slice(0, 200),
-    suggested_fix: 'Make `_meta.json` valid JSON so Orkas can read category, localized descriptions, and routing hints.',
+    suggested_fix: 'Make `_meta.json` valid JSON so OneFleet can read category, localized descriptions, and routing hints.',
   };
 }
 

@@ -147,7 +147,7 @@ export interface ImageProviderPickerOption {
 
 export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
-    { id: 'orkas-api', label: 'Orkas · Image', docs: ORKAS_API_KEYS_URL },
+    { id: 'orkas-api', label: 'OneFleet · Image', docs: ORKAS_API_KEYS_URL },
     { id: 'openai', label: 'OpenAI', docs: 'https://platform.openai.com/api-keys' },
     { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
     {

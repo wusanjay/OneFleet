@@ -153,7 +153,7 @@ export function listTtsProviderPresets(): Array<{
   return [
     {
       id: ORKAS_API_PROVIDER,
-      label: 'Orkas · Voice',
+      label: 'OneFleet · Voice',
       baseUrl: ORKAS_API_BASE_URL,
       defaultModel: ORKAS_API_TTS_MODEL,
       defaultVoice: ORKAS_API_DEFAULT_VOICE,

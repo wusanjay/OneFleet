@@ -5732,7 +5732,7 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
         ...(stderrTail ? { extract_diagnostic: stderrTail } : {}),
       };
     }
-    p.onProgress?.({ phase: 'speech.transcribe.asr', message: 'Running Orkas-native whisper.cpp transcription.' });
+    p.onProgress?.({ phase: 'speech.transcribe.asr', message: 'Running OneFleet-native whisper.cpp transcription.' });
     const timestampDetail = p.timestamps === 'word' ? 'word' : 'segment';
     const args = buildSpeechTranscribeArgs(backend.model, wav, outBase, {
       language: p.language,

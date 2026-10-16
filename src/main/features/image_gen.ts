@@ -317,7 +317,7 @@ async function readOrkasImageResponse(resp: Response, phase: string): Promise<an
   try { data = text ? JSON.parse(text) : {}; } catch { /* handled below */ }
   if (!resp.ok) {
     const message = data?.error?.message || text || `request failed with HTTP ${resp.status}`;
-    throw new Error(`Orkas Image ${phase} ${resp.status}: ${truncate(String(message), 500)}`);
+    throw new Error(`OneFleet Image ${phase} ${resp.status}: ${truncate(String(message), 500)}`);
   }
   return data;
 }
@@ -347,13 +347,13 @@ async function waitForOrkasImageTask(
       },
       ORKAS_IMAGE_POLL_TIMEOUT_MS,
       signal,
-      'Orkas Image status request timed out',
+      'OneFleet Image status request timed out',
       (resp) => readOrkasImageResponse(resp, 'status'),
     );
     data = statusData;
     const status = String(data?.status || '').toLowerCase();
     if (['failed', 'cancelled', 'canceled'].includes(status)) {
-      throw new Error(`Orkas Image task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
+      throw new Error(`OneFleet Image task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
     }
     if (status === 'succeeded' || data?.data?.[0]?.url || data?.data?.[0]?.b64_json) return data;
   }
@@ -380,7 +380,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
   const overall = composeAbortSignal(
     req.signal,
     ORKAS_IMAGE_TOTAL_TIMEOUT_MS,
-    `Orkas Image timed out after ${Math.round(ORKAS_IMAGE_TOTAL_TIMEOUT_MS / 60_000)} minutes`,
+    `OneFleet Image timed out after ${Math.round(ORKAS_IMAGE_TOTAL_TIMEOUT_MS / 60_000)} minutes`,
   );
   try {
     const { body: createdData } = await fetchAndReadWithTimeout(
@@ -404,13 +404,13 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
       },
       ORKAS_IMAGE_CREATE_TIMEOUT_MS,
       overall.signal,
-      'Orkas Image create request timed out',
+      'OneFleet Image create request timed out',
       (resp) => readOrkasImageResponse(resp, 'create'),
     );
     let data = createdData;
     const taskId = String(data?.id || '').trim();
     if (!data?.data?.[0]?.url && !data?.data?.[0]?.b64_json) {
-      if (!taskId) throw new Error('Orkas Image create returned no task id');
+      if (!taskId) throw new Error('OneFleet Image create returned no task id');
       data = await waitForOrkasImageTask(taskId, req.apiKey, overall.signal, req.usageContext);
     }
 
@@ -422,15 +422,15 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
       buffer = Buffer.from(b64, 'base64');
     } else {
       const url = String(data?.data?.[0]?.url || '').trim();
-      if (!url) throw new Error(`Orkas Image task ${taskId || '(sync)'} succeeded without image data`);
+      if (!url) throw new Error(`OneFleet Image task ${taskId || '(sync)'} succeeded without image data`);
       const download = composeAbortSignal(
         overall.signal,
         ORKAS_IMAGE_DOWNLOAD_TIMEOUT_MS,
-        'Orkas Image download timed out',
+        'OneFleet Image download timed out',
       );
       try {
         const result = await downloadBinaryWithProxyPolicy(url, {
-          label: 'Orkas Image download',
+          label: 'OneFleet Image download',
           signal: download.signal,
           maxBytes: 64 * 1024 * 1024,
           validate: (body) => {
@@ -439,7 +439,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
         });
         buffer = result.body;
       } catch (err) {
-        throw new ImageGenerationDeliveryError(`Orkas Image download failed after generation completed. Do not submit another generation task. ${errorMessage(err)}`, { cause: err });
+        throw new ImageGenerationDeliveryError(`OneFleet Image download failed after generation completed. Do not submit another generation task. ${errorMessage(err)}`, { cause: err });
       } finally {
         download.cleanup();
       }

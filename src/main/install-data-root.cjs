@@ -11,8 +11,9 @@
  *      automatically by `paths.ts::DEFAULT_USER_WORKSPACE` via the
  *      `WS_ROOT/../userWorkSpace` sibling convention).
  *
- *      - macOS / Linux: `~/.orkas`
- *      - Windows: drive recorded in `%LOCALAPPDATA%\Orkas\install-pin.json`
+ *      - macOS / Linux: `~/.onefleet` (first launch after the OneFleet
+ *        rename migrates a legacy `~/.orkas` container automatically)
+ *      - Windows: drive recorded in `%LOCALAPPDATA%\OneFleet\install-pin.json`
  *        (chosen on first launch — lowest-letter non-system fixed drive,
  *        fallback `C:`). The pin file lives in LocalAppData
  *        (machine-private), not Roaming (cross-machine), because it
@@ -59,7 +60,50 @@ function flushEarlyDiagnostics(sink) {
 
 function resolveInstallContainer() {
   if (process.platform === 'win32') return resolveWindowsContainer();
+  return path.join(os.homedir(), '.onefleet');
+}
+
+// ── Legacy `.orkas` container migration (OneFleet rename) ────────────────
+
+function legacyContainerPath() {
+  if (process.platform === 'win32') {
+    try {
+      const raw = fs.readFileSync(
+        path.join(localAppDataDir(), 'Orkas', 'install-pin.json'),
+        'utf8',
+      );
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj.container === 'string' && obj.container) return obj.container;
+    } catch {
+      /* no legacy pin — nothing to migrate */
+    }
+    return null;
+  }
   return path.join(os.homedir(), '.orkas');
+}
+
+/**
+ * One-shot copy of a legacy `~/.orkas` container into `~/.onefleet` on the
+ * first post-rename launch. Best-effort: if the copy fails we fall through
+ * and boot with a fresh container rather than blocking startup. The legacy
+ * directory is left untouched so a retry (or a manual rollback) stays
+ * possible.
+ */
+function migrateLegacyContainer(container) {
+  const legacy = legacyContainerPath();
+  if (!legacy || path.resolve(legacy) === path.resolve(container)) return;
+  if (!fs.existsSync(legacy)) return;
+  if (fs.existsSync(container)) return; // new home already populated
+  try {
+    fs.cpSync(legacy, container, { recursive: true });
+    _earlyWarn(
+      `[install-data-root] migrated legacy container ${legacy} -> ${container}\n`,
+    );
+  } catch (err) {
+    _earlyWarn(
+      `[install-data-root] legacy container migration failed: ${err.message}\n`,
+    );
+  }
 }
 
 // ── Windows pin file ─────────────────────────────────────────────────────
@@ -70,6 +114,11 @@ function localAppDataDir() {
 }
 
 function pinFilePath() {
+  return path.join(localAppDataDir(), 'OneFleet', 'install-pin.json');
+}
+
+/** Pre-rename pin location; consulted once to re-pin the same drive. */
+function legacyPinFilePath() {
   return path.join(localAppDataDir(), 'Orkas', 'install-pin.json');
 }
 
@@ -154,6 +203,19 @@ function resolveWindowsContainer() {
     );
   }
 
+  // 1a. No OneFleet pin yet but a pre-rename Orkas pin exists and is live →
+  //     re-pin the same container instead of re-deciding a drive.
+  try {
+    const raw = fs.readFileSync(legacyPinFilePath(), 'utf8');
+    const legacy = JSON.parse(raw);
+    if (legacy && typeof legacy.container === 'string' && legacy.container
+        && pinIsLive({ container: legacy.container })) {
+      return writePin(legacy.container);
+    }
+  } catch {
+    /* no legacy pin — fall through to first-launch decision */
+  }
+
   // 2. Pin missing / dead → first-launch decision.
   const systemDrive = normalizeDrive(process.env.SystemDrive || 'C:');
   const fixed = listFixedDrivesWin();
@@ -173,12 +235,16 @@ function resolveWindowsContainer() {
 }
 
 function containerFor(drive) {
-  return path.join(drive + '\\', '.orkas');
+  return path.join(drive + '\\', '.onefleet');
 }
 
 function hasExistingInstall(drive) {
   try {
-    return fs.existsSync(path.join(drive + '\\', '.orkas', 'data'));
+    // `.onefleet` is the current home; `.orkas` still counts so a pre-rename
+    // install gets re-pinned to its drive and migrated by
+    // `migrateLegacyContainer` instead of triggering a fresh decision.
+    return fs.existsSync(path.join(drive + '\\', '.onefleet', 'data'))
+      || fs.existsSync(path.join(drive + '\\', '.orkas', 'data'));
   } catch {
     return false;
   }
@@ -226,6 +292,8 @@ function listFixedDrivesWin() {
   if (process.env.ORKAS_WORKSPACE_ROOT) return;
 
   const container = resolveInstallContainer();
+
+  migrateLegacyContainer(container);
 
   // Migration is best-effort: a failure here should not block boot. The
   // source-run `<repoRoot>/data` is left in place for retry;

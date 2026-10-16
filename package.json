@@ -1,8 +1,8 @@
 {
-  "name": "orkas",
+  "name": "onefleet",
   "version": "2026.10.1",
   "private": true,
-  "description": "Orkas desktop — Electron + Node one-piece app",
+  "description": "OneFleet desktop — Electron + Node one-piece app",
   "main": "bootstrap.cjs",
   "type": "commonjs",
   "packageManager": "npm@11.11.0",
@@ -105,13 +105,13 @@
     "tar": "7.5.21"
   },
   "build": {
-    "appId": "com.orkas.desktop",
-    "productName": "Orkas",
+    "appId": "com.onefleet.desktop",
+    "productName": "OneFleet",
     "protocols": [
       {
-        "name": "Orkas",
+        "name": "OneFleet",
         "schemes": [
-          "orkas"
+          "onefleet"
         ],
         "role": "Viewer"
       }
@@ -131,6 +131,7 @@
       "!bin/packaged-resource-gate.cjs",
       "!bin/runtime-gate.cjs",
       "src/main/**/*.{js,ts,mjs,md,json}",
+      "src/main/**/*.cjs",
       "resources/connectors/setup/*.md",
       "src/main/native/build/*.node",
       "src/renderer/**/*",

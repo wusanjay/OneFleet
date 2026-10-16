@@ -104,7 +104,7 @@ export function listVideoProviderOptions(): Array<{ id: string; label: string; d
   return [
     {
       id: ORKAS_API_PROVIDER,
-      label: 'Orkas',
+      label: 'OneFleet',
       docs: ORKAS_API_KEYS_URL,
     },
   ];

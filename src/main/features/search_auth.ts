@@ -142,7 +142,7 @@ export async function testSearchProfile(id: string): Promise<TestSearchProfileRe
   if (!target) return { ok: false, durationMs: 0, error: 'profile not found' };
   const t0 = Date.now();
   try {
-    const res = await runSearchAdapter(target, 'Orkas connectivity probe', 1);
+    const res = await runSearchAdapter(target, 'OneFleet connectivity probe', 1);
     return { ok: true, durationMs: Date.now() - t0, resultCount: res.results.length };
   } catch (err) {
     log.warn('search profile test failed', {

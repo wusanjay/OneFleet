@@ -12,7 +12,7 @@
  *       main/                     ← index.ts + preload.js + features/...
  *       renderer/ resources/ core-agent/
  *
- *   <container>/                  ← ~/.orkas (mac/linux) or <drive>:\.orkas (Windows, pinned)
+ *   <container>/                  ← ~/.onefleet (mac/linux) or <drive>:\.onefleet (Windows, pinned)
  *     data/                       ← WS_ROOT
  *       users.json                ← Local uid registry + current_user_id / dev_current_user_id
  *       open-users.json           ← Open-source registry + open_current_user_id
