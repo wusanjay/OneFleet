@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>多 Agent 协同风口 · 独立取证版深度调研与执行方案</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8ee;--dim:#9aa3b2;--acc:#ff6b35;--acc2:#4ea8ff;--line:#2a2f3a;--ok:#3ddc84;--warn:#ffc93c;--bad:#ff5c5c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;padding:0 0 80px}
+.wrap{max-width:980px;margin:0 auto;padding:0 24px}
+h1{font-size:2.1rem;line-height:1.3;margin:56px 0 8px;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:1.5rem;margin:52px 0 14px;padding:10px 0 10px 14px;border-left:4px solid var(--acc);background:linear-gradient(90deg,rgba(255,107,53,.10),transparent)}
+h3{font-size:1.18rem;margin:34px 0 10px;color:var(--acc2)}
+h4{font-size:1.03rem;margin:24px 0 8px;color:var(--dim)}
+p{margin:12px 0}
+a{color:var(--acc2);text-decoration:none;border-bottom:1px solid rgba(78,168,255,.3)}
+a:hover{border-bottom-color:var(--acc2)}
+strong{color:#fff}
+code{background:#22262f;padding:2px 6px;border-radius:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.87em;color:#ffd7a8}
+pre.code{background:#12151b;border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
+pre.code code{background:none;padding:0;color:#cfe3ff}
+blockquote{margin:18px 0;padding:14px 18px;background:rgba(78,168,255,.07);border-left:4px solid var(--acc2);border-radius:0 8px 8px 0;color:#d6e4f7}
+hr{border:none;border-top:1px solid var(--line);margin:44px 0}
+ul,ol{margin:12px 0;padding-left:26px}
+li{margin:6px 0}
+.tw{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:.92rem;background:var(--card)}
+th{background:#1e2330;text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);color:#fff;white-space:nowrap}
+td{padding:10px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#1b1f28}
+</style></head>
+<body><div class="wrap">
+<h1>多 Agent 协同风口：独立取证版深度调研与执行方案</h1>
+<p><strong>调研时间：</strong> 2026-10-12</p>
+<p><strong>调研方法：</strong> 5 路独立取证 agent 并行检索（GitHub API 直连、厂商官方文档、官方/权威媒体交叉验证），再与 <code>调研/</code> 目录下两份既有报告逐条比对。</p>
+<p><strong>面向对象：</strong> 全栈独立开发者 / OPC 一人公司 / 个人 IP 创业者</p>
+<p><strong>起点材料：</strong> Datawhale 公众号《DeepSeek Bot 发布！装个插件就能用！》（2026-10-11，微信原链有验证墙，正文经搜狗摘要 + Pandaily 英文报道 + 作者 README 三方交叉还原）</p>
+<blockquote><strong>本文与目录内另两份报告的关系：</strong> 那两份是其他 AI 的结论，本文做了独立取证，<strong>其中一部分结论被证伪或需要重大修正</strong>。第五节和第十二节专门列出差异。凡本文标注"未证实"的，请勿用于定价、融资或对外宣传。</blockquote>
+<hr>
+<h2>一、结论先行</h2>
+<h3>1.1 你的判断里，有三条需要修正</h3>
+<div class="tw"><table><thead><tr><th>你的原判断</th><th>取证结论</th><th>修正</th></tr></thead><tbody><tr><td>"目前都是国外大厂在做，很快会刮到国内"</td><td><strong>错，且错得比较关键。</strong> 国内大厂不仅已经在做，而且<strong>已经打完赛马、进入整合淘汰期</strong>：腾讯 QClaw 已于 2026-09-24 公告停运（12-24 零时），用户迁往 WorkBuddy；阿里 7 月把 QoderWork+悟空+MuleRun 三合一成"千问办公"；字节 8 月把 TRAE+扣子并入"豆包工作"；百度 8 月把内部 dodo 并入"搭子"。</td><td>你不是"抢在风口前"，而是"晚半步进场"。<strong>信息差窗口已经关闭，能力差窗口还在。</strong></td></tr><tr><td>"本地运行是差异化卖点"</td><td><strong>部分错。</strong> 网易有道的 <strong>LobsterAI</strong>（<code>netease-youdao/LobsterAI</code>，MIT，2026-02 创建，6,107★）已经开源，且明确 "Built on OpenClaw"，主打"不锁定、数据全本地、接所有 IM"。</td><td>"本地"从<strong>卖点</strong>降级为<strong>特性</strong>。真卖点是"本地 + 多 Agent 编排 + 不绑生态"这个<strong>交集</strong>——这个交集目前确实无人占位。</td></tr><tr><td>"风口很快就会起来"</td><td><strong>方向对，但节奏要反过来。</strong> 参照 OpenClaw：2026-01 爆火 → 03 见顶 → 05 腰斩，纯热度红利约 8–10 周；而这波大厂已在整合期，留给个体的<strong>能力窗口约 6–12 个月</strong>。</td><td>热度期抢内容，退潮期做产品——<strong>不要等 Demo 完美了再发声。</strong></td></tr></tbody></table></div>
+<h3>1.2 一句话结论</h3>
+<blockquote><strong>方向成立，但你要做的不是"再造一个 OpenClaw"，而是"本地优先的多 Agent 编排层 + 行业编队方案 + 个人信任资产"。Demo 是钩子不是商品；真正卖钱的是"编队 Know-how"和"人肉交付"。</strong></blockquote>
+<h3>1.3 三条最重要的行动判断</h3>
+<ol><li><strong>第一利润品不是软件、不是课，是"行业编队模板包 + 企业陪跑"。</strong> 取证显示"陪跑落地"是市场公认的溢价核心，且合规负担最轻（人工交付，不触发备案）。</li><li><strong>"开源 → 私域 → 付费"这条链条在国内没有任何可信的转化数据支撑，必须当假设验证，不能当收入预测。</strong>（这是既有报告最乐观、也最缺乏证据的一环。）</li><li><strong>今晚就能开始的第一步不是写代码，是选定一个垂类 + 建三个同名账号 + 发出第一条内容。</strong> 窗口在走，内容资产是唯一能跨风口带走的东西。</li></ol>
+<hr>
+<h2>二、起点材料还原：这篇文章到底说了什么</h2>
+<h3>2.1 事实层（已核实）</h3>
+<ul><li><strong>文章真实存在</strong>，Datawhale 于 2026-10-11 发布，摘要为"一款基于 DeepSeek Harness 的 Bot 插件……装上它就能创建自己的 Bot 团队"。</li><li><strong>它讲的是 DS Bot</strong>（<code>github.com/Fei2411/DeepSeek-Bot</code>），作者 GitHub 用户 <strong>Fei2411</strong>（原名 FeiZhuLulu，媒体称 FeiZ），2026-10-07 建仓。</li><li><strong>DS Bot 不是 DeepSeek 官方产品。</strong> 其 README 原文："DS Bot is an independent community project. It is not an official DeepSeek product, and it is not affiliated with, endorsed by or sponsored by DeepSeek." Pandaily 报道同样写明非官方。</li><li><strong>许可：Apache-2.0。</strong> 最新 v0.1.2（2026-10-11）。Star 曲线：10-08 约 53 → 10-10 约 111 → <strong>10-11 约 449 → 10-12 约 1,071</strong>（star-history 反解，与 Pandaily 引量子位"一天 250+、10-11 过 450"吻合）。</li><li><strong>底座 DSH 是 DeepSeek 官方项目</strong>：<code>deepseek-ai/deepseek-harness</code>，<strong>MIT</strong>，<strong>247,786★</strong>，TypeScript，2026-08-13 创建，slogan "Everything is a Plugin."，基于 Cordis 插件框架，最新 v0.2.1-alpha.2（2026-10-09）。</li></ul>
+<blockquote><strong>标题党提示：</strong> "DeepSeek Bot 发布"会让人以为是官方发布，实际是<strong>社区插件事件</strong>。这个区别很重要——它说明官方开放插件体系后，<strong>48 小时内就能长出爆款</strong>，生态位真实存在。</blockquote>
+<h3>2.2 DS Bot 的机制（全部逐条核实为真）</h3>
+<div class="tw"><table><thead><tr><th>机制</th><th>设计</th><th>产品意图</th></tr></thead><tbody><tr><td><strong>Chief 主 Bot</strong></td><td>首次启动自动创建高权限主管 Bot，管理其他 Bot 与群聊；作者建议"别读文档，直接跟 Chief 说话"</td><td>用对话替代配置界面，上手门槛压到接近零</td></tr><tr><td><strong>群聊 + 管理员 Bot</strong></td><td>每个群默认由 admin Bot 回复，需要时再 @ 调用其他 Bot</td><td><strong>直接解决多 Bot 齐刷刷回复导致的 Token 爆炸</strong></td></tr><tr><td><strong>长期记忆</strong></td><td>每个 Bot 一份 Markdown 记忆文件 + 团队共享记忆；每轮由模型审查该记/改/删什么</td><td>把"重复交代"变成一次性设置</td></tr><tr><td><strong>独立上下文</strong></td><td>每个 Bot 对应一个 DSH session；超长时用压缩、交接摘要、SQLite FTS 本地全文检索</td><td>解决多 Agent 上下文管理</td></tr><tr><td><strong>按 Bot 选模型</strong></td><td>写手 Bot 与程序员 Bot 可用不同模型；Usage 按时间/Bot/模型统计 Token</td><td>成本可见、按角色配算力</td></tr><tr><td><strong>全本地存储</strong></td><td>数据落在 <code>~/.dsh</code> 下 <code>bot/</code> 与 <code>sessions/</code>，卸载插件不删数据</td><td>隐私与数据主权</td></tr></tbody></table></div>
+<h3>2.3 一个必须知道的风险信号</h3>
+<p><strong>DSH 官方自己已上线"智能体团队"（实验性）功能</strong>——官网插件面板可见，代码库存在 <code>docs/subsystems/agent-team.md</code>、<code>packages/experimental/agent-team/</code>（含 TeamId、共享任务 DAG）。同时社区已有 <code>NanmiCoder/dsh-agent-teams</code>（2,040★，MIT）这类竞品插件。</p>
+<blockquote><strong>含义：</strong> "多 Agent 协同"这个能力<strong>随时可能被官方一键收编</strong>。这决定了你不能把价值押在"功能"上——功能会被官方吃掉，只有"编队方案 + 垂直人群信任"吃不掉。</blockquote>
+<hr>
+<h2>三、"目标模式"到底是什么（顺带澄清）</h2>
+<p>你提到的"目标模式"，取证结论：<strong>最可能出自 Kimi K3。</strong></p>
+<ul><li><strong>kimi.com 首页原文</strong>明确写："用 <strong>Swarm 智能体集群与 Goal 模式</strong>并行执行任务"——这是唯一把"Goal 模式"作为产品功能名明示的来源，且与多 Agent 强绑定。</li><li><strong>Meta Muse</strong>（2026-09-08 发布）虽未用 "Goal mode" 字样，但官方博客反复强调 "turns long-term goals into action plans"，语义高度一致。</li><li><strong>[OI] / Anthropic / Google</strong>：未检索到名为 "Goal mode" 的官方功能，此条<strong>未能证实</strong>。</li></ul>
+<blockquote>如果你的"目标模式"是指让我以目标导向模式来做这次调研，那已按此执行；如果是指产品功能对标，那么<strong>你的产品叙事可以直接借用"目标模式"这个已被 Kimi 教育过的词</strong>——用户已经听得懂"给它一个目标，它自己拆解执行"，这比"多 Agent 协同"更容易传播。</blockquote>
+<hr>
+<h2>四、风口判读：这次和大厂的真实位置</h2>
+<h3>4.1 国内大厂全景（已核实）</h3>
+<div class="tw"><table><thead><tr><th>产品</th><th>主体</th><th>状态</th><th>关键数据</th><th>开源</th></tr></thead><tbody><tr><td><strong>豆包工作</strong></td><td>字节</td><td>已发布（2026-08-25 起，9-15 飞书大会）</td><td>官方未公布用户数</td><td>闭源，深绑飞书</td></tr><tr><td><strong>千问办公 QwenWork</strong></td><td>阿里</td><td>公测（2026-08-03）</td><td>—</td><td>闭源，深绑钉钉</td></tr><tr><td><strong>WorkBuddy</strong></td><td>腾讯</td><td>已上线（2026-03-09）</td><td><strong>6 月桌面访问量约 2,097 万次</strong>（易观，经虎嗅引用，属实）</td><td>闭源</td></tr><tr><td><strong>QClaw</strong></td><td>腾讯</td><td><strong>已停运</strong>（2026-09-24 公告，12-24 零时）</td><td>约 200 万用户迁往 WorkBuddy</td><td>基于 OpenClaw 封装</td></tr><tr><td><strong>LobsterAI 有道龙虾</strong></td><td>网易有道</td><td>已发布</td><td>GitHub 6,107★；"用户破 100 万"<strong>仅见第三方导航站，未证实</strong></td><td>✅ <strong>MIT，基于 OpenClaw</strong></td></tr><tr><td><strong>百度搭子</strong></td><td>百度</td><td>已发布（2026-07 WAIC）</td><td>2026-07 桌面榜 MAU 674.3 万</td><td>闭源</td></tr><tr><td><strong>天禧 AI 4.0</strong></td><td>联想</td><td>已发布（2026-05-19）</td><td>首发天禧Claw架构，端侧 1.7B 记忆模型</td><td>闭源</td></tr><tr><td><strong>小艺 / HarmonyOS 7</strong></td><td>华为</td><td>已发布（2026-06-12 HDC）</td><td>小艺 1.8 亿日活、日均唤醒 30 亿次</td><td>闭源，<strong>系统级</strong></td></tr></tbody></table></div>
+<p><strong>未证实的传闻（请勿引用）：</strong> 蚂蚁"灵光 2.0"内测（2026-10-10/11）、蚂蚁数科 DTClaw 内测（2026-04-03）、中国网《互联网巨头抢滩AI办公》、中国工业新闻网《智能体PC赛道进入"系统级战争"》——多引擎检索均无证据。</p>
+<h3>4.2 大厂的真实动作是"收拢"而非"跟进"</h3>
+<p>2026 年 7–9 月是<strong>大厂集中合并产品线</strong>的四个月：</p>
+<ul><li>阿里：7 月 QoderWork + 悟空 + MuleRun 三合一 → 8-03 千问办公公测</li><li>字节：8 月 TRAE + 扣子并入豆包体系 → 推出"豆包工作"</li><li>百度：8 月内部 dodo 并入"搭子"；9 月文心快码并入</li><li>腾讯：<strong>QClaw 停运</strong>，人格/记忆/会话整体迁入 WorkBuddy</li></ul>
+<blockquote>虎嗅 2026-09-24 的判断：<strong>赛马阶段结束，进入定位赛</strong>。这意味着窗口正在关闭，但也意味着<strong>大厂不会再有"多线试错"的余裕去做长尾</strong>。</blockquote>
+<h3>4.3 大厂产品的共同短板（这就是你的空间）</h3>
+<ol><li><strong>偏通用办公、云端为主</strong>：交付物是文档/表格/PPT，核心算力在云，本地只做文件读写代理。</li><li><strong>强登录、强生态绑定</strong>：豆包工作要飞书企业账号，千问办公闭环在钉钉，WorkBuddy 绑腾讯生态——<strong>换生态即失效</strong>。</li><li><strong>数据上云 + 权限让渡</strong>：集中入口即集中记忆，用户上下文汇入厂商云。</li><li><strong>同质化严重</strong>：三家产品定义、交付物、交互几乎同构，差异只在绑哪套 IM。</li></ol>
+<h3>4.4 空位判断：成立，但比既有报告说的窄</h3>
+<p><strong>"本地运行 + 多 Agent 编排 + 不绑生态 + 数据不出本机"这个交集，目前没有大厂产品占位。</strong></p>
+<p>证据链：</p>
+<ul><li>大厂<strong>全部</strong>选择"云端 + 生态绑定"路线，把本地执行当云产品的入口（腾讯甚至主动砍掉最本地化的 QClaw）。</li><li>唯一的本地优先开源产品 LobsterAI，定位是<strong>单机办公助手</strong>，多 Agent 编排不是其主打。</li><li>OpenClaw（MIT，39 万★）已把"本地 Agent Runtime"这一层<strong>商品化</strong>——你不能靠它建壁垒，只能靠它之上的编排。</li></ul>
+<p><strong>窗口还剩多久：约 6–12 个月。</strong> 风险点是 PC 厂商把本地 Agent 下沉到 OS/固件（华为 HarmonyOS 7 已示范），一旦发生，纯软件层的本地窗口会显著收窄。</p>
+<hr>
+<h2>五、OpenClaw 波：国内到底谁赚到了钱（可信度分级）</h2>
+<blockquote>这是本次调研最有价值、也是<strong>水分最大</strong>的部分。既有报告把很多自媒体数字当成了事实。以下按可信度分级。</blockquote>
+<h3>5.1 证据扎实（可信度高）</h3>
+<div class="tw"><table><thead><tr><th>层</th><th>案例</th><th>数字</th></tr></thead><tbody><tr><td><strong>L2 交付</strong></td><td>远程安装 50–100 元/次、<strong>上门 300–1000 元（500 元最常见）</strong></td><td>多源一致</td></tr><tr><td>L2</td><td>上海 AI 产品经理<strong>李岸</strong>：基础上门 500 元，企业定制几千到上万</td><td>指名道姓，腾讯/澎湃/新浪多平台</td></tr><tr><td>L2</td><td>外贸老板闲鱼花 <strong>8000 元</strong>定制"竞品监控小龙虾"</td><td>媒体原样报道</td></tr><tr><td>L2</td><td>某淘宝店近一月售出 <strong>3000+ 单</strong>安装服务</td><td>媒体调查（单一店铺、化名店主）</td></tr><tr><td>L2</td><td>退潮后 <strong>299 元上门卸载 / 199 元远程卸载</strong></td><td>真实存在</td></tr><tr><td><strong>L1 硬件</strong></td><td><strong>Mac mini M4 全网断货</strong>、二手溢价 10–20%、得物售罄涨价 649 元、<strong>库克访华回应</strong></td><td>多源一致，市场信号硬</td></tr><tr><td><strong>L3 知识</strong></td><td>杭州<strong>阿凯</strong>：100 元付费群 <strong>200+ 人</strong></td><td>已核实</td></tr><tr><td>L3</td><td>深圳兼职博主<strong>小鑫</strong>：9.9 元精简版 + 39.9 元一对一答疑</td><td>已核实</td></tr><tr><td><strong>L5 IP/政务</strong></td><td><strong>深圳福田区两个岗位上线"政务龙虾"</strong>（民生诉求分析员、卫生许可辅导员）</td><td>官方发布，人民网/深圳新闻网</td></tr><tr><td><strong>海外</strong></td><td><strong>SetupClaw 明码标价</strong>：托管 3000 / 远程 5000 / 湾区上门 6000 美元</td><td>多源一致</td></tr><tr><td>海外</td><td><strong>OpenClaw Pro 近 30 天约 49,527 美元</strong>、Donely 约 4.4 万美元</td><td>TrustMRR（声称 Stripe 可验证）</td></tr><tr><td><strong>安全</strong></td><td><strong>CNCERT 2026-03-10《关于 OpenClaw 安全应用的风险提示》</strong></td><td>官方</td></tr></tbody></table></div>
+<h3>5.2 事件真实但被嫁接/误读（可信度中）</h3>
+<div class="tw"><table><thead><tr><th>流传说法</th><th>真实情况</th></tr></thead><tbody><tr><td>"傅盛 14 天把 8 个 Agent 养成 7×24 团队"</td><td>傅盛<strong>确实</strong>在春节滑雪摔伤后直播养龙虾；但<strong>底层跑的是猎豹自研的 EasyClaw，不是 OpenClaw</strong>——本质是<strong>产品营销事件</strong>。"14天/8个Agent/7×24"具体数字未证实。</td></tr><tr><td>"政务龙虾"是部署 OpenClaw</td><td>核心架构 <strong>DinTalClaw 由深圳本土企业"夸夸菁领科技"全自研</strong>。"审批效率提升 2–3 倍"官方<strong>无此表述</strong>（官方口径是"显著提升""分钟级"）。</td></tr><tr><td>"ClawHub 按使用量分成"</td><td>ClawHub 市场真实存在（近 3000 skill），但<strong>"按使用量分成"未证实</strong>；且与 OpenClaw 官方"no paid tier"声明存在张力。</td></tr><tr><td>"Anthropic 2026-04-03 封杀第三方订阅"</td><td>宣布约 4-3、美东 4-4 生效属实。<strong>但关键后续被两份既有报告都漏掉了：Anthropic 已于 2026-06-15 通过邮件撤回该禁令。</strong></td></tr><tr><td>"OpenClaw 5 月访问量环比跌 50.67%"</td><td>数字属实，但口径是<strong>4 月数据</strong>（霞光社引非凡产研，5 月发布）。QClaw 跌 99.19%、InStreet 跌 91.10% 同源。</td></tr></tbody></table></div>
+<h3>5.3 找不到可靠来源，高度疑似编造（可信度低，请勿引用）</h3>
+<ul><li>❌ "二手经销商 7 天卖出 200 台 Mac mini M4"</li><li>❌ "深圳李工预装 OpenClaw 两周订单增长 8 倍"（<strong>李工存在，8 倍数字未找到</strong>）</li><li>❌ "大三学生技能包三档订阅月入 10 万"（<strong>实际报道是相反方向</strong>：南京大三学生韩航做上门安装，成交十几单赚 1000 多元）</li><li>❌ "阿凯 99 元教程两周卖 800 多份 ≈ 8 万"（<strong>阿凯的付费群 200 人属实，但 99 元教程 800 份未找到</strong>）</li><li>❌ "小鑫每天几十单小赚一万"</li><li>❌ "七师傅 Chris Zhao 组织社群，入群验截图"（<strong>检索无任何踪迹，疑似虚构人设</strong>）</li><li>❌ "某服务商分销 API 两周赚 5 万"</li><li>❌ "ClawdHost"</li><li>❌ "重度用户一天 Token 费 700 元"（最接近的是"$200 订阅用出 $5000 算力价值"）</li><li>⚠️ "公务员靠上门安装赚 26 万"——原文是"<strong>有网友甚至宣称</strong>"，是网友自述无凭证</li></ul>
+<blockquote><strong>给既有报告的提醒：</strong> 上面这些编造数字，两份报告里有多条被当作事实引用。<strong>如果你已经打算把它们写进内容，请全部撤掉</strong>——用可核实的数据（500 元上门、8000 元定制、Mac mini 断货、QClaw 停运）比用夸张数字更能建立"懂行"的信任。</blockquote>
+<h3>5.4 修正版五条规律</h3>
+<ol><li><strong>钱不在模型层，在"门槛差"上。</strong> 门槛存在 → 服务溢价；门槛消失 → 生意归零。第一个问题永远是："门槛在哪，多久消失？"</li><li><strong>一次性服务退潮即归零，内容与信任留下。</strong> 代装是一锤子买卖；阿凯的群、小鑫的账号退潮后仍有价值——它们沉淀的是"这个人懂行"的认知。</li><li><strong>热度窗口 8–10 周，认知窗口长得多。</strong> 节奏：热度期抢内容，退潮期做产品。</li><li><strong>杀死上一波的不是产品缺陷，是"补贴结束"。</strong> 2026 上半年 Agent 繁荣很大程度是模型厂商免费额度在买单；Anthropic 切断订阅后同涨同跌。<strong>你的商业模式必须不依赖任何一家的补贴活着</strong>——这正是"本地跑 + 用户自带额度"的真正价值。</li><li><strong>卖铲人内部也分层，越往上留存越久。</strong> 正确做法不是选一层，而是<strong>用 L2 的现金流养 L3/L5 的资产</strong>。</li></ol>
+<hr>
+<h2>六、两波对比：这次的钱在哪一层</h2>
+<div class="tw"><table><thead><tr><th>维度</th><th>OpenClaw 波（2026 Q1）</th><th>多 Agent 波（2026 Q4）</th><th>含义</th></tr></thead><tbody><tr><td>上手门槛</td><td>高（开终端、配环境、绑 API、接 IM）</td><td>低（插件市场搜一下、点安装）</td><td><strong>L2 代装层归零</strong></td></tr><tr><td>载体归属</td><td>用户自建</td><td>官方 Harness / 官方桌面端内置</td><td>无法再靠"提供载体"赚钱</td></tr><tr><td>大厂状态</td><td>3 月才被动跟进</td><td><strong>已在场且进入整合淘汰期</strong></td><td>信息差窗口更短</td></tr><tr><td>真正稀缺</td><td>会装（技术执行）</td><td><strong>会编排</strong>（选哪些角色、什么顺序、如何验收）</td><td><strong>这是你的主战场</strong></td></tr><tr><td>用户心智</td><td>"这玩意儿牛，我得试试"</td><td>"我该让这些 AI 员工替我干什么活"</td><td>从功能好奇转向场景需求</td></tr></tbody></table></div>
+<h3>反直觉但必须接受的结论</h3>
+<p><strong>"本地优先的多 Agent 产品 Demo"作为流量入口和信任凭证价值极高；作为收入来源几乎没有价值。</strong></p>
+<p>原因：LobsterAI 已开源免费；DSH/OpenClaw 生态里的开源多 Agent 编排项目已有几十个；官方自己都在做"智能体团队"。<strong>在"工具"这一层，开源免费是默认价格。</strong></p>
+<blockquote><strong>正确定位：Demo 是钩子，不是商品。</strong></blockquote>
+<h3>这一波真正的四个空位</h3>
+<ol><li><strong>行业编队 Know-how</strong>——大厂做通用办公，绝无可能去做"跨境电商选品三人组""独立律师助理团队"这类长尾编队。</li><li><strong>中文场景内容</strong>——开源项目文档以英文为主，大厂内容偏"功能介绍"；缺的是"用大白话讲清楚一个具体岗位怎么被编队替代"。</li><li><strong>本地 + 自带模型的成本结构</strong>——不依赖补贴，边际成本≈0。</li><li><strong>大厂不愿做的"人肉交付"</strong>——企业侧真实需求是"帮我把流程跑通并教会我的人"，客单价几千到上万，非标长尾大厂不接。</li></ol>
+<hr>
+<h2>七、你的定位修正</h2>
+<h3>7.1 逐条评估你的原设想</h3>
+<div class="tw"><table><thead><tr><th>你的想法</th><th>评估</th><th>调整建议</th></tr></thead><tbody><tr><td>做产品 Demo 用于功能展示</td><td>✅ 保留</td><td>目标不是"产品竞争力"，而是"3 分钟视频能让人看懂并转发"。功能广度让位给演示冲击力。</td></tr><tr><td>基于开源产品完善组装手搓</td><td>✅ 保留</td><td><strong>许可要挑干净</strong>：优先 MIT/Apache（DSH、DS Bot、AgentTeams、OpenClaw 均可）；<strong>避开 AGPL</strong>（见第九节）。建议做"编排层 + 技能包"，底座引导用户自装而非内置分发。</td></tr><tr><td>本地运行、成本低、差异化</td><td>⚠️ 部分修正</td><td>成本低是真的；"差异化"已被 LobsterAI 撞车。把"本地"降级为特性，卖点换成"<strong>开箱即用的行业编队</strong>"。</td></tr><tr><td>录跨行业工作流 / 一人公司 100 个 Agent 视频</td><td>✅✅ 强烈保留</td><td><strong>全案最重要的一步。</strong>"一个人开公司，有 100 个员工（Agent），还能拉群协作"本身就是可传播的钩子。</td></tr><tr><td>以后大厂付费找我推广</td><td>⚠️ 可行但靠后</td><td>大厂"生态讲师/认证开发者"<strong>没有面向个人的公开低门槛入口</strong>，本质是 BD，依赖已有案例背书。<strong>先把一个垂类的 1000 个精准付费用户做出来</strong>，BD 会主动来。</td></tr><tr><td>直播 / 小红书运营</td><td>✅ 保留</td><td>小红书做"精准垂类 + 强付费意愿"，视频号/B站做"深度长内容 + 信任沉淀"，抖音只做泛流量曝光。</td></tr></tbody></table></div>
+<h3>7.2 一句话定位</h3>
+<blockquote><strong>我不卖 AI 工具，我卖"一支能替你上班的 AI 编队"。</strong></blockquote>
+<p>工具开源免费（做流量和信任）→ 编队方案收费（做利润）→ 落地陪跑做高客单（做现金流）→ 内容做护城河（做长期资产）。</p>
+<h3>7.3 三层商业结构</h3>
+<div class="tw"><table><thead><tr><th>层</th><th>价格</th><th>内容</th><th>作用</th></tr></thead><tbody><tr><td><strong>钩子层（免费）</strong></td><td>0 元</td><td>开源多 Agent 桌面 Demo + 演示视频 + 每周一个真实行业编队拆解</td><td>获客入口 + 专业度凭证</td></tr><tr><td><strong>利润层（订阅/一次性）</strong></td><td>99–999 元</td><td>行业编队模板包（角色定义 + 提示词 + 技能包 + 验收清单 + 录屏教程）</td><td>可复制、边际成本近零的复利收入</td></tr><tr><td><strong>高客单层（服务）</strong></td><td>3000–5 万+</td><td>编队落地陪跑：需求梳理 → 编队设计 → 打通工具 → 培训交接</td><td>稳定现金流，大厂不抢</td></tr></tbody></table></div>
+<hr>
+<h2>八、技术方案（含许可红线与成本量化）</h2>
+<h3>8.1 许可风险清单（商业化硬约束）</h3>
+<div class="tw"><table><thead><tr><th>项目</th><th>许可</th><th>结论</th></tr></thead><tbody><tr><td><strong>DeepSeek Harness</strong></td><td><strong>MIT</strong></td><td>✅ 可商用、可闭源改造</td></tr><tr><td><strong>DS Bot</strong></td><td><strong>Apache-2.0</strong></td><td>✅ 可商用（保留 NOTICE）</td></tr><tr><td><strong>OpenClaw / OpenClaw Enterprise</strong></td><td><strong>MIT</strong></td><td>✅ 可商用（<strong>但"OpenClaw"是商标，不能做产品名</strong>）</td></tr><tr><td><strong>AgentTeams（<code>agentscope-ai/AgentTeams</code>）</strong></td><td><strong>Apache-2.0</strong>（5,732★，Go，阿里 AgentScope）</td><td>✅ 可商用</td></tr><tr><td>⚠️ <strong><code>777genius/agent-teams-ai</code></strong></td><td><strong>AGPL-3.0</strong>（2,254★）</td><td>❌ <strong>不可 fork 后闭源分发</strong>。既有报告把这两个项目混为一谈（"Agent Teams 是 AGPL"），实际主流那个是 Apache-2.0。</td></tr><tr><td>⚠️ <strong>obelisk</strong></td><td><strong>AGPL-3.0</strong></td><td>❌ DS Bot 记忆检索思路的来源，只可学习设计</td></tr><tr><td>⚠️ <strong>n8n</strong></td><td>Sustainable Use License（非开源）</td><td>❌ 不能打包进付费产品</td></tr><tr><td>⚠️ <strong>Dify</strong></td><td>修改版 Apache-2.0</td><td>⚠️ 禁止多租户、禁止去 Logo</td></tr></tbody></table></div>
+<p><strong>AGPL 会怎样咬你：</strong> §13 网络条款——修改 AGPL 代码并通过网络提供服务，须向用户提供完整源码；§5/§6——与你的代码结合成单一作品分发，整个作品受 AGPL 约束。<strong>只在本地自用、不分发、不提供网络服务则不触发。</strong> 学习其架构、自己重写完全合法（思路不受版权保护）。</p>
+<p><strong>推荐策略（法理上干净）：</strong> 只做<strong>编排层 + 技能包</strong>（自己的原创代码，Apache-2.0 输出），底座由用户自行安装（DSH/OpenClaw/goose 都是 MIT/Apache），<strong>你不构成"分发 AGPL 作品"</strong>。做成"引导安装"而非"内置"。</p>
+<h3>8.2 推荐技术栈</h3>
+<div class="tw"><table><thead><tr><th>层</th><th>选型</th><th>理由</th></tr></thead><tbody><tr><td>桌面壳</td><td><strong>Electron 44.7</strong>（Demo）→ Tauri 2.12（v2 优化）</td><td>4 周内速度优先，全栈 TS 一把梭；Tauri 留作体积/内存优化</td></tr><tr><td>本地后端</td><td>Node.js + TypeScript</td><td>与 Electron 同语言，<code>better-sqlite3</code> 原生可用</td></tr><tr><td>存储</td><td><strong>SQLite + FTS5</strong></td><td>内置 bm25/trigram/snippet，本地全文检索零依赖</td></tr><tr><td>编排</td><td><strong>自研 Supervisor + 轻量 DAG</strong></td><td>主管模式最易演示，逻辑存 SQLite 可恢复，规避 AGPL</td></tr><tr><td>多 Agent 范式</td><td><strong>主管 Bot + 群聊 + 管理员默认回复 + 按需 @</strong></td><td>直接复用 DS Bot 已验证设计，天然控 Token</td></tr><tr><td>记忆</td><td>Markdown（事实来源）+ FTS5 召回，向量库列 v2</td><td>可读可版本化，零依赖</td></tr><tr><td>模型接入</td><td><strong>BYO-Key 多 provider</strong>：DeepSeek-flash 默认，Qwen/GLM 备选，Ollama 本地</td><td>边际成本≈0</td></tr></tbody></table></div>
+<p><strong>被否决：</strong> n8n（SUL）、Dify（多租户限制）、777genius/agent-teams-ai（AGPL）、OpenClaw Enterprise（需 K8s，对桌面工具过重）、CrewAI/AutoGen/LangGraph 直接做底座（服务端 Python，非桌面）、自建代理转发（边际成本非零 + 可能触发资质问题）。</p>
+<h3>8.3 成本量化（这是"用户自带额度"模式的核心优势）</h3>
+<p><strong>现行价格（人民币/百万 tokens，2026-10-12 官方抓取）：</strong></p>
+<div class="tw"><table><thead><tr><th>模型</th><th>输入（缓存命中/未命中）</th><th>输出</th></tr></thead><tbody><tr><td>DeepSeek-flash</td><td>¥0.02 / ¥1（闲时）</td><td>¥4</td></tr><tr><td>Qwen3.8-flash</td><td>¥0.8</td><td>¥2.7</td></tr><tr><td>GLM-5.3-Flash</td><td>¥0.8</td><td>¥2.8</td></tr><tr><td>Kimi K3</td><td>¥2</td><td>¥100</td></tr><tr><td>Claude 中档（$2/$10）</td><td>—</td><td>约 ¥3.99/¥7.98 折算</td></tr></tbody></table></div>
+<p><strong>一次多 Agent 任务的成本（估算模型）：</strong></p>
+<div class="tw"><table><thead><tr><th>场景</th><th>角色数</th><th>调用次数</th><th>总输入</th><th>总输出</th></tr></thead><tbody><tr><td>中等（写一份竞品分析）</td><td>6</td><td>4</td><td>~192K</td><td>~17K</td></tr><tr><td>重度（完整内容运营闭环）</td><td>12</td><td>8</td><td>~1.44M</td><td>~77K</td></tr></tbody></table></div>
+<ul><li>中等任务用 <strong>DeepSeek-flash 闲时 ≈ ¥0.26</strong>、峰时 ¥0.52；用 Claude 中档 ≈ ¥3.99。</li><li>重度任务用 <strong>DeepSeek-flash 闲时 ≈ ¥1.75</strong>、峰时 ¥3.50；用 Kimi K3 / GPT 中高档 <strong>¥10–30</strong>。</li></ul>
+<p><strong>结论：flash 级国产模型无论中等还是重度任务都稳稳 &lt;¥5；这是"默认便宜模型 + 按需升级"的直接价值。</strong></p>
+<p><strong>"用户自带额度"下你的边际成本 ≈ ¥0</strong>（仅更新检查/可选遥测的服务器成本，可低至每月几十元）。<strong>建议不做代理转发</strong>——那会承担模型成本、需要计量风控，还可能触发资质问题。</p>
+<p><strong>把单次任务压到 ¥5 以内的七个手法：</strong></p>
+<ol><li>默认 flash 级模型，仅主管/汇总用强模型</li><li><strong>强制开启上下文缓存</strong>（DeepSeek 缓存命中价是未命中的 1/50；前缀稳定化可极大提高命中率）</li><li>管理员 Bot 默认回复 + 按需调用</li><li>交接摘要 + FTS5 按需召回，不塞全文历史</li><li>输出上限 + 非思考模式</li><li>按复杂度路由（ClawRouter 思路）</li><li>off-peak 批处理（DeepSeek 空闲时段半价）</li></ol>
+<h3>8.4 本地模型可行性</h3>
+<ul><li>当前 Mac mini 已更新为 <strong>M6 / M5 Pro</strong>（M4 已不在售）；M6 上限 32GB，M5 Pro 上限 64GB。</li><li><strong>32GB M6 可流畅跑 qwen3.5:27b（17GB）/ 35b（22GB）/ gemma4:31b（19GB）</strong>，这些支持工具调用，足够支撑 Agent 编排。</li><li><strong>最优解是混合模式</strong>：本地做记忆/召回/简单工具调用，云端做强推理。</li></ul>
+<hr>
+<h2>九、执行方案</h2>
+<h3>9.1 90 天作战计划（紧凑版）</h3>
+<p><strong>第 1–14 天 · 定位与第一个可录屏 Demo</strong></p>
+<ul><li>选一个垂类（<strong>全案最重要的一次决策</strong>）。筛选标准：① 反复做重复性工作；② 已在用 AI 但不满意；③ 有明确付费习惯。候选：跨境电商小卖家、独立律师/会计、小红书 MCN、外贸 SOHO、SaaS 独立开发者、本地生活商家。</li><li>盘点存量优势：你做过哪些行业？有哪些现成人脉？<strong>第一支编队必须长在你已有的认知上</strong>，否则内容会空。</li><li>技术底座选型 + 许可核对（优先 DSH）。</li><li>用现有开源框架组装一个可运行工作流，每天记录：输入、Agent 分工、调用模型、耗时、Token、人工介入、结果。</li><li>建三个同名账号（小红书 + 视频号 + GitHub），攒 30 条观点选题。</li><li>发布 10 条内容，主题"我用一人公司养 8 个 AI 员工的一周"，每条只讲一个具体任务 + 一个失败教训。</li></ul>
+<blockquote><strong>验收：</strong> 陌生用户看完 3 分钟视频后，能说清"谁负责什么、为什么需要多个 Agent、最后省了什么、花了多少钱"。</blockquote>
+<p><strong>第 15–30 天 · 产品壳 + 3 个模板</strong></p>
+<ul><li>把能力包装成桌面/本地 Web 应用：安装器、模型配置、团队模板、日志、权限、恢复。</li><li>首批只做三个模板：<strong>内容增长团队 / 独立开发者销售团队 / 产品研发团队</strong>。</li><li>招 10–20 名种子用户（独立开发者、内容创业者、咨询顾问、小工作室），免费换使用记录和访谈，<strong>不承诺"自动赚钱"</strong>。</li></ul>
+<p><strong>第 31–60 天 · 从 Demo 到可交付套餐</strong></p>
+<div class="tw"><table><thead><tr><th>套餐</th><th>定价</th><th>内容</th></tr></thead><tbody><tr><td>体验版</td><td>免费/低价</td><td>基础团队模板 + 公开教程</td></tr><tr><td>个人 Pro</td><td>49–199 元/月</td><td>更多模板、版本更新、使用统计、社区支持</td></tr><tr><td>一对一交付</td><td>999–2999 元（首批）</td><td>本地安装 + 模型配置 + 一个业务工作流定制 + 培训</td></tr></tbody></table></div>
+<blockquote>价格不是市场事实，是<strong>验证起点</strong>。真正重要的是记录：转化率、交付耗时、退款原因、用户每周实际运行次数、愿意重复付费的功能。</blockquote>
+<p><strong>第 61–90 天 · 用数据定主航道</strong></p>
+<ul><li>播放高但没人试用 → 叙事有吸引力，产品价值不清楚。</li><li>试用多但复用低 → Demo 好看但工作流不稳定/不够刚需。</li><li>愿付交付费但不愿订阅 → 你更适合做垂直服务与实施。</li><li>主动分享模板并愿持续更新 → 才考虑模板市场/插件生态。</li></ul>
+<blockquote><strong>90 天结束时，最多保留一个主垂类 + 一个次垂类。</strong> 不要变成"什么行业都能做的 AI 外包公司"。</blockquote>
+<h3>9.2 24 周作战计划（完整版）</h3>
+<div class="tw"><table><thead><tr><th>阶段</th><th>周次</th><th>核心动作</th><th>验收标准</th></tr></thead><tbody><tr><td><strong>0 定位与盘点</strong></td><td>1–2</td><td>选垂类、盘存量优势、定底座并核对许可、三平台同名、30 条选题</td><td>垂类确定、底座选型完成、三平台同名</td></tr><tr><td><strong>1 MVP Demo</strong></td><td>3–6</td><td>Electron + 本地后端 + 多 Agent 编排 + SQLite + 群聊视图；三个功能（一句话创建团队 / 群聊可见协作 / 职业记忆面板）；3 支演示编队</td><td>可运行 Demo、GitHub 开源、3 支编队各能产出真实可用文件</td></tr><tr><td><strong>2 内容冷启动</strong>（与阶段1并行，第4周起必发）</td><td>4–10</td><td>三大系列：①《一个人=100个员工》②《拆解一个岗位》③《踩坑实录》；小红书日更图文 + 视频号/B站周更2条长视频；私域承接</td><td>每周 5–7 条内容、免费社群 200+ 人、至少 1 条破万播放</td></tr><tr><td><strong>3 变现闭环</strong></td><td>11–18</td><td>先卖模板包（199–499）验证需求，再卖陪跑（3000–5万/单）；设月度盈亏线</td><td>模板包首月 50 单、陪跑 2–4 单/月、月收入覆盖固定成本</td></tr><tr><td><strong>4 放大与生态</strong></td><td>19–24+</td><td>从一次性模板升级为"每月新增 1 支编队"会员制；接触 DSH/豆包工作/WorkBuddy 生态团队；直播做固定栏目</td><td>会员订阅制、1 个官方生态身份、资产可跨风口迁移</td></tr></tbody></table></div>
+<p><strong>月度盈亏决策线：</strong></p>
+<pre class="code"><code>月固定成本 = 生活费 + 工具订阅 + 记账/主体维护
+月必需营收 = 月固定成本 ÷ 毛利率
+决策线：连续 3 个月净收入 ≥ 月必需营收 → 可考虑全职放大</code></pre>
+<p><strong>不要做的事：</strong> 不要做代安装（门槛已消失）；不要卖"AI 快速致富课"（短命且伤 IP）；不要把收入结构建立在任何一家的模型补贴上。</p>
+<hr>
+<h2>十、变现路径 ROI 排序（修正版）</h2>
+<blockquote><strong>重要：</strong> 既有报告把"内容引流 + 免费社群"和"模板包"列为 P0，把"企业陪跑"列为 P1。<strong>本次取证建议把顺序反过来</strong>——因为"内容→付费"的转化链条在国内<strong>没有任何可信数据</strong>，而"陪跑落地"是市场公认的溢价核心且合规负担最轻。</blockquote>
+<div class="tw"><table><thead><tr><th>优先级</th><th>路径</th><th>启动难度</th><th>回款速度</th><th>生命周期</th><th>依据强度</th></tr></thead><tbody><tr><td><strong>P0</strong></td><td><strong>企业陪跑/咨询</strong>（3000–5万/单）</td><td>中（需案例+信任）</td><td><strong>快</strong></td><td>中</td><td><strong>强</strong>（多来源一致：陪跑是溢价核心）</td></tr><tr><td><strong>P0</strong></td><td><strong>行业编队模板包</strong>（199–499）</td><td>中</td><td>快</td><td><strong>长</strong>（可复用、边际成本低）</td><td>中</td></tr><tr><td>P1</td><td>开源项目做 IP（GitHub→私域→付费）</td><td><strong>高</strong>（长周期）</td><td><strong>慢</strong></td><td>长</td><td><strong>弱（无实证数据，待验证假设）</strong></td></tr><tr><td>P1</td><td>内容引流 + 免费社群</td><td>低</td><td>中</td><td>长</td><td>中（是前提，但转化率无据）</td></tr><tr><td>P2</td><td>中价教程（99–199）</td><td>低</td><td>快</td><td>中</td><td>中</td></tr><tr><td>P3</td><td>会员订阅（每月新编队）</td><td>中</td><td>中</td><td>长</td><td>中（前提是模板包已跑通）</td></tr><tr><td>P3</td><td>大厂生态合作/推广</td><td><strong>高</strong>（个人入口窄）</td><td>慢</td><td>中</td><td>中</td></tr><tr><td>⛔</td><td>代安装 / 卸载 / 速成致富课</td><td>低</td><td>极快</td><td>极短</td><td>—</td></tr></tbody></table></div>
+<p><strong>排序逻辑：按"现金流确定性 × 合规安全度"。</strong> 企业陪跑回款快、合规负担轻（人工交付、不碰备案），是当前最优解；开源做 IP 是<strong>长期钩子</strong>而非近期现金流。</p>
+<blockquote><strong>必须诚实面对的一条：</strong> 我未找到任何国内"开源 GitHub star → 私域 → 付费"的可信转化数据，也未找到官方（艾瑞/易观/CNNIC）发布的 2025–2026 知识付费转化率基准。<strong>所有"转化率 3%""1000 精准粉 &gt; 100 万泛粉"这类说法都来自自媒体营销话术。</strong> 请把这条链条当假设验证，不要拿它做收入预测。</blockquote>
+<h3>一人公司（OPC）的现实提醒</h3>
+<ul><li>China Daily 系列报道（2026-05）真实存在：截至 2025 年年中，中国有<strong>超 1600 万家一人有限责任公司</strong>；截至 2026 年 5 月，<strong>全国 37 个城市出台 OPC 相关政策</strong>（宁波最高补助 800 万、广州番禺最高补贴 500 万、海淀 OPC 创业生态措施）。</li><li><strong>但：</strong> 有报道称 OPC 群体"超 80% 从业者月入不足 5000"，头部"七八位数、毛利率 90%+"。<strong>这是两极分化赛道，请据此设定预期。</strong></li><li>"核定征收 0.5%"多为园区招商软文，与官方口径冲突，<strong>不要当政策承诺</strong>。</li></ul>
+<hr>
+<h2>十一、合规边界（精确版）</h2>
+<h3>11.1 法规核实结果</h3>
+<div class="tw"><table><thead><tr><th>法规</th><th>真实性</th><th>生效</th><th>对你的影响</th></tr></thead><tbody><tr><td>《生成式人工智能服务管理暂行办法》（网信办令第15号，七部门）</td><td>✅ 真实</td><td>2023-08-15</td><td><strong>关键条款第二条</strong>："仅研发、应用相关技术而<strong>未向境内公众提供服务</strong>的……不适用本办法。"</td></tr><tr><td>《人工智能生成合成内容标识办法》（国信办通字〔2025〕2号）</td><td>✅ 真实</td><td><strong>2025-09-01</strong></td><td><strong>重点。</strong> 你的演示视频/图文必须<strong>显式标识</strong>（文本/声音/图形标记）+ 隐式标识（文件元数据）。</td></tr><tr><td><strong>GB 45438-2025</strong>（强制性国标）</td><td>✅ 真实</td><td>2025-09-01</td><td>标识方法的技术依据</td></tr><tr><td>《智能体规范应用与创新发展实施意见》（网信办+发改委+工信部）</td><td>✅ 真实</td><td><strong>2026-05-08</strong></td><td>定义智能体为"具备自主感知、记忆、决策、交互与执行能力的智能系统"（<strong>原文完全一致</strong>）。要求<strong>人机协同审核</strong>（第10条）、<strong>分类分级</strong>（第11条）。<strong>注意：原文没有"决策可解释"这四个字</strong>（既有报告写错了），实际是"确保用户享有知情权和最终决策权"+"行为可验证、可追溯"。<strong>备案/检测/召回仅限敏感领域和重点行业</strong>，通用效率产品属低风险区。</td></tr><tr><td>《人工智能拟人化互动服务管理暂行办法》（网信办等令第21号，五部门）</td><td>✅ 真实</td><td><strong>2026-07-15</strong></td><td><strong>第二条明确排除</strong>"智能客服、知识问答、工作助手、学习教育、科学研究"——<strong>你的产品不适用</strong>，除非做虚拟伴侣/情感陪伴。</td></tr><tr><td><strong>GB/T 47863-2026</strong>《生成式人工智能技术应用社会影响 服务提供者合规管理指南》</td><td>✅ 真实</td><td><strong>2026-11-01</strong></td><td><strong>推荐性</strong>国标（非强制），可作企业陪跑的"合规交付物"卖点</td></tr><tr><td>CNCERT《关于 OpenClaw 安全应用的风险提示》</td><td>✅ 真实</td><td>2026-03-10</td><td>四类风险：提示词注入、误操作、插件投毒、安全漏洞</td></tr><tr><td>CNCERT/CNVD 智能体 Skills 安全公告</td><td>✅ 真实</td><td>2026-05-11 起</td><td><strong>技能包供应链安全</strong>是你必须主动设计的能力（权限最小化、来源校验、沙箱）</td></tr></tbody></table></div>
+<h3>11.2 你的合规定性</h3>
+<p><strong>"本地运行的软件工具 + 人工交付的服务" vs "面向公众的在线 AI 服务"——这条线决定你的一切。</strong></p>
+<ul><li>✅ <strong>大概率不触发备案</strong>：Demo 免费开源、用户在自己机器本地运行、你不运营托管服务、你交付的是咨询（人脑输出）。落在第二条豁免区。</li><li>⚠️ <strong>可能触发</strong>：一旦你<strong>托管运营</strong>让公众在线调用的 Agent 服务，或模板包内置了<strong>你提供的大模型能力</strong>并对外服务 → 至少需要大模型登记 + 算法备案。</li><li><strong>"人工交付"不改变定性，改变定性的是"是否提供 AI 服务本身"。</strong></li></ul>
+<blockquote><strong>合规策略一句话：</strong> 做"本地运行的软件工具 + 人工交付的服务"，不做"面向公众的在线 AI 服务"。<strong>你的"本地优先"路线在合规上反而是优势——这比它在成本上的优势更值钱，也更难被大厂复制。</strong></blockquote>
+<h3>11.3 必须避免的红线</h3>
+<ol><li>❌ <strong>托管运营面向公众的生成式 AI 服务</strong>（尤其自研模型）→ 大模型备案 3–6 个月 + 算法备案</li><li>❌ <strong>未标识的 AI 生成内容</strong>：小红书已自动检测 + 限流，抖音最高封号。<strong>演示视频/图文必须显式标识</strong></li><li>❌ <strong>"AI 炒股 / AI 帮你转账 / 稳赚不赔"</strong>：武汉市 2026-03-16 专门警示；21 世纪经济报道 2026-06-12 曝光借小红书/短视频行骗套路。<strong>平台违规 + 金融违法双线</strong></li><li>❌ <strong>私信/评论区主动留微信、二维码导流</strong>：小红书"恶意导流最严封号"</li><li>❌ <strong>做拟人化情感陪伴/虚拟伴侣</strong>（尤其面向未成年人）</li><li>❌ <strong>把"核定征收 0.5%"当政策承诺</strong></li><li>❌ <strong>删除/篡改/隐匿 AI 标识</strong></li><li>❌ <strong>忽视技能包/插件供应链安全</strong></li></ol>
+<hr>
+<h2>十二、交叉核对：既有两份调研的错误清单</h2>
+<blockquote>以下是本次独立取证发现的、既有报告（<code>多Agent风口深度调研与执行方案.html</code> 与 <code>openclaw-multi-agent-research.md</code>）中的错误或存疑点。<strong>如果你要对外引用或据此做内容，请先修正这些。</strong></blockquote>
+<h3>12.1 事实性错误（须修正）</h3>
+<div class="tw"><table><thead><tr><th>既有报告的说法</th><th>实际</th></tr></thead><tbody><tr><td>"OpenClaw 2.0 重构，主打 Shared Cloud Sessions，933 位贡献者"</td><td><strong>未能证实</strong>。OpenClaw 采用日期版本号（最新 v2026.10.2），无 "2.0" 版本</td></tr><tr><td>"Agent Teams（2.2k star）是 AGPL-3.0，有传染性"</td><td><strong>混淆了两个项目</strong>：<code>agentscope-ai/AgentTeams</code> 是 <strong>Apache-2.0</strong>（5,732★）；<code>777genius/agent-teams-ai</code> 才是 AGPL-3.0（2,254★）。<strong>这直接影响你的技术选型结论</strong></td></tr><tr><td>"傅盛 14 天把 8 个 Agent 养成了 7×24 自动工作团队"</td><td>傅盛确实直播养龙虾，但<strong>底层是猎豹自研 EasyClaw，不是 OpenClaw</strong>——是产品营销事件</td></tr><tr><td>"政务龙虾：深圳福田两个岗位，审批效率提升 2–3 倍"</td><td>岗位属实，但架构是<strong>本土自研 DinTalClaw</strong>；"2-3 倍"官方无此表述</td></tr><tr><td>"大三学生技能包月入 10 万"</td><td><strong>未找到来源，且与实际报道相反</strong>（南京大三学生做上门安装赚 1000 多元）</td></tr><tr><td>"网易 LobsterAI 用户已破 100 万"</td><td><strong>仅见第三方导航站，未证实</strong>。可证实的只有：MIT、6,107★、基于 OpenClaw</td></tr><tr><td>"OpenDot、MyCoWork、Bernstein、h5i、SwarmClaw、ORCH、5dive 等数十个项目"</td><td>Bernstein/h5i/SwarmClaw/5dive 真实；<strong>OpenDot/MyCoWork/ORCH 未能证实为真实主流项目</strong></td></tr><tr><td>"灵光 2.0 开启内测（2026-10-10/11）对标 Meta Muse"</td><td><strong>未能证实</strong>。灵光 1.0（2025-11-18）真实</td></tr><tr><td>"蚂蚁数科 DTClaw 内测（2026-04-03）"</td><td><strong>未能证实</strong></td></tr><tr><td>引用的《正观新闻》《中国网》《中国工业新闻网》三篇报道</td><td><strong>均未能定位到原文</strong>，请勿引用</td></tr><tr><td>"99 元教程两周卖 800 份 ≈ 8 万"（阿凯）</td><td>阿凯的<strong>付费群 200 人属实</strong>；99 元教程 800 份<strong>未找到</strong></td></tr><tr><td>"7 天卖出 200 台 Mac mini"、"李工两周订单增长 8 倍"</td><td>前者<strong>未找到来源</strong>；后者"李工"存在但 8 倍数字<strong>未找到</strong></td></tr><tr><td>"ClawdHost"、"七师傅 Chris Zhao"、"分销 API 两周赚 5 万"</td><td><strong>全部未找到来源</strong>，疑似虚构</td></tr><tr><td>"重度用户一天 Token 费 700 元"</td><td><strong>未找到</strong>；最接近的是"$200 订阅用出 $5000 算力价值"</td></tr></tbody></table></div>
+<h3>12.2 遗漏的重要事实（既有报告未提）</h3>
+<ol><li><strong>Anthropic 已于 2026-06-15 撤回"订阅不覆盖第三方 Agent"的禁令</strong>——两份报告都只讲了 4 月封杀，没讲 6 月反转。这对"补贴依赖"的规律判断有影响。</li><li><strong>腾讯 QClaw 已停运（2026-09-24 公告，12-24 停运）</strong>——这是"大厂进入整合淘汰期"最硬的实锤，既有报告只提了"腾讯 WorkBuddy 访问量"。</li><li><strong>DSH 官方自己已上线实验性"智能体团队"功能</strong>——这是"多 Agent 能力随时被官方收编"的关键风险信号。</li><li><strong>Mac mini 现役机型已更新为 M6 / M5 Pro</strong>（M4 已不在售）。</li><li><strong>DS Bot 的作者 GitHub 账号是 <code>Fei2411</code>（原名 FeiZhuLulu）</strong>，既有报告写作 "FeiZ / FeiZhuLulu" 不完整。</li><li><strong>"目标模式"很可能出自 Kimi K3 的"Goal 模式"</strong>（kimi.com 首页明示）——既有报告未涉及这一提法溯源。</li></ol>
+<h3>12.3 判断层面的分歧（供你权衡）</h3>
+<div class="tw"><table><thead><tr><th>议题</th><th>既有报告（HTML版）</th><th>本次取证</th></tr></thead><tbody><tr><td>变现优先级</td><td>内容引流 + 模板包为 P0，陪跑为 P1</td><td><strong>陪跑为 P0</strong>（回款快、合规轻、证据强），内容为长期钩子</td></tr><tr><td>"开源→私域→付费"</td><td>作为核心路径之一</td><td><strong>无任何可信国内数据，须当假设</strong></td></tr><tr><td>"8-10 周窗口"</td><td>信息差窗口</td><td>一致（但补：<strong>能力窗口约 6–12 个月</strong>）</td></tr><tr><td>"1000 精准付费粉 &gt; 100 万泛粉"</td><td>作为张磊案例引用</td><td><strong>未在任何来源找到，疑似杜撰</strong></td></tr></tbody></table></div>
+<hr>
+<h2>十三、风险清单与止损线</h2>
+<div class="tw"><table><thead><tr><th>风险</th><th>概率</th><th>早期信号</th><th>对策</th></tr></thead><tbody><tr><td>大厂免费产品吃掉入口</td><td><strong>高</strong></td><td>你的核心功能在某大厂产品更新里被"内置"</td><td>从第 1 天起不押功能，押"编队方案 + 垂类信任"</td></tr><tr><td>官方收编多 Agent 能力（DSH Agent Team）</td><td><strong>高</strong></td><td>官方"智能体团队"转正并开放</td><td>同上；把编排 Know-how 而非功能作为资产</td></tr><tr><td>这不是独立风口，只是 OpenClaw 续集</td><td>中</td><td>3 个月内无新爆款多 Agent 应用，大厂产品访问量停滞</td><td>把重心从"多 Agent"平移到"AI 办公自动化"，人群与内核不变</td></tr><tr><td>内容做了 8 周没转化</td><td>中</td><td>社群增长 &lt; 20 人/周，且无人问"能不能帮我做"</td><td><strong>立即换垂类重跑，不要在同一条路上加倍投入</strong></td></tr><tr><td>Token 成本失控</td><td>中</td><td>演示编队单次任务成本 &gt; 5 元</td><td>管理员 Bot 默认回复 + 按需调用 + 默认 flash 模型 + 强制缓存</td></tr><tr><td>开源许可踩坑</td><td>中</td><td>你 fork 的底座是 AGPL</td><td><strong>现在就列一张依赖许可表</strong>；AGPL 只参考不分发</td></tr><tr><td>个人精力分散（最容易的死法）</td><td><strong>高</strong></td><td>同时推进 &gt; 2 条产品线，内容断更 &gt; 5 天</td><td><strong>固定"内容优先"原则：一天只能做一件事时，做内容</strong></td></tr><tr><td>OPC 收入两极分化</td><td>中</td><td>前 3 个月净收入远低于必需营收</td><td>预设退出线，先用陪跑现金流兜底</td></tr></tbody></table></div>
+<hr>
+<h2>十四、最后：如果只带走三句话</h2>
+<ol><li><strong>方向对，但你已经晚了半步。</strong> 国内大厂不是"即将跟进"，而是已经在打淘汰赛（QClaw 已停运）。这意味着你不能用上一波的"信息差玩法"，只能走"能力差 + 信任差"。</li></ol>
+<ol><li><strong>这波的钥匙不是"做得更好"，是"讲得更清楚"。</strong> 上一波赚到钱的不是技术最强的开发者，是最早把踩坑过程变成内容的人。<strong>你的 Demo 是道具，你的编队方案是商品，你的账号是资产。</strong></li></ol>
+<ol><li><strong>今晚就可以开始，不用等 Demo。</strong> 第一步不是写代码，是选定一个垂类、建好三个同名账号、发出第一条"我要用 AI 编队替代某一个具体岗位"的内容。<strong>能力窗口约 6–12 个月，而内容资产是唯一能跨风口带走的东西。</strong></li></ol>
+<hr>
+<h2>附：来源清单（均为 2026-10-12 抓取/检索）</h2>
+<p><strong>起点材料与技术底座</strong></p>
+<ul><li>微信原文（验证墙）：https://mp.weixin.qq.com/s/ex9zLAjJXOP3CPxnPlwyVA</li><li>DSH：https://github.com/deepseek-ai/deepseek-harness ｜ Agent Team 文档：https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/agent-team.md</li><li>DS Bot：https://github.com/Fei2411/DeepSeek-Bot ｜ npm：https://registry.npmjs.org/ds-bot</li><li>Pandaily 报道：https://pandaily.com/ds-bot-community-plugin-deepseek-harness-multi-bot-team-main-bot-long-term-memory</li><li>dsh-agent-teams：https://github.com/NanmiCoder/dsh-agent-teams</li></ul>
+<p><strong>开源项目与许可</strong></p>
+<ul><li>OpenClaw：https://github.com/openclaw/openclaw ｜ Enterprise：https://github.com/openclaw/openclaw-enterprise</li><li>AgentTeams（Apache-2.0）：https://github.com/agentscope-ai/AgentTeams</li><li>agent-teams-ai（AGPL-3.0）：https://github.com/777genius/agent-teams-ai</li><li>obelisk（AGPL-3.0）：https://github.com/tommy0103/obelisk</li><li>goose：https://github.com/aaif-goose/goose ｜ OpenCode：https://github.com/anomalyco/opencode</li><li>LobsterAI：https://github.com/netease-youdao/LobsterAI</li><li>n8n LICENSE：https://github.com/n8n-io/n8n/blob/master/LICENSE.md ｜ Dify LICENSE：https://github.com/langgenius/dify/blob/main/LICENSE</li></ul>
+<p><strong>大厂与赛道</strong></p>
+<ul><li>QClaw 停运：https://www.huxiu.com/article/4893724.html ｜ https://news.qq.com/rain/a/20260924A07ZTJ00</li><li>WorkBuddy：https://www.workbuddy.cn ｜ 千问办公：https://qwenwork.cn ｜ 豆包工作：https://www.doubao.com/work</li><li>Meta Muse：https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/</li><li>Kimi Goal 模式：https://www.kimi.com</li></ul>
+<p><strong>OpenClaw 波赚钱案例</strong></p>
+<ul><li>全民养虾生意经：https://news.qq.com ｜ https://www.thepaper.cn （2026-03-12/15）</li><li>代装风靡：https://finance.sina.com.cn （2026-03-05/03-08）</li><li>上门安装年入百万？：https://www.huxiu.com （2026-03-02）</li><li>退潮：https://36kr.com （霞光社，2026-05-19）</li><li>Anthropic 封堵与撤回：https://finance.sina.com.cn （2026-04-04）｜ https://www.163.com （2026-06-16）</li><li>CNCERT 提示：https://www.cert.org.cn/</li><li>政务龙虾：https://sz.people.com.cn ｜ https://www.sznews.com （2026-03-09/10）</li></ul>
+<p><strong>价格与本地模型</strong></p>
+<ul><li>DeepSeek：https://api-docs.deepseek.com/zh-cn/quick_start/pricing</li><li>通义：https://help.aliyun.com/zh/model-studio/billing-for-model-studio</li><li>智谱：https://docs.bigmodel.cn/cn/guide/start/pricing.md</li><li>Kimi：https://platform.moonshot.cn/docs/pricing/chat.md</li><li>Ollama：https://ollama.com/library ｜ SQLite FTS5：https://www.sqlite.org/fts5.html</li><li>Electron：https://www.electronjs.org/docs/latest/tutorial/electron-timelines ｜ Tauri：https://v2.tauri.app/</li></ul>
+<p><strong>合规</strong></p>
+<ul><li>《生成式人工智能服务管理暂行办法》：https://www.cac.gov.cn/2023-07/13/c_1690898327029107.htm</li><li>《人工智能生成合成内容标识办法》：https://www.cac.gov.cn/2025-03/14/c_1743654684782215.htm</li><li>GB 45438-2025：https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=F32EA2A561F1886CD8D606513512D547</li><li>《智能体规范应用与创新发展实施意见》：https://www.cac.gov.cn/2026-05/08/c_1779979789523320.htm</li><li>《人工智能拟人化互动服务管理暂行办法》：https://www.cac.gov.cn/2026-04/10/c_1777558395078289.htm</li><li>OPC 政策：China Daily 系列（2026-05）</li></ul>
+<hr>
+<p><em>免责声明：本报告为公开信息取证与整理，不构成法律、税务或投资意见。标注"未证实"的内容请勿用于对外宣传、定价或融资。涉及备案义务定性、注册主体与税务筹划，建议落地前咨询持牌中国律师与税务师。</em></p>
+</div></body></html>

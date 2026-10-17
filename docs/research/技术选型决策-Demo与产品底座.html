@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>技术选型决策：Demo 底座与产品底座</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8ee;--dim:#9aa3b2;--acc:#ff6b35;--acc2:#4ea8ff;--line:#2a2f3a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;padding:0 0 80px}
+.wrap{max-width:980px;margin:0 auto;padding:0 24px}
+h1{font-size:2rem;line-height:1.3;margin:56px 0 8px;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:1.45rem;margin:52px 0 14px;padding:10px 0 10px 14px;border-left:4px solid var(--acc);background:linear-gradient(90deg,rgba(255,107,53,.10),transparent)}
+h3{font-size:1.16rem;margin:34px 0 10px;color:var(--acc2)}
+h4{font-size:1.02rem;margin:24px 0 8px;color:var(--dim)}
+p{margin:12px 0}
+a{color:var(--acc2);text-decoration:none;border-bottom:1px solid rgba(78,168,255,.3)}
+strong{color:#fff}
+code{background:#22262f;padding:2px 6px;border-radius:5px;font-family:ui-monospace,Menlo,monospace;font-size:.87em;color:#ffd7a8}
+pre.code{background:#12151b;border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
+pre.code code{background:none;padding:0;color:#cfe3ff}
+blockquote{margin:18px 0;padding:14px 18px;background:rgba(78,168,255,.07);border-left:4px solid var(--acc2);border-radius:0 8px 8px 0;color:#d6e4f7}
+hr{border:none;border-top:1px solid var(--line);margin:44px 0}
+ul,ol{margin:12px 0;padding-left:26px}
+li{margin:6px 0}
+.tw{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:.92rem;background:var(--card)}
+th{background:#1e2330;text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);color:#fff;white-space:nowrap}
+td{padding:10px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#1b1f28}
+</style></head>
+<body><div class="wrap">
+<h1>技术选型决策备忘（v2 · 纳入 Hermes）</h1>
+<p><strong>日期：</strong> 2026-10-12</p>
+<p><strong>背景：</strong> 承接 <code>独立取证-多Agent协同风口与执行方案.md</code>。用户补充了一个关键信息：<strong>"Hermes 的 desktop 我实际用过"</strong>。本版据此把 Hermes 纳入候选，重做同口径对比，并修正 v1 的推荐。</p>
+<p><strong>方法：</strong> 3 路独立技术尽调（GitHub API 直连实测 + 仓库源码/测试文件/官方文档逐条核对），star、版本、issue 数均为 2026-10-12 抓取。</p>
+<hr>
+<h2>一、v1 推荐被修正（先讲变化）</h2>
+<p>v1 的结论是"<strong>Demo 用 DS Bot，产品用 OpenClaw 原生或 fork Orkas</strong>"。</p>
+<p><strong>纳入 Hermes 后，这个双轨方案可以合并成一条：Hermes 同时胜任 Demo 与产品底座，且比 DS Bot 和 Orkas 都更合适。</strong> 理由是它<strong>唯一同时满足</strong>"多 Agent + 群聊 UI + 桌面 + 本地优先"四个条件，且<strong>官方 MIT 可商用</strong>、<strong>公司维护</strong>、<strong>原生中文</strong>——而这三条恰好是 DS Bot（v0.1 预览、5 天新仓、只测过 Linux）和 Orkas（社区小、单人主导）的短板。</p>
+<p><strong>DS Bot 从"推荐的 Demo 道具"降级为"不必需"</strong>——Hermes 的 Bot Mode 做了同样的事，但更成熟、有测试、有官方维护。</p>
+<hr>
+<h2>二、Hermes 身份消歧（这一步很重要，因为"Hermes"有多个对象）</h2>
+<div class="tw"><table><thead><tr><th>对象</th><th>仓库</th><th>许可</th><th>Star</th><th>判断</th></tr></thead><tbody><tr><td><strong>Hermes Agent（官方内核 + 官方桌面端）</strong></td><td><code>NousResearch/hermes-agent</code></td><td>✅ <strong>MIT</strong></td><td><strong>252,959</strong></td><td><strong>推荐用这个</strong></td></tr><tr><td>Hermes Bot Mode（群聊插件，<strong>已归档</strong>）</td><td><code>NousResearch/Hermes-Bot-Mode</code></td><td>✅ MIT</td><td>668</td><td>已内置进官方桌面端，无需单独装</td></tr><tr><td>Hermes One（社区桌面端）</td><td><code>fathah/hermes-desktop</code></td><td>✅ MIT</td><td>14,396</td><td>可用的社区壳，<code>hermesone.org</code></td></tr><tr><td><strong>Hermes Agent CN Desktop（中文社区桌面端）</strong></td><td><code>Eynzof/Hermes-CN-Desktop</code></td><td>⚠️ <strong>PolyForm Noncommercial 1.0.0</strong></td><td>1,749</td><td><strong>商用禁区，见下方警告</strong></td></tr><tr><td>Hermes 3 / Hermes 4（模型系列）</td><td>—</td><td>—</td><td>—</td><td>是模型不是产品，非用户所指</td></tr><tr><td><code>facebook/hermes</code>（JS 引擎）、<code>matcornic/hermes</code>（Go 邮件模板）</td><td>—</td><td>—</td><td>—</td><td>同名无关</td></tr></tbody></table></div>
+<blockquote>⚠️ <strong>需要你确认一件事：你实际用的是哪一个 desktop？</strong><br>如果你用的是 <strong>Hermes Agent CN Desktop</strong>（中文社区那个，<code>hermesagent.org.cn</code> 分发，Windows 优先、Tauri+Rust），它的许可是 <strong>PolyForm Noncommercial 1.0.0</strong>，原文明确："<strong>Commercial use, commercial distribution, commercial integration, hosted resale, or use as part of a commercial product or service requires a separate commercial license from Qingdao Wanderminds Network Technology Co., Ltd.</strong>"（青岛万德缦思网络科技有限公司）。<br><strong>这不影响你做 Demo，但如果你想把它当产品底座，必须换成官方 MIT 版本。</strong> 两者的内核是同一个 Hermes Agent，迁移成本不高，但这个法律区别是硬约束。</blockquote>
+<hr>
+<h2>三、Hermes 关键事实（已逐条核实）</h2>
+<h3>3.1 基本信息</h3>
+<div class="tw"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>仓库</td><td><code>NousResearch/hermes-agent</code>，描述 "The agent that grows with you"</td></tr><tr><td>许可</td><td><strong>MIT</strong>（<code>Copyright (c) 2025 Nous Research</code>）—— 可商用、可闭源分发</td></tr><tr><td>Star / Fork</td><td><strong>252,959 / 54,786</strong></td></tr><tr><td>语言 / 建仓 / 最后推送</td><td>Python（monorepo）/ 2025-07-22 / <strong>2026-10-12</strong></td></tr><tr><td>官网</td><td>https://hermes-agent.nousresearch.com （桌面下载页 <code>/desktop</code>）</td></tr><tr><td>桌面端</td><td><strong>官方 Electron</strong>，在 monorepo <code>apps/desktop</code>；macOS（Apple Silicon，Intel 需专门构建）/ Windows（MSIX）/ Linux（AppImage/deb/rpm）</td></tr><tr><td>维护方</td><td><strong>Nous Research 公司</strong>（非个人）；头部贡献者 teknium1（20,541 commits）</td></tr><tr><td>版本节奏</td><td>约 <strong>38 个 release</strong>，<strong>近乎每周一版</strong>；最新 <code>v0.21.7</code>（2026-10-12），<code>prerelease=false</code></td></tr></tbody></table></div>
+<h3>3.2 群聊机制（这是它最强的地方，原文核实）</h3>
+<p>Bot Mode 已是<strong>官方桌面端内置、默认开启</strong>的插件（Settings → Plugins 可切换），代码在 <code>apps/desktop/src/plugins/hermes-bots/</code>。README 原文（<code>Hermes-Bot-Mode</code>）：</p>
+<blockquote><strong>Group chats</strong> — hit <strong>Open chat</strong> on any group header (2-6 bots) for a shared room where the whole group coordinates. Your message triggers up to three serial rounds of member turns: @mentioned bots respond (everyone when nobody is mentioned), each bot replies briefly or passes, and the room settles when a full round stays silent. Bots pull each other in with @name, escalate real judgment calls with @user (the group header shows a <strong>needs you</strong> badge), and hard caps (10 messages per turn, 3 rounds) keep rooms from spinning. Each bot keeps its own persistent <code>Group: &lt;name&gt;</code> session, so room context survives like any other conversation.</blockquote>
+<p>拆解出五个<strong>产品级设计</strong>，这些恰好是你做"多 Agent 群聊"最难的部分，它已经解决了：</p>
+<ol><li><strong>Bots pane</strong>：左侧名册，一行一个 Agent（头像、最新消息预览、时间戳），右键可看该 bot 最近 200 条会话。</li><li><strong>Active now 在线状态条</strong>：显示当前在干活的 bot（gateway busy 的 + 90 秒内写过消息的），空闲时自动消失。<strong>这直接解决"看不出 Agent 在不在干活"的演示痛点。</strong></li><li><strong>发言预算与轮次上限</strong>：每轮最多 10 条消息、最多 3 轮，空轮即收敛。<strong>这是 Token 爆炸的工程解法</strong>（和 DS Bot 的"管理员 Bot 默认回复"是同一类思路，但更显式）。</li><li><strong>bot 互相拉人 + 升级给人</strong>：bot 可用 <code>@name</code> 把同伴拉进来；遇到真正需要判断的事用 <code>@user</code> 升级，群头部显示 <strong>needs you</strong> 徽章。<strong>这正好对应合规要求的"高风险动作人工确认"。</strong></li><li><strong>持久群会话</strong>：每个 bot 保留自己的 <code>Group: &lt;name&gt;</code> session，房间上下文像普通会话一样留存。</li></ol>
+<p><strong>代码有完整测试覆盖</strong>（<code>group-chat.ts</code>、<code>group-rounds.ts</code>、<code>group-turns.ts</code>、<code>relay.ts</code>、<code>group-presence.ts</code>、<code>group-membership.ts</code>、<code>roster-pane*.tsx</code> 等数十个模块 + 同名 <code>.test.ts</code>）——<strong>这不是 demo 级实现，是产品级实现。</strong></p>
+<h3>3.3 四条件核对（与 v1 同口径）</h3>
+<div class="tw"><table><thead><tr><th>条件</th><th>Hermes</th><th>证据</th></tr></thead><tbody><tr><td><strong>多 Agent</strong></td><td>✅ 强满足</td><td>Agent = profile，<code>~/.hermes/profiles/&lt;name&gt;/</code> 下<strong>独立 config / memory / skills / credentials / 聊天历史</strong>；每个可写自己的 <code>SOUL.md</code> 人设、可 pin 不同 provider/model。有协调者概念：Bot Mode 的编排、<code>role="orchestrator"</code> 子代理、<code>delegation.max_spawn_depth</code></td></tr><tr><td><strong>群聊/可视化</strong></td><td>✅ 强满足</td><td>见 3.2，官方内置、2–6 bot 同房间、@mention、presence 条、needs-you 徽章</td></tr><tr><td><strong>桌面 + 本地优先</strong></td><td>✅ 满足</td><td>数据在 <code>~/.hermes</code>，会话检索用 <strong>SQLite FTS5</strong>；本地模型支持 <strong>Ollama / LM Studio / vLLM / llama.cpp / LocalAI</strong>；国产模型 <strong>DeepSeek / Qwen(含 alibaba-cn) / GLM(zai) / Kimi / MiniMax-CN / 小米 MiMo</strong> 均为 first-class provider，<strong>BYO keys 无锁定</strong></td></tr><tr><td><strong>工作流 DAG / 模板 / 技能扩展</strong></td><td>⚠️ 部分满足</td><td><strong>无 DAG</strong>：官方文档明确 "Grouping controls result delivery, not execution order: all tasks still run in parallel"，需要依赖就顺序派发。<strong>有</strong>：Skills（兼容 <code>agentskills.io</code> 开放标准）、<strong>MCP 集成</strong>、插件目录、cron 定时任务、Kanban（含 per-task model override）。<strong>无"行业编队模板"市场</strong>——但 profile 可整体 Duplicate（克隆 config + skills + SOUL.md + memory），这正好是你编队模板的落地抓手</td></tr></tbody></table></div>
+<hr>
+<h2>四、五候选同口径对比</h2>
+<div class="tw"><table><thead><tr><th>维度</th><th><strong>Hermes（官方）</strong></th><th>DS Bot</th><th>OpenClaw 原生</th><th>Orkas</th><th>LobsterAI</th></tr></thead><tbody><tr><td>Star</td><td><strong>252,959</strong></td><td>1,133</td><td>391,744</td><td>2,166</td><td>6,107</td></tr><tr><td>许可</td><td>✅ <strong>MIT</strong></td><td>✅ Apache-2.0</td><td>✅ MIT</td><td>✅ MIT</td><td>✅ MIT</td></tr><tr><td>多 Agent</td><td>✅ profile+orchestrator</td><td>✅ Chief+bots</td><td>✅ bindings</td><td>✅ Commander+专家</td><td>⚠️ 隔离助手</td></tr><tr><td><strong>群聊 UI</strong></td><td>✅ <strong>内置 2–6 bot</strong></td><td>✅ 内置</td><td>⚠️ broadcast（experimental，走 IM 无桌面 UI）</td><td>✅ 核心模块</td><td>❌ <strong>无</strong></td></tr><tr><td>桌面端</td><td>✅ 官方 Electron</td><td>⚠️ 寄居 DSH 桌面</td><td>✅ 多端</td><td>✅ Electron</td><td>✅ Electron</td></tr><tr><td>本地优先</td><td>✅ SQLite FTS5</td><td>✅</td><td>✅</td><td>✅ SQLite</td><td>✅ SQLite</td></tr><tr><td>中文</td><td>✅ <strong>官方 zh + 社区</strong></td><td>✅</td><td>⚠️</td><td>❌</td><td>✅</td></tr><tr><td>维护方</td><td><strong>公司</strong>（Nous）</td><td>个人 + AI bot</td><td>基金会</td><td>单人主导</td><td>公司（网易）</td></tr><tr><td>版本节奏</td><td>每周一版</td><td>5 天新仓</td><td>快</td><td>中</td><td>每日</td></tr><tr><td><strong>churn 风险</strong></td><td>⚠️ 高（见下）</td><td>⚠️ 极高（宿主 alpha）</td><td>中</td><td>低</td><td>中</td></tr><tr><td>DAG</td><td>❌</td><td>❌</td><td>⚠️</td><td>⚠️</td><td>❌</td></tr><tr><td>模型锁定</td><td>✅ BYO keys</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr><tr><td><strong>综合</strong></td><td><strong>🥇 4/5</strong></td><td>2/5</td><td>4/5</td><td>3/5</td><td>2/5（群聊缺失）</td></tr></tbody></table></div>
+<h3>关于 Hermes 的 churn 风险（必须知道，但不必恐慌）</h3>
+<p>我实测了 issue 口径：<strong>open issue 15,104 + open PR 32,924</strong>（GitHub 的 <code>open_issues_count</code> 显示 48,031 是两者之和）。这个数字很大，但要注意它的性质——从标题看绝大多数是 <code>fix(...)</code>/<code>feat(...)</code> 形式的<strong>开发 PR</strong>，说明这是<strong>极高强度的开发仓库</strong>（teknium1 一人 2 万次提交、大量自动化 PR），不是"积压了 4.8 万个 bug"。</p>
+<p><strong>对比参照：</strong> OpenClaw open issues 9,543、Orkas 仅 11、DSH 0。</p>
+<p><strong>结论：</strong> Hermes 的成熟度是"功能强 + 迭代猛"，不是"功能弱 + 没人管"。<strong>应对方法就是 pin 一个 tag</strong>（如 <code>v0.21.7</code>），别跟着 main 跑。</p>
+<hr>
+<h2>五、修正后的推荐</h2>
+<h3>🥇 首选：Hermes 官方 MIT 版（Demo + 产品共用一套）</h3>
+<p><strong>为什么它取代了 v1 的双轨方案：</strong></p>
+<ol><li><strong>群聊开箱即用</strong>，且是产品级实现（有测试、有 presence、有轮次预算、有 needs-you 升级）——<strong>录 3 分钟视频基本不用自己写 UI</strong>，这一点和 DS Bot 一样省事，但成熟度高一档。</li><li><strong>MIT + 公司维护</strong>，可以放心做商业产品，不像 DS Bot 那样绑在一个 alpha 宿主上。</li><li><strong>原生中文</strong>（官方文档 + UI 语言切换 + 社区站），你的目标用户是国内个体/小商家。</li><li><strong>BYO keys + 国产模型 first-class</strong>，边际成本≈0 的模式天然成立。</li><li><strong>你已经用过它</strong>——学习成本已经付过了，这是别人没有的起跑优势。</li></ol>
+<p><strong>你要自己补的（和 v1 结论一致）：</strong></p>
+<ul><li><strong>行业编队模板层</strong>：Hermes 没有"编队模板市场"，但 profile 可整体 Duplicate。把"跨境电商选品四人组"做成<strong>一套 profile 包 + SOUL.md + skills</strong>，用你自己的 YAML/JSON 描述，可一键重建。<strong>这是你唯一守得住的东西。</strong></li><li><strong>DAG/流程可视化</strong>（可选）：群聊是"轮次驱动"不是"图驱动"。如果演示需要流程图，得自建。</li><li><strong>成本与权限面板</strong>：把 Token/耗时/失败做成看板（Hermes 有 per-task model override，可挂在此之上）。</li></ul>
+<p><strong>立刻要做的动作：</strong></p>
+<ol><li><strong>pin 版本</strong>：<code>git checkout v0.21.7</code> 或锁住当前 tag，别跟 main。</li><li><strong>确认你用的是官方 MIT 版，不是 CN 桌面版</strong>（见第二节警告）。</li><li>装好后直接开 Bot Mode，建 2–3 个 bot 开一个群，<strong>验证 2–6 bot 群聊在你的机器上跑得动</strong>，然后就能录第一版视频了。</li></ol>
+<h3>🥈 备选：OpenClaw 原生（若 Hermes 的 churn 变成实际困扰）</h3>
+<p>MIT、391k★、稳定；<code>broadcast-groups</code> 与 <code>multi-agent routing</code> 是已有原语（虽 experimental）。代价是<strong>群聊 UI 要自己从零做</strong>（OpenClaw 有原语无桌面群聊界面）。适合你后期想完全掌控产品形态时用。</p>
+<h3>🥉 备选：fork Orkas（若你想最快拿到"可改造的群聊产品"）</h3>
+<p>MIT、2,166★、open issues 仅 11、群聊是核心模块。适合你想直接改一个现成群聊产品而非用 Hermes 的形态。</p>
+<h3>降级 / 排除</h3>
+<div class="tw"><table><thead><tr><th>项目</th><th>结论</th></tr></thead><tbody><tr><td><strong>DS Bot</strong></td><td><strong>降级为不必需</strong>。Hermes Bot Mode 做同样的事且更成熟。除非你想蹭"DeepSeek Bot"这个热点词做内容，否则不必绕这一道</td></tr><tr><td><strong>LobsterAI</strong></td><td><strong>仍排除</strong>：无群聊（官方 spec 原文"用户期望 A2A 群聊 → 本功能不覆盖"），与网易官方团队版对撞，IP 叙事降级</td></tr><tr><td><strong>cc-haha</strong></td><td><strong>仍排除</strong>：<code>package.json</code> name = <code>claude-code-local</code>、引用 <code>USER_TYPE==='ant'</code>，是对 Claude 的逆向分发，法律来源不清</td></tr><tr><td><strong>ekko-studio</strong></td><td><strong>仍排除</strong>：BSL 1.1，商业使用需单独授权</td></tr><tr><td><strong>AgentTeams</strong></td><td><strong>仍排除</strong>：需 Docker + 2C4G + 浏览器，非桌面端</td></tr><tr><td><strong>AionUi</strong></td><td><strong>暂缓</strong>：主仓库自 2026-09-09 停更 5 周（后端 AionCore 仍活跃，疑似迁移），fork 前需确认发布模式</td></tr><tr><td><strong>Hermes CN Desktop</strong></td><td><strong>仅限非商用</strong>：PolyForm Noncommercial，商用需青岛万德缦思单独授权</td></tr></tbody></table></div>
+<hr>
+<h2>六、无论选哪个，三件事不变（v1 结论保留）</h2>
+<ol><li><strong>编队模板存成底座无关的 YAML/JSON</strong>，不要用任何一家的原生格式。Hermes 的 profile、DS Bot 的数据格式、DSH 的配置都会变——<strong>你的"行业编队 Know-how"必须能一键迁移到任何底座。</strong></li><li><strong>编排层抽象成可替换接口</strong>：</li></ol>
+<pre class="code"><code>   AgentRuntime（可替换：Hermes / OpenClaw / DSH）
+     spawn(role, {model, tools, workspace, memoryScope}) -&gt; AgentHandle
+     send(handle, message) / events(handle) -&gt; Stream&lt;...&gt;
+     approve(handle, requestId, decision) / cancel(handle)
+     capabilities() -&gt; {acp?, mcp?, sandbox?, subagents?, groupChat?}
+   TeamOrchestrator（你的差异化层）
+     plan(goal) / delegate / mailbox / taskBoard / sharedMemory / roundPolicy
+   TeamStore（本地 SQLite）
+     teams / members / tasks / messages / runs / artifacts</code></pre>
+<p>Hermes 的群聊原语比 DSH 丰富（有轮次、presence、升级机制），所以 Hermes 侧编排层可以更薄。</p>
+<ol><li><strong>第一天做 go/no-go</strong>，但验证清单换成 Hermes 版：</li></ol>
+<ul><li>装官方桌面端，pin <code>v0.21.7</code></li><li>建 3 个 bot（主管 + 写手 + 分析师），配 DeepSeek/Qwen 的 Key</li><li>开一个群，测：@mention 是否触发指定 bot、bot 之间能否 <code>@name</code> 互相拉人、<code>@user</code> 是否出现 needs-you 徽章、轮次上限是否生效</li><li>跑一个真实任务（如"给我一份竞品分析"），看能否收敛并汇总</li></ul>
+<hr>
+<h2>七、一句话回答</h2>
+<blockquote><strong>Hermes（官方 MIT 版）现在是首选，Demo 和产品共用一套——它唯一同时满足"多 Agent + 群聊 UI + 桌面 + 本地优先"，还是 MIT、公司维护、原生中文，而且你已经用过。</strong><br><br><strong>DS Bot 不必绕了；LobsterAI 仍排除；OpenClaw 和 Orkas 留作备选。</strong><br><br><strong>一个硬提醒：先确认你用的是官方 MIT 版，不是 CN 桌面版——后者是 PolyForm Noncommercial，商用要单独授权。</strong></blockquote>
+</div></body></html>
