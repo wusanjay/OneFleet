@@ -91,7 +91,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   },
   // DeepSeek direct (not in pi-ai 0.68.1; routed through the
   // openai-completions adapter in external-providers.ts).
-  { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys' },
+  { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys',                     region: 'cn' },
 
   { id: 'openai-codex', label: 'OpenAI Codex',  oauthOnly: true },
   { id: 'openai',       label: 'OpenAI',        docsUrl: 'https://platform.openai.com/api-keys' },
@@ -617,6 +617,11 @@ export const VISIBLE_PROVIDERS: readonly string[] = CATALOG
 /** Ordered index map for sorting. */
 const CATALOG_ORDER = new Map<string, number>(CATALOG.map((p, i) => [p.id, i]));
 
+/** OneFleet: provider → region（'cn' = 主端点在国内，可直连）。 */
+const PROVIDER_REGION = new Map<string, string>(
+  CATALOG.filter((p) => p.region).map((p) => [p.id, p.region]),
+);
+
 export function isVisibleProvider(id: string): boolean {
   return CATALOG_ORDER.has(id);
 }
@@ -802,6 +807,11 @@ export function findImageGenCapability(providerId: string): ImageGenCapability |
  */
 export function sortProviderIds(ids: string[]): string[] {
   return [...ids].sort((a, b) => {
+    // OneFleet: cn 区供应商置顶（组内保持 CATALOG 顺序），国内用户
+    // 打开下拉第一屏就是可直连的服务商。
+    const ca = PROVIDER_REGION.get(a) === 'cn' ? 0 : 1;
+    const cb = PROVIDER_REGION.get(b) === 'cn' ? 0 : 1;
+    if (ca !== cb) return ca - cb;
     const ra = CATALOG_ORDER.has(a) ? (CATALOG_ORDER.get(a) as number) : 1000;
     const rb = CATALOG_ORDER.has(b) ? (CATALOG_ORDER.get(b) as number) : 1000;
     if (ra !== rb) return ra - rb;

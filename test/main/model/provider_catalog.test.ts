@@ -48,8 +48,11 @@ describe('provider_catalog › CATALOG', () => {
     ]);
   });
 
-  it('has VISIBLE_PROVIDERS derived from CATALOG order', () => {
-    expect([...VISIBLE_PROVIDERS]).toEqual(CATALOG.map((p) => p.id));
+  it('derives VISIBLE_PROVIDERS from CATALOG minus fork-unavailable services', () => {
+    expect([...VISIBLE_PROVIDERS]).toEqual(
+      CATALOG.map((p) => p.id).filter((id) => id !== 'orkas-api'),
+    );
+    expect(VISIBLE_PROVIDERS).not.toContain('orkas-api');
   });
 
   it('excludes oauthOnly entries from FEATURED_API_PROVIDERS (API-key docs list)', () => {
@@ -65,6 +68,7 @@ describe('provider_catalog › CATALOG', () => {
   it('tags Chinese providers with region=cn', () => {
     const cnIds = CATALOG.filter((p) => p.region === 'cn').map((p) => p.id);
     expect(cnIds).toEqual([
+      'deepseek',
       'zai',
       'moonshot',
       'kimi-coding',
@@ -544,12 +548,15 @@ describe('provider_catalog › isVisibleProvider / sortProviderIds', () => {
     expect(isVisibleProvider('minimax')).toBe(false); // only minimax-cn is visible
   });
 
-  it('sortProviderIds puts CATALOG ids first in CATALOG order, orphans last alphabetically', () => {
+  it('sortProviderIds puts cn-region providers on top, then CATALOG order, orphans last', () => {
     const input = ['minimax', 'huggingface', 'openrouter', 'anthropic', 'zai'];
     expect(sortProviderIds(input)).toEqual([
-      'anthropic',
+      // cn 区置顶（组内保持 CATALOG 顺序，OneFleet fork gate）
       'zai',
+      // 非 cn 保持 CATALOG 顺序
+      'anthropic',
       'openrouter',
+      // orphans 最后，字母序
       'huggingface',
       'minimax',
     ]);
