@@ -331,5 +331,22 @@
   "license": "MIT",
   "engines": {
     "node": ">=22.12.0"
-  }
+  },
+  "author": "Jayden <wusj007@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jayswu/OneFleet.git"
+  },
+  "homepage": "https://github.com/jayswu/OneFleet#readme",
+  "bugs": {
+    "url": "https://github.com/jayswu/OneFleet/issues"
+  },
+  "keywords": [
+    "multi-agent",
+    "ai-fleet",
+    "wechat",
+    "local-first",
+    "electron",
+    "fleet-templates"
+  ]
 }
