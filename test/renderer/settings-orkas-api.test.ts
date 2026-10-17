@@ -146,37 +146,17 @@ describe('Orkas public API quick setup', () => {
     expect(css).toContain('.settings-orkas-api-actions');
   });
 
-  it('uses the complete Orkas service labels in pickers and configured rows', () => {
-    const { context, elements, source } = loadQuickSetupHarness();
+  it('keeps orkas-api entries out of every purpose picker (OneFleet fork gate)', () => {
+    const { context, source } = loadQuickSetupHarness();
     expect(source).not.toContain("label: 'Orkas API'");
-    expect(vm.runInContext("_SEARCH_PROVIDER_OPTIONS.find((p) => p.id === 'orkas-api').label", context))
-      .toBe('Orkas · Search');
-    expect(vm.runInContext("_IMAGE_PROVIDER_OPTIONS.find((p) => p.id === 'orkas-api').label", context))
-      .toBe('Orkas · Image');
-    expect(vm.runInContext("_VIDEO_AUTH_PROVIDER_OPTIONS.find((p) => p.id === 'orkas-api').label", context))
-      .toBe('Orkas · Video');
-    expect(vm.runInContext("_ttsProviderLabel('orkas-api')", context)).toBe('Orkas · Voice');
-
-    vm.runInContext(`
-      _settingsAttachReorderDnd = () => {};
-      _settingsState.searchProfiles = [{ id: 's1', provider: 'orkas-api', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
-      _settingsState.imageProfiles = [{ id: 'i1', provider: 'orkas-api', model: 'orkas-image', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
-      _settingsState.videoProfiles = [{ id: 'v1', provider: 'orkas-api', model: 'orkas-video', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
-      _settingsState.ttsProfiles = [{ id: 't1', provider: 'orkas-api', model: 'orkas-tts-1', label: 'Orkas', apiKeyMasked: 'sk-…1' }];
-      _settingsRenderSearchEntries();
-      _settingsRenderImageEntries();
-      _settingsRenderVideoEntries();
-      _settingsRenderTtsEntries();
-    `, context);
-
-    const configuredLabel = (id: string) => elements.get(id)!
-      .children[0]!.children[1]!.children[0]!.innerHTML;
-    expect(configuredLabel('settings-search-entries')).toContain('>Orkas · Search</span>');
-    expect(configuredLabel('settings-image-entries')).toContain('>Orkas · Image</span>');
-    expect(configuredLabel('settings-video-entries')).toContain('>Orkas · Video</span>');
-    expect(configuredLabel('settings-tts-entries')).toContain('>Orkas · Voice</span>');
-    expect(source).toContain('settings.orkas_api.recommended');
-    expect(source).toContain('settings.orkas_api.includes');
+    // 上游托管服务（orkas-api）未随 fork 提供：对话/搜索/图片/视频面板的
+    // 可选列表都不得再出现该入口（对话面板由主进程 VISIBLE_PROVIDERS 把关）。
+    for (const list of ['_SEARCH_PROVIDER_OPTIONS', '_IMAGE_PROVIDER_OPTIONS', '_VIDEO_AUTH_PROVIDER_OPTIONS']) {
+      expect(vm.runInContext(`${list}.some((p) => p.id === 'orkas-api')`, context)).toBe(false);
+    }
+    // 历史回显兜底退化为裸 id，而不是冒充一个可配置的服务名。
+    expect(vm.runInContext(`_ttsProviderLabel('orkas-api')`, context)).toBe('orkas-api');
+    expect(vm.runInContext(`_searchProviderLabel('orkas-api')`, context)).toBe('orkas-api');
   });
 
   it('renders both configured official model rows in Settings', () => {

@@ -73,6 +73,7 @@ import {
   OAUTH_ALIAS_FOR,
   VISIBLE_PROVIDERS,
   EXTERNAL_API_PROVIDERS,
+  FORK_UNAVAILABLE_PROVIDERS,
   isVisibleProvider,
   curatedModelsFor,
   isSelectableModel,
@@ -1289,7 +1290,9 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     if (!byProvider.has(alias)) visible.delete(alias);
   }
 
-  const sorted = sortProviderIds([...visible].filter((id) => isModelProviderAllowed(id)));
+  const sorted = sortProviderIds([...visible].filter((id) => isModelProviderAllowed(id)))
+    // OneFleet: 即使本地残留 orkas-api 的已存 profile，也不让它回到可选列表。
+    .filter((id) => !FORK_UNAVAILABLE_PROVIDERS.includes(id));
   const featuredIds = new Set(FEATURED_API_PROVIDERS.map((p) => p.id));
   // Provider-is-known-to-pi-ai check so we don't advertise API-key support
   // for an id that pi-ai can't build a client for. When core-agent is

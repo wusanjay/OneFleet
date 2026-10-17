@@ -1416,7 +1416,9 @@
                   <p data-i18n="settings.models.page_sub">按用途配置服务，设置默认模型与备用顺序。</p>
                 </header>
 
-                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
+                <!-- OneFleet fork gate: 上游 Orkas 托管 API Key 卡片未随 fork 提供（无
+                     orkas.ai 服务端），整卡隐藏；保留 DOM 以降低上游合并成本。 -->
+                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group" hidden>
                   <div class="settings-group-head settings-orkas-api-head">
                     <div class="settings-group-head-main">
                       <div class="settings-group-title" data-i18n="settings.orkas_api.title">OneFleet API Key</div>

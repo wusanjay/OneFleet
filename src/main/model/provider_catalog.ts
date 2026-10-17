@@ -601,8 +601,18 @@ export const EXTRA_LABELS: Readonly<Record<string, string>> = {
 
 // ── Derived exports (back-compat with auth.ts) ──────────────────────────
 
+/**
+ * OneFleet fork gate: 上游 CATALOG 里的 Orkas 托管服务（orkas-api，按积分
+ * 计费的官方模型/搜索/媒体后端）未随 fork 提供——OneFleet 没有这套服务端，
+ * 保留入口只会让用户配一个永远无法生效的 key。不进任何用户可选列表。
+ * 上游合并时保留本段；勿把 orkas-api 加回用户可见集合。
+ */
+export const FORK_UNAVAILABLE_PROVIDERS: readonly string[] = [ORKAS_API_PROVIDER];
+
 /** Providers shown in the settings dropdown, in display order. */
-export const VISIBLE_PROVIDERS: readonly string[] = CATALOG.map((p) => p.id);
+export const VISIBLE_PROVIDERS: readonly string[] = CATALOG
+  .map((p) => p.id)
+  .filter((id) => !FORK_UNAVAILABLE_PROVIDERS.includes(id));
 
 /** Ordered index map for sorting. */
 const CATALOG_ORDER = new Map<string, number>(CATALOG.map((p, i) => [p.id, i]));
@@ -640,6 +650,7 @@ export interface ProviderMeta {
  */
 export const FEATURED_API_PROVIDERS: readonly ProviderMeta[] = CATALOG
   .filter((p) => !p.oauthOnly && p.docsUrl)
+  .filter((p) => !FORK_UNAVAILABLE_PROVIDERS.includes(p.id))
   .map((p) => ({ id: p.id, label: p.label, docsUrl: p.docsUrl }));
 
 /**

@@ -85,7 +85,9 @@ describe('video auth profiles', () => {
     expect(listVideoProfiles().map((profile) => profile.id)).toEqual([first.id]);
   });
 
-  it('exposes the concrete open-source video model in the picker', () => {
+  it('keeps the orkas-api provider out of the runtime picker (OneFleet fork gate)', () => {
+    // flatten 本身是通用纯函数（对历史 profile 的回显仍有效），
+    // 但用户可选列表必须为空——上游唯一的视频 provider 是托管 orkas 服务。
     const options = flattenVideoProviderOptions([
       { id: 'orkas-api', label: 'Orkas' },
       { id: 'doubao', label: 'DouBao' },
@@ -98,7 +100,7 @@ describe('video auth profiles', () => {
       label: 'Orkas · Video',
     });
     expect(options).toHaveLength(1);
-    expect(listVideoProviderOptions().map((option) => option.id)).toEqual(['orkas-api']);
+    expect(listVideoProviderOptions()).toEqual([]);
   });
 });
 

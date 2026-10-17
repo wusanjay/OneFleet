@@ -147,7 +147,8 @@ export interface ImageProviderPickerOption {
 
 export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
-    { id: 'orkas-api', label: 'OneFleet · Image', docs: ORKAS_API_KEYS_URL },
+    // orkas-api 项已移除（OneFleet fork gate）：上游托管图片服务未随 fork
+    // 提供，保留入口会把用户 key 发往 orkas.ai 且永远无法生效。
     { id: 'openai', label: 'OpenAI', docs: 'https://platform.openai.com/api-keys' },
     { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
     {

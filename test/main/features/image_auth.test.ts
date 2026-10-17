@@ -193,9 +193,7 @@ describe('image auth profiles', () => {
     ]);
   });
 
-  it('labels the official picker option with its concrete service', () => {
-    expect(listImageProviderOptions().find((option) => option.id === 'orkas-api')).toMatchObject({
-      label: 'Orkas · Image',
-    });
+  it('keeps the orkas-api provider out of the picker (OneFleet fork gate)', () => {
+    expect(listImageProviderOptions().some((option) => option.id === 'orkas-api')).toBe(false);
   });
 });

@@ -2404,7 +2404,7 @@ function _settingsOrkasServiceLabel(service) {
 }
 
 const _SEARCH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api',          label: _settingsOrkasServiceLabel('Search'), docs: _ORKAS_API_KEYS_URL },
+  // orkas-api 项已移除（OneFleet fork gate，同 provider_catalog.ts）。
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
@@ -2548,7 +2548,7 @@ function _settingsRenderSearchEntries() {
 // still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
+  // orkas-api 项已移除（OneFleet fork gate，同 image_auth.ts）。
   { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
   { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
   { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
@@ -2693,7 +2693,8 @@ function _settingsRenderImageEntries() {
 // User-owned provider keys only; bundled video providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
+  // orkas-api 项已移除（OneFleet fork gate，同 video_auth.ts）；
+  // 运行时列表也返回空，视频面板呈现空下拉。
 ];
 
 function _settingsVideoProviderOptions() {
@@ -2892,7 +2893,7 @@ function _settingsTtsPreset(providerId) {
 }
 
 function _ttsProviderLabel(id) {
-  if (id === _ORKAS_API_PROVIDER_ID || id === 'orkas-voice') return _settingsOrkasServiceLabel('Voice');
+  // orkas-api 特判已移除（OneFleet fork gate）：历史 profile 回显退化为裸 id。
   const hit = (_settingsState.ttsPresets || []).find((p) => p.id === id);
   return hit ? hit.label : (id || 'custom');
 }

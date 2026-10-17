@@ -100,9 +100,9 @@ describe('auth › FEATURED_PROVIDERS', () => {
     // DeepSeek 直连先（pi-ai 不带，自建适配）→ 全球前沿 OpenAI / Google /
     // Anthropic（去掉 oauthOnly 的 OpenAI Codex）→ CN 主流（Zhipu / Moonshot
     // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
-    // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
+    // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项，
+    // OneFleet fork 再减去未随 fork 提供的 orkas-api 托管服务）。
     expect(a.FEATURED_PROVIDERS).toEqual([
-      'orkas-api',
       'deepseek',
       'openai',
       'google',

@@ -101,13 +101,9 @@ export function reorderVideoProfiles(orderedIds: string[]): { ok: boolean } {
 }
 
 export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
-  return [
-    {
-      id: ORKAS_API_PROVIDER,
-      label: 'OneFleet',
-      docs: ORKAS_API_KEYS_URL,
-    },
-  ];
+  // OneFleet fork gate: 上游唯一的视频 provider 是 orkas-api（托管积分服务），
+  // 未随 fork 提供，返回空列表让视频面板显示空下拉，而不是一个配了也无效的入口。
+  return [];
 }
 
 export function listVideoModelOptions(provider: string): Array<{ id: string; name: string }> {
