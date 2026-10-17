@@ -58,7 +58,14 @@ async function updateAccount(uid: string, patch: Partial<ChannelAccount> & { cha
 export async function disconnect(uid: string, channel: ChannelId = 'weixin'): Promise<void> {
   stopLoop(uid, channel);
   const file = await readFile(uid);
-  file.accounts = file.accounts.filter((a) => a.channel !== channel);
+  const idx = file.accounts.findIndex((a) => a.channel === channel);
+  if (idx >= 0) {
+    // 只失效凭据，保留绑定（botId/agentId/cid）：重扫登录经 updateAccount 合并后
+    // 复用原 DM 会话。bot_id 重扫即变（渠道侧新 bot），但 cid/agentId 是
+    // OneFleet 内部身份，跨重扫连续；token 置空 + enabled=false 表示待重扫。
+    file.accounts[idx] = { ...file.accounts[idx], token: '', enabled: false };
+  }
+  // 游标属于旧 bot 的消息流，重扫后是新 bot_id 的新流，必须重置防跳消息。
   delete file.cursors[channel];
   await writeFile(uid, file);
 }

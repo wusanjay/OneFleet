@@ -386,7 +386,7 @@
     const empty = document.getElementById('remote-view-convos-empty');
     if (!wrap) return;
     wrap.innerHTML = '';
-    const agentId = st && st.account && st.account.agentId;
+    const agentId = st && st.connected && st.account && st.account.agentId;
     if (!agentId) { if (empty) empty.style.display = ''; return; }
     try {
       const res = await window.orkas.invoke('conversations.list', {});

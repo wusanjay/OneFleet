@@ -37,16 +37,16 @@
 - rebrand（93b052f）：productName OneFleet、新章鱼图标、容器 ~/.onefleet 迁移、打包 cjs 修复
 - 发布产物：arm64 DMG + ZIP（含微信渠道），打包版验收通过（菜单栏 OneFleet、循环自启、数据与源码版共享）
 - 录像分镜脚本：docs/research/OneFleet-发布视频分镜.md
+- 重连保留绑定：disconnect 只失效凭据（token 空 + enabled=false），保留 botId/agentId/cid；重扫经 updateAccount 合并复用原 DM（游标随断开重置防跳消息）。单测 test/main/features/channels-reconnect.test.ts
 
 ### 待办（按优先级）
 1. 录发布视频（分镜已备；注意先扫码、勿中途重连）
 2. 转 public + GitHub Release（挂 dist 产物）+ 三平台同名账号
-3. 重连保留绑定：disconnect 时保留 agentId/cid 只清 token，重扫后复用原 DM（当前断开会清掉绑定，产生死会话）
-4. 成本面板按 actor 归因（W5 遗留，需 runner→AgentRunner 线程穿透）
-5. 员工卡片聚合（每机器人的成本/例程/交付物）
-6. 渠道矩阵：飞书 / Telegram adapter
-7. 打包 x64 target（曾时间盒止损：ensure-runtime darwin-x64 失败链）
-8. 微信群聊能力实测（协议有 chatType:group 字段，能力面未知）
+3. 成本面板按 actor 归因（W5 遗留，需 runner→AgentRunner 线程穿透）
+4. 员工卡片聚合（每机器人的成本/例程/交付物）
+5. 渠道矩阵：飞书 / Telegram adapter
+6. 打包 x64 target（曾时间盒止损：ensure-runtime darwin-x64 失败链）
+7. 微信群聊能力实测（协议有 chatType:group 字段，能力面未知）
 
 ### 已知坑速查（详见 AGENTS.md 陷阱清单）
 打包清 runtime / forceCodeSigning / CDP 加固 / 单实例锁顶替 / bot_id 变更 / CSS flex 覆盖 hidden / createCustomAgent 顶层选项 / zai→CN 别名。
