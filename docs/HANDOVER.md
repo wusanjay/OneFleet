@@ -27,6 +27,7 @@
 | 内部保留 `ORKAS_*` 命名 | 上游合并成本是硬约束。只改了 productName/图标/容器目录（~/.onefleet，一次性迁移） |
 | 渠道抽象 `ChannelAdapter` | 必选方法压到最少（beginLogin/pollLogin/test/pollInbound/sendText），能力差异用可选方法表达。参考 ZCode BotProviderAdapter。飞书/Telegram 未来各几百行 |
 | 微信回复用普通文本 | iLink 渠道只支持文本粒度（streaming card 是飞书专属）；typing 用 `/sendtyping` 每 5s 续期（状态自动过期） |
+| **主动推送官方支持**（实测 2026-10-17） | 三组对照全达：无 context_token 也可主动发（bot_token + to_user_id 即可）；前提是会话已激活（用户首条消息）。ZCode 亦把 weixin 列为自动化投递目标。待实现 `channels.pushText`（定时任务/进度汇报推微信） |
 
 ## 三、状态账本
 
@@ -47,6 +48,7 @@
 5. 渠道矩阵：飞书 / Telegram adapter
 6. 打包 x64 target（曾时间盒止损：ensure-runtime darwin-x64 失败链）
 7. 微信群聊能力实测（协议有 chatType:group 字段，能力面未知）
+9. `channels.pushText`：定时任务完成/成本里程碑 → 主动推微信（协议已实测可行，见决策表）
 
 ### 已知坑速查（详见 AGENTS.md 陷阱清单）
 打包清 runtime / forceCodeSigning / CDP 加固 / 单实例锁顶替 / bot_id 变更 / CSS flex 覆盖 hidden / createCustomAgent 顶层选项 / zai→CN 别名。
