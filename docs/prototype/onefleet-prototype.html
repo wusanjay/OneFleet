@@ -1,0 +1,1888 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OneFleet 交互原型（评审用 · 数据为模拟）</title>
+<!--
+  OneFleet 单文件交互原型 — 完全复刻 2026-10-17 已实现功能，供一次性收集修改意见。
+  视觉规格取自 src/renderer/style.css 设计 token；结构与文案对齐 src/renderer/index.html。
+  图标为真实资源内嵌：logo.png / wechat.svg（src/resources/icons/）。
+  所有数据为模拟；模型调用/微信协议为演示模拟，不代表真实链路。
+-->
+<style>
+:root{
+  --bg:#f7f9fc; --surface:#ffffff; --surface-2:#eef1f8; --surface-3:#dfe3ee;
+  --card:rgba(255,255,255,.95);
+  --text:#161a26; --text-2:#4a5163; --muted:#7e8597;
+  --border:rgba(28,45,89,.07); --border-strong:rgba(28,45,89,.14);
+  --primary:#5b57d6; --primary-hover:#4945c0; --primary-soft:#e8e8fe; --primary-text:#4945c0;
+  --success:#16a34a; --success-text:#15803d; --success-soft:#dcfce7;
+  --warn:#d97706; --warn-text:#b45309;
+  --danger:#dc2626; --danger-hover:#b91c1c;
+  --wechat:#22c560;
+  --radius-lg:20px; --radius-md:14px; --radius-sm:10px;
+  --shadow:0 8px 30px rgba(28,45,89,.10);
+  --shadow-sm:0 2px 10px rgba(28,45,89,.07);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--text);font-size:14px;overflow:hidden;
+}
+button{font-family:inherit;border:none;background:none;cursor:pointer;color:inherit}
+input,select{font-family:inherit;font-size:inherit;color:inherit}
+.hidden{display:none!important}
+
+/* ── 评审横幅 ─────────────────────────────── */
+.proto-banner{
+  position:fixed;top:0;left:0;right:0;z-index:999;height:26px;
+  background:linear-gradient(90deg,#161a26,#4945c0);color:#fff;
+  font-size:11px;display:flex;align-items:center;justify-content:center;gap:14px;
+  letter-spacing:.5px;
+}
+.proto-banner b{font-weight:600}
+.app-container{display:flex;height:100%;padding-top:26px}
+
+/* ── Rail（图标导航栏）────────────────────── */
+.rail{
+  width:64px;flex:0 0 64px;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:2px;
+}
+.rail-logo{width:34px;height:34px;margin-bottom:14px;border-radius:10px;overflow:hidden;
+  box-shadow:var(--shadow-sm)}
+.rail-logo img{width:34px;height:34px;display:block}
+.rail-btn{
+  width:52px;padding:8px 0 6px;border-radius:var(--radius-sm);
+  display:flex;flex-direction:column;align-items:center;gap:3px;
+  color:var(--muted);position:relative;transition:background .15s,color .15s;
+}
+.rail-btn:hover{background:var(--surface-2);color:var(--text-2)}
+.rail-btn.active{background:var(--primary-soft);color:var(--primary-text)}
+.rail-btn svg{width:19px;height:19px}
+.rail-btn .rail-icon-brand{width:19px;height:19px;display:block}
+.rail-label{font-size:10px;line-height:1}
+.rail-spacer{flex:1}
+.rail-badge{position:absolute;top:5px;right:10px;min-width:15px;height:15px;border-radius:8px;
+  background:var(--danger);color:#fff;font-size:9px;display:flex;align-items:center;justify-content:center;padding:0 4px}
+
+/* ── Midbar（中栏）────────────────────────── */
+.midbar{width:262px;flex:0 0 262px;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden}
+.midbar-header{padding:14px 14px 8px}
+.midbar-title{font-size:16px;font-weight:700}
+.midbar-filter{display:flex;gap:6px;margin-top:10px}
+.midbar-filter button{
+  padding:4px 12px;border-radius:999px;font-size:12px;color:var(--text-2);background:var(--surface-2);
+}
+.midbar-filter button.active{background:var(--primary);color:#fff;font-weight:500}
+.midbar-add{position:absolute;top:16px;right:14px;font-size:18px;color:var(--muted);width:26px;height:26px;
+  border-radius:8px}
+.midbar-add:hover{background:var(--surface-2);color:var(--text)}
+.midbar-header{position:relative}
+.midbar-body{flex:1;overflow-y:auto;padding:6px 8px 12px}
+.section-label{font-size:11px;color:var(--muted);padding:10px 8px 4px;display:flex;align-items:center;gap:6px}
+.conv-row{
+  width:100%;text-align:left;display:flex;gap:10px;align-items:center;
+  padding:9px 10px;border-radius:var(--radius-sm);
+}
+.conv-row:hover{background:var(--surface-2)}
+.conv-row.active{background:var(--primary-soft)}
+.conv-avatar{width:34px;height:34px;border-radius:10px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;font-size:17px;background:var(--surface-3)}
+.conv-main{flex:1;min-width:0}
+.conv-name{font-size:13px;font-weight:500;display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-preview{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-time{font-size:10px;color:var(--muted);flex:0 0 auto}
+.chip{font-size:9px;padding:1px 6px;border-radius:6px;background:var(--surface-3);color:var(--text-2);flex:0 0 auto}
+.chip.running{background:var(--primary-soft);color:var(--primary-text)}
+.chip.bot{background:#e6f7ee;color:var(--success-text)}
+.chip.ok{background:var(--success-soft);color:var(--success-text)}
+.chip.warn{background:#fef3c7;color:var(--warn-text)}
+.conv-empty{font-size:12px;color:var(--muted);text-align:center;padding:32px 16px;line-height:1.8}
+
+/* 编队卡 */
+.fleet-card{width:100%;text-align:left;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-md);padding:12px;margin-bottom:8px;transition:border-color .15s, box-shadow .15s}
+.fleet-card:hover{border-color:var(--primary);box-shadow:var(--shadow-sm)}
+.fleet-card-name{font-size:13px;font-weight:600;display:block}
+.fleet-card-meta{font-size:11px;color:var(--muted);margin-top:4px;display:block}
+.midbar-fleets-import{width:100%;padding:9px;border-radius:var(--radius-sm);border:1px dashed var(--border-strong);
+  color:var(--text-2);font-size:12px;margin-bottom:10px}
+.midbar-fleets-import:hover{border-color:var(--primary);color:var(--primary-text)}
+.employees-hint{font-size:11px;color:var(--muted);padding:8px 8px 6px;line-height:1.5}
+.employee-row{width:100%;display:flex;gap:10px;align-items:center;text-align:left;
+  padding:9px 10px;border-radius:var(--radius-sm)}
+.employee-row:hover{background:var(--surface-2)}
+.employee-avatar{width:34px;height:34px;border-radius:10px;background:var(--surface-3);display:flex;align-items:center;justify-content:center;font-size:17px;position:relative}
+.employee-main{flex:1;min-width:0}
+.employee-name{font-size:13px;font-weight:500;display:flex;gap:6px;align-items:center}
+.employee-fleet{font-size:9px;padding:1px 6px;border-radius:6px;background:var(--primary-soft);color:var(--primary-text)}
+.employee-role{font-size:11px;color:var(--muted);margin-top:2px;display:block}
+.employee-go{color:var(--muted);font-size:16px}
+
+/* 状态灯（头像右上角）*/
+.status-dot{position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border-radius:50%;
+  border:2px solid var(--surface)}
+.st-idle{background:#9aa3b5}
+.st-working{background:var(--primary);animation:pulse 1.6s infinite}
+.st-error{background:var(--danger)}
+.st-done{background:var(--success)}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.82);opacity:.55}}
+
+/* 远程（中栏卡）*/
+.remote-head{display:flex;gap:10px;align-items:center;padding:4px 8px 10px}
+.remote-head-icon{width:34px;height:34px;border-radius:10px;background:#e8f8ee;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.remote-head-icon img{width:26px;height:26px;display:block}
+.remote-head-main{flex:1}
+.remote-head-title{font-size:13px;font-weight:600;display:block}
+.remote-head-desc{font-size:11px;color:var(--muted)}
+.remote-state-pill{font-size:10px;padding:3px 9px;border-radius:999px;background:var(--surface-3);color:var(--text-2)}
+.remote-state-pill.is-on{background:var(--success-soft);color:var(--success-text)}
+.remote-steps{margin:0 8px 12px;padding-left:18px;font-size:12px;color:var(--text-2);line-height:2}
+.remote-connect-btn{width:100%;padding:10px;border-radius:var(--radius-sm);background:var(--wechat);color:#fff;font-weight:500;font-size:13px}
+.remote-connect-btn:hover{filter:brightness(1.05)}
+.remote-qr{background:var(--surface-2);border-radius:var(--radius-sm);padding:14px;text-align:center}
+.remote-qr-img{width:132px;height:132px;background:
+  repeating-conic-gradient(#161a26 0 25%, #fff 0 50%) 0 0/16px 16px;border-radius:8px;margin:0 auto;display:block}
+.remote-qr-status{font-size:12px;margin-top:10px;color:var(--text-2)}
+.remote-qr-hint{font-size:11px;color:var(--muted);margin-top:4px}
+.remote-qr-refresh{font-size:11px;color:var(--primary-text);margin-top:8px}
+.remote-bound-label{font-size:11px;color:var(--muted);display:block;margin-bottom:6px}
+.remote-bound-select{width:100%;padding:8px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
+  background:var(--surface);font-size:13px}
+.remote-bound-hint{font-size:11px;color:var(--muted);margin:8px 0 10px;line-height:1.5}
+.remote-disconnect-btn{width:100%;padding:8px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);
+  color:var(--danger);font-size:12px}
+.remote-disconnect-btn:hover{background:#fef2f2;border-color:var(--danger)}
+.remote-future{font-size:11px;color:var(--muted);text-align:center;padding:12px 8px 4px}
+
+/* ── Main（右栏）─────────────────────────── */
+.main-content{flex:1;overflow:hidden;position:relative;background:var(--bg)}
+.panel{position:absolute;inset:0;overflow-y:auto;display:none}
+.panel.active{display:block}
+
+/* 首页 */
+.home{max-width:760px;margin:0 auto;padding:7vh 32px 40px}
+.home-hero{text-align:center;margin-bottom:34px}
+.home-hero h1{font-size:27px;font-weight:700}
+.home-hero p{color:var(--text-2);margin-top:10px;font-size:14px}
+.guide-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:13px 16px;margin-bottom:10px;transition:border-color .15s}
+.guide-card:hover{border-color:var(--primary)}
+.guide-num{width:20px;height:20px;border-radius:50%;background:var(--primary);color:#fff;font-size:11px;
+  display:flex;align-items:center;justify-content:center;flex:0 0 20px}
+.guide-num.done{background:var(--success)}
+.guide-text{flex:1;font-size:13px}
+.guide-text b{font-weight:600}
+.guide-text .sub{color:var(--muted);font-size:12px;margin-left:6px}
+.guide-btn{font-size:12px;color:var(--primary-text);background:var(--primary-soft);padding:5px 12px;border-radius:8px;flex:0 0 auto}
+.guide-card.done{opacity:.72}
+.composer{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+  box-shadow:var(--shadow-sm);padding:14px;margin-top:26px}
+.composer textarea{width:100%;border:none;outline:none;resize:none;font-size:14px;height:44px;background:transparent}
+.composer textarea::placeholder{color:var(--muted)}
+.composer-bar{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}
+.composer-plus{width:26px;height:26px;border-radius:8px;font-size:16px;color:var(--muted);position:relative}
+.composer-plus:hover{background:var(--surface-2)}
+.composer-select{font-size:12px;color:var(--text-2);background:var(--surface-2);padding:4px 10px;border-radius:8px}
+select.composer-select{appearance:none;-webkit-appearance:none;outline:none;cursor:pointer}
+.attach-chip{font-size:11px;background:var(--primary-soft);color:var(--primary-text);padding:4px 10px;border-radius:8px;display:inline-flex;gap:6px;align-items:center}
+.attach-chip button{font-size:12px;color:inherit;opacity:.7}
+.attach-chip button:hover{opacity:1}
+.composer-send{margin-left:auto;width:34px;height:34px;border-radius:11px;background:var(--primary);color:#fff;
+  display:flex;align-items:center;justify-content:center}
+.composer-send:hover{background:var(--primary-hover)}
+.composer-send svg{width:16px;height:16px}
+.quick-head{display:flex;align-items:center;gap:12px;margin:30px 0 14px}
+.quick-head span:first-child{font-size:12px;color:var(--muted);white-space:nowrap}
+.quick-rule{flex:1;height:1px;background:var(--border)}
+.quick-more{font-size:12px;color:var(--primary-text);white-space:nowrap}
+.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.quick-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:14px;text-align:left;transition:border-color .15s}
+.quick-card:hover{border-color:var(--primary)}
+.quick-tag{font-size:10px;color:var(--muted)}
+.quick-title{font-size:13px;font-weight:600;margin-top:6px;line-height:1.45}
+.quick-dl{font-size:11px;color:var(--muted);margin-top:8px}
+.quick-dl b{color:var(--text-2);font-weight:500}
+
+/* 会话详情 */
+.conversation{display:flex;flex-direction:column;height:100%}
+.conv-head{padding:14px 22px;border-bottom:1px solid var(--border);background:var(--surface);
+  display:flex;align-items:center;gap:8px}
+.conv-head-title{font-size:15px;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.icon-btn{width:28px;height:28px;border-radius:8px;color:var(--muted);display:flex;align-items:center;justify-content:center;font-size:14px}
+.icon-btn:hover{background:var(--surface-2)}
+.icon-btn.active{background:var(--primary-soft);color:var(--primary-text)}
+.conv-body{flex:1;overflow-y:auto;padding:22px 26px;display:flex;flex-direction:column;gap:16px}
+.msg{max-width:72%;display:flex;flex-direction:column;gap:4px}
+.msg.user{align-self:flex-end;align-items:flex-end}
+.msg.agent{align-self:flex-start}
+.msg-bubble{padding:10px 14px;border-radius:14px;font-size:13.5px;line-height:1.65}
+.msg.user .msg-bubble{background:var(--primary);color:#fff;border-bottom-right-radius:4px}
+.msg.agent .msg-bubble{background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg-meta{font-size:10px;color:var(--muted);display:flex;gap:6px;align-items:center}
+.msg-avatar{width:22px;height:22px;border-radius:7px;background:#f6c344;display:flex;align-items:center;justify-content:center;font-size:12px;margin-bottom:2px}
+.msg-avatar.bot-av{background:var(--surface-3)}
+.msg-time{color:var(--muted)}
+.dash-sep{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px;margin:4px 0}
+.dash-sep::before,.dash-sep::after{content:"";flex:1;height:1px;background:var(--border)}
+.dash-sep button{font-size:11px;color:var(--primary-text);white-space:nowrap}
+.dash-sep button:hover{text-decoration:underline}
+.conv-foot{padding:14px 22px 18px}
+.conv-foot .composer textarea{height:38px}
+.running-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 16px;font-size:12px;color:var(--text-2);align-self:flex-start;min-width:280px}
+.running-card .t{color:var(--muted);font-size:11px}
+.running-card .dots::after{content:"…";animation:blink 1.2s infinite}
+@keyframes blink{50%{opacity:0}}
+.create-bot-hint{text-align:center;font-size:11px;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:6px 18px;align-self:center}
+
+/* 通用页面（编队详情 / 远程管理页） */
+.page{max-width:820px;margin:0 auto;padding:34px 36px}
+.page h1{font-size:21px;font-weight:700}
+.page .sub{color:var(--text-2);margin-top:8px;font-size:13px;line-height:1.7}
+.member-row{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-md);padding:13px 16px;margin-top:10px}
+.member-row .avatar{width:38px;height:38px;border-radius:11px;background:var(--surface-3);display:flex;align-items:center;justify-content:center;font-size:19px;position:relative}
+.member-main{flex:1}
+.member-name{font-size:13.5px;font-weight:600;display:flex;gap:8px;align-items:center}
+.member-role{font-size:11.5px;color:var(--muted);margin-top:3px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:var(--radius-sm);font-size:12.5px}
+.btn-primary{background:var(--primary);color:#fff;font-weight:500}
+.btn-primary:hover{background:var(--primary-hover)}
+.btn-soft{background:var(--primary-soft);color:var(--primary-text)}
+.btn-ghost{border:1px solid var(--border-strong);color:var(--text-2)}
+.btn-danger{color:var(--danger);border:1px solid var(--border-strong)}
+.btn-danger:hover{background:#fef2f2}
+.btn-sm{padding:5px 11px;font-size:12px}
+.inline-status{font-size:12px;margin-left:12px}
+.inline-status.ok{color:var(--success-text)}
+.inline-status.busy{color:var(--muted)}
+
+/* 工作台（卡片主页） */
+.workbench{max-width:760px;margin:0 auto;padding:40px 32px}
+.workbench h1{font-size:22px;font-weight:700}
+.workbench .sub{color:var(--text-2);font-size:13px;margin-top:8px}
+.workbench-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:26px}
+.workbench-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:18px;text-align:left;transition:border-color .15s, box-shadow .15s}
+.workbench-card:hover{border-color:var(--primary);box-shadow:var(--shadow-sm)}
+.wb-ic{width:34px;height:34px;border-radius:10px;background:var(--primary-soft);color:var(--primary-text);
+  display:flex;align-items:center;justify-content:center;margin-bottom:12px}
+.wb-ic svg{width:17px;height:17px}
+.wb-title{font-size:14px;font-weight:600;display:block}
+.wb-desc{font-size:12px;color:var(--muted);margin-top:5px;display:block;line-height:1.5}
+
+/* 工具子页（待办/自动化/技能/连接器/资料库/应用共用外壳） */
+.tool-page{display:flex;flex-direction:column;height:100%;max-width:900px;margin:0 auto}
+.tool-head{padding:16px 28px 12px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);background:var(--surface)}
+.tool-back{width:28px;height:28px;border-radius:8px;color:var(--muted);display:flex;align-items:center;justify-content:center;font-size:15px}
+.tool-back:hover{background:var(--surface-2);color:var(--text)}
+.tool-title{font-size:16px;font-weight:700;flex:0 0 auto}
+.tool-count{font-size:11px;color:var(--muted)}
+.tool-head-actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+.tool-body{flex:1;overflow-y:auto;padding:18px 28px 34px}
+.seg{display:flex;gap:6px}
+.seg button{padding:5px 12px;border-radius:8px;font-size:12px;color:var(--text-2);background:var(--surface-2)}
+.seg button.active{background:var(--primary);color:#fff;font-weight:500}
+
+/* 待办 */
+.todo-group-label{font-size:11px;color:var(--muted);margin:16px 0 6px;display:flex;align-items:center;gap:8px}
+.todo-item{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:11px 14px;margin-top:6px;font-size:13px}
+.todo-check{width:17px;height:17px;border-radius:5px;border:1.5px solid var(--border-strong);flex:0 0 17px;
+  display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;background:var(--surface)}
+.todo-item.done .todo-check{background:var(--success);border-color:var(--success)}
+.todo-item.done .todo-text{text-decoration:line-through;color:var(--muted)}
+.todo-text{flex:1;min-width:0}
+.todo-src{font-size:10px;color:var(--muted);flex:0 0 auto}
+.add-row{display:flex;gap:8px;margin-top:14px}
+.add-row input{flex:1;padding:9px 12px;border:1px dashed var(--border-strong);border-radius:var(--radius-sm);background:transparent;outline:none;font-size:12.5px}
+.add-row input:focus{border-color:var(--primary);border-style:solid}
+
+/* 自动化 */
+.auto-row{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:14px 16px;margin-top:10px;display:flex;gap:12px;align-items:flex-start}
+.auto-row.is-off{opacity:.6}
+.auto-main{flex:1;min-width:0}
+.auto-row-title{font-size:13.5px;font-weight:600;display:flex;gap:8px;align-items:center}
+.auto-row-content{font-size:12px;color:var(--text-2);margin-top:5px;line-height:1.6}
+.auto-row-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+.auto-row-chip{font-size:10px;padding:2px 8px;border-radius:7px;background:var(--surface-2);color:var(--text-2);display:inline-flex;gap:4px;align-items:center}
+.auto-row-chip.is-schedule{background:var(--primary-soft);color:var(--primary-text)}
+.auto-row-chip.is-agent{background:#e6f7ee;color:var(--success-text)}
+.auto-row-side{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:0 0 auto}
+.auto-row-status{font-size:10.5px;color:var(--muted)}
+.auto-row-status.on{color:var(--success-text)}
+.switch{width:34px;height:19px;border-radius:999px;background:var(--surface-3);position:relative;transition:background .15s;flex:0 0 34px}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#fff;box-shadow:var(--shadow-sm);transition:left .15s}
+.switch.on{background:var(--primary)}
+.switch.on::after{left:17px}
+.auto-next{font-size:10px;color:var(--muted)}
+
+/* 技能 / 连接器 / 应用 卡片网格 */
+.tool-cat-strip{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tool-cat-strip button{font-size:11px;padding:4px 11px;border-radius:999px;background:var(--surface-2);color:var(--text-2)}
+.tool-cat-strip button.active{background:var(--primary);color:#fff}
+.card-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+@media (min-width:1200px){.card-grid{grid-template-columns:repeat(3,1fr)}}
+.skill-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:14px 16px;transition:border-color .15s}
+.skill-card:hover{border-color:var(--primary)}
+.skill-card.is-disabled{opacity:.55}
+.skill-card-top{display:flex;align-items:center;gap:8px}
+.skill-card-name{font-size:13.5px;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.skill-card-desc{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.6;min-height:34px}
+.skill-card-foot{display:flex;align-items:center;gap:8px;margin-top:10px}
+.skill-card-foot .btn-sm{margin-left:auto}
+.conn-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:14px 16px;transition:border-color .15s;display:flex;gap:12px;align-items:center}
+.conn-card:hover{border-color:var(--primary)}
+.conn-ic{width:34px;height:34px;border-radius:10px;background:var(--surface-3);color:var(--text-2);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;flex:0 0 34px}
+.conn-ic.brand{background:#e8f8ee}
+.conn-ic.brand img{width:24px;height:24px;display:block}
+.conn-main{flex:1;min-width:0}
+.conn-name{font-size:13.5px;font-weight:600;display:flex;gap:8px;align-items:center}
+.conn-desc{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.55}
+.app-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:16px;display:flex;gap:12px;align-items:center;transition:border-color .15s}
+.app-card:hover{border-color:var(--primary)}
+.app-card-icon{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:19px;flex:0 0 40px}
+.app-card-icon.tone-purple{background:var(--primary-soft);color:var(--primary-text)}
+.app-card-icon.tone-green{background:#e6f7ee;color:var(--success-text)}
+.app-card-icon.tone-amber{background:#fef3c7;color:var(--warn-text)}
+.tool-group-label{font-size:11px;color:var(--muted);margin:6px 0 8px;display:flex;gap:8px;align-items:center}
+.conn-search{display:flex;align-items:center;gap:6px;background:var(--surface-2);border-radius:8px;padding:5px 10px}
+.conn-search svg{width:13px;height:13px;color:var(--muted)}
+.conn-search input{border:none;background:transparent;outline:none;font-size:12px;width:150px}
+
+/* 资料库两栏 */
+.ctx-layout{display:flex;height:100%;min-height:0}
+.ctx-tree-col{width:250px;flex:0 0 250px;border-right:1px solid var(--border);background:var(--surface);overflow-y:auto;padding:10px 8px}
+.ctx-folder{font-size:12px;color:var(--text-2);font-weight:600;padding:7px 8px;cursor:pointer;display:flex;gap:6px;align-items:center}
+.ctx-folder:hover{background:var(--surface-2);border-radius:6px}
+.ctx-file{font-size:12.5px;padding:7px 8px 7px 26px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}
+.ctx-file:hover{background:var(--surface-2)}
+.ctx-file.active{background:var(--primary-soft);color:var(--primary-text)}
+.ctx-file .size{font-size:10px;color:var(--muted);margin-left:auto;flex:0 0 auto}
+.ctx-view-col{flex:1;overflow-y:auto;padding:22px 28px;min-width:0}
+.ctx-view-path{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);margin-bottom:14px}
+.md-body h2{font-size:16px;margin-bottom:8px}
+.md-body h3{font-size:13.5px;margin:14px 0 6px}
+.md-body p,.md-body li{font-size:13px;line-height:1.75;color:var(--text-2);margin-bottom:6px}
+.md-body ul{padding-left:18px}
+.md-body code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--surface-2);padding:1px 5px;border-radius:5px}
+.md-viewer{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:20px 24px}
+
+/* 右侧抽屉（任务面板 / 会话信息） */
+.drawer{position:absolute;top:0;right:0;bottom:0;width:300px;background:var(--surface);border-left:1px solid var(--border);
+  box-shadow:var(--shadow);z-index:60;display:none;flex-direction:column}
+.drawer.open{display:flex}
+.drawer-head{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.drawer-head b{font-size:13.5px;flex:1}
+.drawer-body{flex:1;overflow-y:auto;padding:14px 16px}
+.drawer-card{background:var(--surface-2);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;font-size:12px}
+.drawer-card .t{font-size:12.5px;font-weight:600;display:flex;gap:6px;align-items:center;margin-bottom:6px}
+.drawer-card .d{font-size:11px;color:var(--muted);line-height:1.6}
+.drawer-kv{display:flex;justify-content:space-between;padding:8px 2px;font-size:12px;border-bottom:1px solid var(--border)}
+.drawer-kv span:first-child{color:var(--muted)}
+
+/* 弹层通用（搜索 / 弹窗菜单） */
+.ovl{position:fixed;inset:0;background:rgba(22,26,38,.42);z-index:120;display:none;align-items:flex-start;justify-content:center;padding-top:12vh}
+.ovl.open{display:flex}
+.search-box{background:var(--surface);border-radius:16px;box-shadow:var(--shadow);width:560px;max-width:92vw;overflow:hidden}
+.search-input{width:100%;border:none;outline:none;padding:16px 20px;font-size:15px;background:transparent}
+.search-results{max-height:52vh;overflow-y:auto;padding:6px 8px 12px}
+.search-group{font-size:10.5px;color:var(--muted);padding:10px 12px 4px}
+.res-row{width:100%;text-align:left;display:flex;gap:10px;align-items:center;padding:9px 12px;border-radius:8px;font-size:13px}
+.res-row:hover{background:var(--surface-2)}
+.res-row .sub{color:var(--muted);font-size:11px;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.search-foot{border-top:1px solid var(--border);padding:8px 16px;font-size:11px;color:var(--muted);display:flex;gap:14px}
+
+/* 弹出小菜单（附件） */
+.pop{position:absolute;bottom:34px;left:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);
+  box-shadow:var(--shadow);z-index:80;min-width:170px;padding:5px;display:none}
+.pop.open{display:block}
+.pop button{display:flex;gap:9px;align-items:center;width:100%;text-align:left;padding:8px 10px;border-radius:7px;font-size:12.5px;color:var(--text-2)}
+.pop button:hover{background:var(--surface-2)}
+
+/* 设置 */
+.settings{max-width:860px;margin:0 auto;padding:34px 36px}
+.settings h1{font-size:21px;font-weight:700}
+.settings-tabs{display:flex;gap:22px;border-bottom:1px solid var(--border);margin-top:18px}
+.settings-tabs button{padding:10px 2px;font-size:13.5px;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.settings-tabs button.active{color:var(--text);font-weight:600;border-color:var(--primary)}
+.settings-body{padding:22px 0 40px}
+.settings-note{display:flex;gap:8px;align-items:center;background:var(--primary-soft);color:var(--primary-text);
+  border-radius:var(--radius-sm);padding:9px 14px;font-size:12px;margin-bottom:18px}
+.model-row{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-md);padding:13px 16px;margin-top:10px}
+.badge{font-size:10px;padding:2px 8px;border-radius:7px;background:var(--primary);color:#fff}
+.badge.soft{background:var(--primary-soft);color:var(--primary-text)}
+.model-name{font-size:13.5px;font-weight:600}
+.model-sub{font-size:11.5px;color:var(--muted);margin-top:3px}
+.model-sub code{font-family:ui-monospace,Menlo,monospace;font-size:11px}
+.link-btn{font-size:12px;color:var(--text-2);padding:5px 10px;border-radius:8px}
+.link-btn:hover{background:var(--surface-2)}
+.link-btn.danger{color:var(--danger)}
+.models-empty{text-align:center;color:var(--muted);font-size:12.5px;padding:26px;background:var(--surface);border:1px dashed var(--border-strong);border-radius:var(--radius-md);margin-top:12px}
+.data-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:16px 18px;margin-bottom:12px}
+.data-card .t{font-size:13.5px;font-weight:600}
+.data-card .d{font-size:12px;color:var(--muted);margin-top:5px;line-height:1.6}
+.data-card .path{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--text-2);margin-top:8px}
+.settings-section-h{font-size:14px;font-weight:600;margin:22px 0 4px;display:flex;align-items:center;justify-content:space-between}
+.settings-section-h .hint{font-size:11.5px;color:var(--muted);font-weight:400;display:flex;align-items:center;gap:8px}
+
+/* 弹窗 */
+.modal-mask{position:fixed;inset:0;background:rgba(22,26,38,.42);z-index:100;display:none;
+  align-items:center;justify-content:center}
+.modal-mask.open{display:flex}
+.modal{background:var(--surface);border-radius:16px;box-shadow:var(--shadow);width:460px;max-width:92vw;
+  padding:22px 24px;position:relative;max-height:86vh;overflow-y:auto}
+.modal.wide{width:640px}
+.modal h3{font-size:15.5px;font-weight:700}
+.modal .desc{font-size:12px;color:var(--muted);margin-top:6px}
+.modal-x{position:absolute;top:14px;right:14px;color:var(--muted);font-size:15px}
+.form-label{font-size:12px;font-weight:600;margin:16px 0 6px;display:block}
+.form-select,.form-input,.form-textarea{width:100%;padding:9px 11px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
+  background:var(--surface);outline:none;font-size:13px}
+.form-textarea{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;min-height:150px;resize:vertical}
+.form-select:focus,.form-input:focus,.form-textarea:focus{border-color:var(--primary)}
+.form-hint{font-size:11px;color:var(--muted);margin-top:6px}
+.form-hint a{color:var(--primary-text)}
+.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+select.dropdown-opt{font-size:13px}
+.tpl-item{display:flex;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:13px 15px;margin-top:10px;cursor:pointer;transition:border-color .15s}
+.tpl-item:hover,.tpl-item.sel{border-color:var(--primary);background:var(--primary-soft)}
+.tpl-item .ic{width:36px;height:36px;border-radius:10px;background:var(--surface-3);display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 36px}
+.tpl-item .nm{font-size:13.5px;font-weight:600}
+.tpl-item .ds{font-size:11px;color:var(--muted);margin-top:3px}
+pre.yaml{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.65;background:var(--surface-2);
+  border-radius:var(--radius-sm);padding:14px 16px;overflow-x:auto;margin-top:12px;white-space:pre;color:var(--text-2)}
+
+/* Toast */
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--text);color:#fff;
+  padding:9px 18px;border-radius:10px;font-size:12.5px;z-index:200;opacity:0;transition:opacity .25s;pointer-events:none}
+.toast.show{opacity:.95}
+</style>
+</head>
+<body>
+
+<div class="proto-banner"><b>OneFleet 交互原型</b><span>仅供评审 · 数据为模拟 · 2026-10-17 功能快照 · 图标为真实资源</span></div>
+
+<div class="app-container">
+  <!-- ═══ Rail ═══ -->
+  <nav class="rail">
+    <div class="rail-logo"><img src="data:image/png;base64,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" alt="OneFleet"></div>
+    <button class="rail-btn" title="全局搜索 (⌘K)" onclick="openSearch()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <span class="rail-label">搜索</span>
+    </button>
+    <button class="rail-btn" data-nav="home">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      <span class="rail-label">新对话</span>
+    </button>
+    <button class="rail-btn" data-nav="messages">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span class="rail-label">消息</span><span class="rail-badge" id="rail-msg-badge">1</span>
+    </button>
+    <button class="rail-btn" data-nav="fleets">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span class="rail-label">编队</span>
+    </button>
+    <button class="rail-btn" data-nav="remote" title="微信远程接入">
+      <img class="rail-icon-brand" src="data:image/svg+xml;base64,PCEtLSBTb3VyY2U6IGh0dHBzOi8vYXBpLmljb25pZnkuZGVzaWduL3NpbXBsZS1pY29uczp3ZWNoYXQuc3ZnIChTaW1wbGUgSWNvbnMsIENDMCkuIEJyYW5kIGNvbG9yICMwN0MxNjAgYXBwbGllZDsgdmVuZG9yZWQgMjAyNi0xMC0xNi4gLS0+Cjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciICB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGZpbGw9IiMwN0MxNjAiIGQ9Ik04LjY5MSAyLjE4OEMzLjg5MSAyLjE4OCAwIDUuNDc2IDAgOS41M2MwIDIuMjEyIDEuMTcgNC4yMDMgMy4wMDIgNS41NWEuNTkuNTkgMCAwIDEgLjIxMy42NjVsLS4zOSAxLjQ4Yy0uMDE5LjA3LS4wNDguMTQxLS4wNDguMjEzYzAgLjE2My4xMy4yOTUuMjkuMjk1YS4zMy4zMyAwIDAgMCAuMTY3LS4wNTRsMS45MDMtMS4xMTRhLjg2Ljg2IDAgMCAxIC43MTctLjA5OGExMC4yIDEwLjIgMCAwIDAgMi44MzcuNDAzYy4yNzYgMCAuNTQzLS4wMjcuODExLS4wNWMtLjg1Ny0yLjU3OC4xNTctNC45NzIgMS45MzItNi40NDZjMS43MDMtMS40MTUgMy44ODItMS45OCA1Ljg1My0xLjgzOGMtLjU3Ni0zLjU4My00LjE5Ni02LjM0OC04LjU5Ni02LjM0OE01Ljc4NSA1Ljk5MWMuNjQyIDAgMS4xNjIuNTI5IDEuMTYyIDEuMThhMS4xNyAxLjE3IDAgMCAxLTEuMTYyIDEuMTc4QTEuMTcgMS4xNyAwIDAgMSA0LjYyMyA3LjE3YzAtLjY1MS41Mi0xLjE4IDEuMTYyLTEuMTh6bTUuODEzIDBjLjY0MiAwIDEuMTYyLjUyOSAxLjE2MiAxLjE4YTEuMTcgMS4xNyAwIDAgMS0xLjE2MiAxLjE3OGExLjE3IDEuMTcgMCAwIDEtMS4xNjItMS4xNzhjMC0uNjUxLjUyLTEuMTggMS4xNjItMS4xOG01LjM0IDIuODY3Yy0xLjc5Ny0uMDUyLTMuNzQ2LjUxMi01LjI4IDEuNzg2Yy0xLjcyIDEuNDI4LTIuNjg3IDMuNzItMS43OCA2LjIyYy45NDIgMi40NTMgMy42NjYgNC4yMjkgNi44ODQgNC4yMjljLjgyNiAwIDEuNjIyLS4xMiAyLjM2MS0uMzM2YS43Mi43MiAwIDAgMSAuNTk4LjA4MmwxLjU4NC45MjZhLjMuMyAwIDAgMCAuMTQuMDQ3Yy4xMzQgMCAuMjQtLjExMS4yNC0uMjQ3YzAtLjA2LS4wMjMtLjEyLS4wMzgtLjE3N2wtLjMyNy0xLjIzM2EuNi42IDAgMCAxLS4wMjMtLjE1NmEuNDkuNDkgMCAwIDEgLjIwMS0uMzk4QzIzLjAyNCAxOC40OCAyNCAxNi44MiAyNCAxNC45OGMwLTMuMjEtMi45MzEtNS44MzctNi42NTYtNi4wODhWOC44OWMtLjEzNS0uMDEtLjI3LS4wMjctLjQwNy0uMDN6bS0yLjUzIDMuMjc0Yy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45Ny0uOTgyem00Ljg0NCAwYy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45NjktLjk4MiIvPjwvc3ZnPgo=" alt="微信">
+      <span class="rail-label">远程</span>
+    </button>
+    <button class="rail-btn" data-nav="employees">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span class="rail-label">机器人</span>
+    </button>
+    <button class="rail-btn" data-nav="workbench">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+      <span class="rail-label">工作台</span>
+    </button>
+    <div class="rail-spacer"></div>
+    <button class="rail-btn" data-nav="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span class="rail-label">设置</span>
+    </button>
+  </nav>
+
+  <!-- ═══ Midbar ═══ -->
+  <aside class="midbar">
+    <!-- 消息模式 -->
+    <div id="mb-messages">
+      <div class="midbar-header">
+        <span class="midbar-title">消息</span>
+        <div class="midbar-filter" id="conv-filter">
+          <button class="active" data-filter="all">全部</button><button data-filter="dm">机器人</button><button data-filter="group">群组</button>
+        </div>
+        <button class="midbar-add" title="导入编队模板" onclick="openImport()">＋</button>
+      </div>
+      <div class="midbar-body">
+        <div class="section-label">今天 <span class="chip running" id="running-chip">执行中 1</span></div>
+        <div id="msg-rows"></div>
+      </div>
+    </div>
+
+    <!-- 编队模式 -->
+    <div id="mb-fleets" class="hidden">
+      <div class="midbar-header"><span class="midbar-title">编队</span></div>
+      <div class="midbar-body" style="padding:10px">
+        <button class="midbar-fleets-import" onclick="openImport()">导入编队模板</button>
+        <div id="fleet-rows"></div>
+      </div>
+    </div>
+
+    <!-- 远程模式（中栏） -->
+    <div id="mb-remote" class="hidden">
+      <div class="midbar-header"><span class="midbar-title">远程</span></div>
+      <div class="midbar-body" style="padding:10px">
+        <div class="remote-head">
+          <span class="remote-head-icon"><img src="data:image/svg+xml;base64,PCEtLSBTb3VyY2U6IGh0dHBzOi8vYXBpLmljb25pZnkuZGVzaWduL3NpbXBsZS1pY29uczp3ZWNoYXQuc3ZnIChTaW1wbGUgSWNvbnMsIENDMCkuIEJyYW5kIGNvbG9yICMwN0MxNjAgYXBwbGllZDsgdmVuZG9yZWQgMjAyNi0xMC0xNi4gLS0+Cjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciICB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGZpbGw9IiMwN0MxNjAiIGQ9Ik04LjY5MSAyLjE4OEMzLjg5MSAyLjE4OCAwIDUuNDc2IDAgOS41M2MwIDIuMjEyIDEuMTcgNC4yMDMgMy4wMDIgNS41NWEuNTkuNTkgMCAwIDEgLjIxMy42NjVsLS4zOSAxLjQ4Yy0uMDE5LjA3LS4wNDguMTQxLS4wNDguMjEzYzAgLjE2My4xMy4yOTUuMjkuMjk1YS4zMy4zMyAwIDAgMCAuMTY3LS4wNTRsMS45MDMtMS4xMTRhLjg2Ljg2IDAgMCAxIC43MTctLjA5OGExMC4yIDEwLjIgMCAwIDAgMi44MzcuNDAzYy4yNzYgMCAuNTQzLS4wMjcuODExLS4wNWMtLjg1Ny0yLjU3OC4xNTctNC45NzIgMS45MzItNi40NDZjMS43MDMtMS40MTUgMy44ODItMS45OCA1Ljg1My0xLjgzOGMtLjU3Ni0zLjU4My00LjE5Ni02LjM0OC04LjU5Ni02LjM0OE01Ljc4NSA1Ljk5MWMuNjQyIDAgMS4xNjIuNTI5IDEuMTYyIDEuMThhMS4xNyAxLjE3IDAgMCAxLTEuMTYyIDEuMTc4QTEuMTcgMS4xNyAwIDAgMSA0LjYyMyA3LjE3YzAtLjY1MS41Mi0xLjE4IDEuMTYyLTEuMTh6bTUuODEzIDBjLjY0MiAwIDEuMTYyLjUyOSAxLjE2MiAxLjE4YTEuMTcgMS4xNyAwIDAgMS0xLjE2MiAxLjE3OGExLjE3IDEuMTcgMCAwIDEtMS4xNjItMS4xNzhjMC0uNjUxLjUyLTEuMTggMS4xNjItMS4xOG01LjM0IDIuODY3Yy0xLjc5Ny0uMDUyLTMuNzQ2LjUxMi01LjI4IDEuNzg2Yy0xLjcyIDEuNDI4LTIuNjg3IDMuNzItMS43OCA2LjIyYy45NDIgMi40NTMgMy42NjYgNC4yMjkgNi44ODQgNC4yMjljLjgyNiAwIDEuNjIyLS4xMiAyLjM2MS0uMzM2YS43Mi43MiAwIDAgMSAuNTk4LjA4MmwxLjU4NC45MjZhLjMuMyAwIDAgMCAuMTQuMDQ3Yy4xMzQgMCAuMjQtLjExMS4yNC0uMjQ3YzAtLjA2LS4wMjMtLjEyLS4wMzgtLjE3N2wtLjMyNy0xLjIzM2EuNi42IDAgMCAxLS4wMjMtLjE1NmEuNDkuNDkgMCAwIDEgLjIwMS0uMzk4QzIzLjAyNCAxOC40OCAyNCAxNi44MiAyNCAxNC45OGMwLTMuMjEtMi45MzEtNS44MzctNi42NTYtNi4wODhWOC44OWMtLjEzNS0uMDEtLjI3LS4wMjctLjQwNy0uMDN6bS0yLjUzIDMuMjc0Yy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45Ny0uOTgyem00Ljg0NCAwYy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45NjktLjk4MiIvPjwvc3ZnPgo=" alt=""></span>
+          <span class="remote-head-main">
+            <span class="remote-head-title">微信远程</span>
+            <span class="remote-head-desc">在微信里直接指挥你的机器人</span>
+          </span>
+          <span class="remote-state-pill" id="mb-remote-state">未连接</span>
+        </div>
+        <ol class="remote-steps">
+          <li>扫码绑定微信</li><li>选一个值班机器人</li><li>在微信里发消息遥控</li>
+        </ol>
+        <button class="remote-connect-btn" onclick="remoteScan()">扫码接入微信</button>
+        <div class="remote-future">更多渠道（飞书 / Telegram）接入开发中。</div>
+      </div>
+    </div>
+
+    <!-- 员工模式 -->
+    <div id="mb-employees" class="hidden">
+      <div class="midbar-header"><span class="midbar-title">机器人</span></div>
+      <div class="midbar-body" style="padding:6px 8px" id="employee-rows">
+      </div>
+    </div>
+
+    <!-- 其他模式（工作台/设置等）中栏留空 -->
+    <div id="mb-empty" class="hidden"></div>
+  </aside>
+
+  <!-- ═══ Main ═══ -->
+  <main class="main-content">
+
+    <!-- 首页 / 新对话 -->
+    <section class="panel" id="panel-home">
+      <div class="home">
+        <div class="home-hero">
+          <h1>朋友，想完成什么？</h1>
+          <p>说出你的目标。指挥官会拆解任务、安排合适的机器人协作，并把成品交给你。</p>
+        </div>
+        <button class="guide-card done">
+          <span class="guide-num done">✓</span>
+          <span class="guide-text"><b>配置模型</b><span class="sub">Zhipu GLM · GLM-5.3 已就绪</span></span>
+          <span class="guide-btn">已完成</span>
+        </button>
+        <button class="guide-card" onclick="openImport()">
+          <span class="guide-num">2</span>
+          <span class="guide-text"><b>导入一支编队模板</b><span class="sub">YAML 一键建队</span></span>
+          <span class="guide-btn">导入编队</span>
+        </button>
+        <button class="guide-card" onclick="guideGoGroup()">
+          <span class="guide-num">3</span>
+          <span class="guide-text"><b>进群说第一句话</b><span class="sub">编队自动开工</span></span>
+          <span class="guide-btn">去开工</span>
+        </button>
+
+        <div class="composer">
+          <textarea id="home-input" placeholder="例如：分析这份文件，找出关键问题并给出优化建议"></textarea>
+          <div class="composer-bar" id="home-attach-bar"></div>
+          <div class="composer-bar">
+            <div style="position:relative">
+              <button class="composer-plus" onclick="togglePop(this,'home')" title="添加附件">＋</button>
+              <div class="pop" id="pop-home">
+                <button onclick="addAttach('home','📄 需求文档.docx')">上传文件</button>
+                <button onclick="addAttach('home','🖼️ 参考图.png')">上传图片</button>
+                <button onclick="addAttach('home','📁 竞品资料（文件夹）')">上传文件夹</button>
+              </div>
+            </div>
+            <select class="composer-select" id="home-model"><option>模型：GLM-5.3</option><option>模型：GLM-5.3 Flash</option><option>模型：GLM-5.2</option></select>
+            <span class="composer-select">给：<b>指挥官</b></span>
+            <select class="composer-select" id="home-ws"><option>工作区：默认</option><option>工作区：工作</option><option>工作区：个人</option></select>
+            <button class="composer-send" onclick="sendHome()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="quick-head"><span>试试这些任务，点一下就能跑</span><span class="quick-rule"></span><button class="quick-more" onclick="openMarket()">接入开源工具能力 ›</button></div>
+        <div class="quick-grid">
+          <button class="quick-card" onclick="fillDemo('调研 AI 桌面应用')"><span class="quick-tag">研究</span><span class="quick-title">调研 AI 桌面应用</span><span class="quick-dl">交付：<b>研究报告</b></span></button>
+          <button class="quick-card" onclick="fillDemo('分析宠物饮水机是否值得卖')"><span class="quick-tag">电商</span><span class="quick-title">分析宠物饮水机是否值得卖</span><span class="quick-dl">交付：<b>选品报告</b></span></button>
+          <button class="quick-card" onclick="fillDemo('制作 AI 办公助手产品介绍 PPT')"><span class="quick-tag">演示</span><span class="quick-title">制作 AI 办公助手产品介绍 PPT</span><span class="quick-dl">交付：<b>PPT</b></span></button>
+          <button class="quick-card" onclick="fillDemo('制作一份电商销售月报')"><span class="quick-tag">办公</span><span class="quick-title">制作一份电商销售月报</span><span class="quick-dl">交付：<b>月报文件</b></span></button>
+          <button class="quick-card" onclick="fillDemo('设计城市夏日咖啡节活动海报')"><span class="quick-tag">图片</span><span class="quick-title">设计城市夏日咖啡节活动海报</span><span class="quick-dl">交付：<b>活动海报</b></span></button>
+          <button class="quick-card" onclick="fillDemo('制作一条 AI 发展趋势科普视频')"><span class="quick-tag">视频</span><span class="quick-title">制作一条 AI 发展趋势科普视频</span><span class="quick-dl">交付：<b>视频成片</b></span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 群聊会话（编队作战室） -->
+    <section class="panel" id="panel-conversation">
+      <div class="conversation">
+        <div class="conv-head">
+          <span class="conv-head-title">本周内容计划作战室</span>
+          <span class="chip">3 个机器人</span>
+          <button class="icon-btn" title="会话信息" onclick="openDrawer('drawer-info')">⋯</button>
+          <button class="icon-btn" id="side-toggle-btn" title="任务面板" onclick="toggleDrawer('drawer-side',this)">▣</button>
+        </div>
+        <div class="conv-body" id="conv-body">
+          <div class="dash-sep">内容运营小队 已就位：指挥官 · 小艾 · 小笔 · 小审</div>
+          <div class="msg user">
+            <div class="msg-bubble">你好，请用一句话自我介绍</div>
+            <div class="msg-meta"><span class="msg-time">2026-10-17 17:19</span></div>
+          </div>
+          <div class="msg agent">
+            <span class="msg-avatar">👑</span>
+            <div class="msg-meta"><b>指挥官</b> <span class="chip bot" style="margin-left:4px">管理员</span> <span class="msg-time">2026-10-17 17:20 · 耗时 40s</span></div>
+            <div class="msg-bubble">你好！我是这个群聊的指挥官（Commander），一个能直接帮你完成任务、也能调度内容调研、写作、审查等编队机器人协同工作的总协调者。</div>
+          </div>
+          <div class="dash-sep"><button onclick="createBotFromChat()">＋ 基于以上对话创建机器人</button></div>
+        </div>
+        <div class="conv-foot">
+          <div class="composer">
+            <textarea id="conv-input" placeholder="输入 @ 选择机器人、技能、连接器、资料库"></textarea>
+            <div class="composer-bar" id="conv-attach-bar"></div>
+            <div class="composer-bar">
+              <div style="position:relative">
+                <button class="composer-plus" onclick="togglePop(this,'conv')" title="添加附件">＋</button>
+                <div class="pop" id="pop-conv">
+                  <button onclick="addAttach('conv','📄 需求文档.docx')">上传文件</button>
+                  <button onclick="addAttach('conv','🖼️ 参考图.png')">上传图片</button>
+                  <button onclick="addAttach('conv','📁 竞品资料（文件夹）')">上传文件夹</button>
+                </div>
+              </div>
+              <select class="composer-select"><option>模型：GLM-5.3</option><option>模型：GLM-5.3 Flash</option></select>
+              <select class="composer-select" id="conv-rcpt"><option>给：指挥官</option><option>给：@小艾</option><option>给：@小笔</option><option>给：@小审</option></select>
+              <select class="composer-select"><option>工作区：默认</option><option>工作区：工作</option></select>
+              <button class="composer-send" onclick="sendConv()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- 会话信息抽屉 -->
+      <div class="drawer" id="drawer-info">
+        <div class="drawer-head"><b>会话信息</b><button class="icon-btn" onclick="closeDrawer('drawer-info')">✕</button></div>
+        <div class="drawer-body">
+          <div class="drawer-kv"><span>类型</span><span>群聊（编队房间）</span></div>
+          <div class="drawer-kv"><span>成员</span><span>指挥官 · 小艾 · 小笔 · 小审</span></div>
+          <div class="drawer-kv"><span>默认模型</span><span>Zhipu GLM · GLM-5.3</span></div>
+          <div class="drawer-kv"><span>工作区</span><span>默认</span></div>
+          <div class="drawer-kv"><span>消息数</span><span id="info-msg-count">2</span></div>
+          <div class="drawer-kv"><span>创建时间</span><span>2026-10-17 17:19</span></div>
+          <div class="drawer-kv"><span>占用存储</span><span>12 KB（本机）</span></div>
+          <p style="font-size:11px;color:var(--muted);margin-top:12px;line-height:1.6">数据只存在本机 ~/.onefleet/data。导出、删除可在设置 → 数据 中操作。</p>
+        </div>
+      </div>
+      <!-- 任务面板抽屉 -->
+      <div class="drawer" id="drawer-side">
+        <div class="drawer-head"><b>任务面板</b><button class="icon-btn" onclick="closeDrawer('drawer-side')">✕</button></div>
+        <div class="drawer-body">
+          <div class="drawer-card">
+            <div class="t"><span class="chip running">进行中</span> 本周内容计划</div>
+            <div class="d">✓ 近一周 AI 编队产品动态调研<br>✓ 调研简报（小艾）<br>● 公众号文章初稿（小笔 · 写作中）<br>○ 合规审查（小审 · 待前序完成）</div>
+          </div>
+          <div class="drawer-card">
+            <div class="t">交付物</div>
+            <div class="d"><button class="link-btn" style="padding:2px 4px" onclick="toast('打开 调研简报.md（原型：真机在右侧预览器打开）')">📄 调研简报.md</button><br><button class="link-btn" style="padding:2px 4px" onclick="toast('打开 初稿.md（原型：真机在右侧预览器打开）')">📄 初稿.md</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 编队详情（演示） -->
+    <section class="panel" id="panel-fleet-detail">
+      <div class="page">
+        <h1>内容运营小队</h1>
+        <p class="sub">由编队模板一键生成 · 3 个机器人 + 1 个群聊房间。给群聊发目标，指挥官自动分派给员工协作，成品以交付物卡片沉淀。</p>
+        <div style="display:flex;gap:10px;margin-top:16px">
+          <button class="btn btn-primary" onclick="fleetGo()">▶ 进群开工</button>
+          <button class="btn btn-ghost" onclick="openExport()">导出模板 YAML</button>
+        </div>
+        <div class="member-row">
+          <span class="avatar">👑</span>
+          <span class="member-main"><span class="member-name">指挥官 <span class="badge soft">默认</span></span><span class="member-role">拆解目标 · 调度员工 · 汇总交付</span></span>
+        </div>
+        <div class="member-row">
+          <span class="avatar">🤖<span class="status-dot st-idle"></span></span>
+          <span class="member-main"><span class="member-name">小艾</span><span class="member-role">内容调研员 · 检索并核验资料，产出调研简报</span></span>
+          <button class="btn btn-ghost" onclick="openDm('小艾')">私聊</button>
+        </div>
+        <div class="member-row">
+          <span class="avatar">🤖<span class="status-dot st-working"></span></span>
+          <span class="member-main"><span class="member-name">小笔</span><span class="member-role">内容写手 · 把调研写成可发布的成稿</span></span>
+          <button class="btn btn-ghost" onclick="openDm('小笔')">私聊</button>
+        </div>
+        <div class="member-row">
+          <span class="avatar">🤖<span class="status-dot st-done"></span></span>
+          <span class="member-main"><span class="member-name">小审</span><span class="member-role">内容审查员 · 事实核查与合规把关</span></span>
+          <button class="btn btn-ghost" onclick="openDm('小审')">私聊</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- DM 会话（员工私聊，演示） -->
+    <section class="panel" id="panel-dm">
+      <div class="conversation">
+        <div class="conv-head">
+          <span class="conv-avatar" style="width:26px;height:26px;font-size:14px;border-radius:8px;background:var(--surface-3);display:flex;align-items:center;justify-content:center">🤖</span>
+          <span class="conv-head-title" id="dm-title">小艾</span>
+          <span class="chip bot">机器人</span>
+        </div>
+        <div class="conv-body" id="dm-body">
+          <div class="msg agent">
+            <span class="msg-avatar bot-av">🤖</span>
+            <div class="msg-meta"><b id="dm-name2">小艾</b> <span class="msg-time">刚刚</span></div>
+            <div class="msg-bubble">你好，我是小艾，内容调研员。把要调研的主题发给我，我会检索资料并输出带来源的调研简报。</div>
+          </div>
+        </div>
+        <div class="conv-foot">
+          <div class="composer">
+            <textarea id="dm-input" placeholder="输入 @ 选择机器人、技能、连接器、资料库"></textarea>
+            <div class="composer-bar" id="dm-attach-bar"></div>
+            <div class="composer-bar">
+              <div style="position:relative">
+                <button class="composer-plus" onclick="togglePop(this,'dm')" title="添加附件">＋</button>
+                <div class="pop" id="pop-dm">
+                  <button onclick="addAttach('dm','📄 需求文档.docx')">上传文件</button>
+                  <button onclick="addAttach('dm','🖼️ 参考图.png')">上传图片</button>
+                  <button onclick="addAttach('dm','📁 竞品资料（文件夹）')">上传文件夹</button>
+                </div>
+              </div>
+              <select class="composer-select"><option>模型：GLM-5.3</option><option>模型：GLM-5.3 Flash</option></select>
+              <span class="composer-select">给：<b id="dm-rcpt">小艾</b></span>
+              <button class="composer-send" onclick="sendDm()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 远程管理页（右栏） -->
+    <section class="panel" id="panel-remote-view">
+      <div class="page">
+        <h1>微信远程</h1>
+        <p class="sub">扫码把值班机器人装进微信。手机发消息，家里的编队就开始干活；「对方正在输入…」、任务进度、成稿回复，全程手机可见。</p>
+        <div style="margin-top:20px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:18px">
+          <div id="rv-state-body">
+            <button class="remote-connect-btn" style="max-width:260px" onclick="remoteScan()">扫码接入微信</button>
+          </div>
+          <div id="rv-state-qr" class="hidden">
+            <div class="remote-qr" style="max-width:260px">
+              <span class="remote-qr-img"></span>
+              <div class="remote-qr-status">等待扫码…</div>
+              <div class="remote-qr-hint">微信扫一扫，登录机器人</div>
+              <button class="remote-qr-refresh" onclick="remoteBound()">（演示）模拟扫码成功</button>
+            </div>
+          </div>
+          <div id="rv-state-bound" class="hidden" style="max-width:320px">
+            <label class="remote-bound-label">值班机器人</label>
+            <select class="remote-bound-select" id="rv-agent-select">
+              <option>小艾 · 内容调研员</option>
+              <option>小笔 · 内容写手</option>
+              <option>小审 · 内容审查员</option>
+            </select>
+            <div class="remote-bound-hint">绑定后，在微信里给机器人发消息即可遥控。断开不会丢失绑定和会话 — 重新扫码自动接回原对话。</div>
+            <button class="remote-disconnect-btn" onclick="remoteDisconnect()">断开连接</button>
+          </div>
+          <div style="margin-top:14px"><span class="inline-status" id="rv-status"></span></div>
+        </div>
+        <div class="settings-section-h">微信消息入口<span class="hint">点进 DM，配置面在「远程」，聊点进去聊</span></div>
+        <div id="rv-convos" class="hidden">
+          <button class="member-row" style="width:100%;text-align:left" onclick="openDm('小艾')">
+            <span class="avatar"><img style="width:22px;height:22px" src="data:image/svg+xml;base64,PCEtLSBTb3VyY2U6IGh0dHBzOi8vYXBpLmljb25pZnkuZGVzaWduL3NpbXBsZS1pY29uczp3ZWNoYXQuc3ZnIChTaW1wbGUgSWNvbnMsIENDMCkuIEJyYW5kIGNvbG9yICMwN0MxNjAgYXBwbGllZDsgdmVuZG9yZWQgMjAyNi0xMC0xNi4gLS0+Cjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciICB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGZpbGw9IiMwN0MxNjAiIGQ9Ik04LjY5MSAyLjE4OEMzLjg5MSAyLjE4OCAwIDUuNDc2IDAgOS41M2MwIDIuMjEyIDEuMTcgNC4yMDMgMy4wMDIgNS41NWEuNTkuNTkgMCAwIDEgLjIxMy42NjVsLS4zOSAxLjQ4Yy0uMDE5LjA3LS4wNDguMTQxLS4wNDguMjEzYzAgLjE2My4xMy4yOTUuMjkuMjk1YS4zMy4zMyAwIDAgMCAuMTY3LS4wNTRsMS45MDMtMS4xMTRhLjg2Ljg2IDAgMCAxIC43MTctLjA5OGExMC4yIDEwLjIgMCAwIDAgMi44MzcuNDAzYy4yNzYgMCAuNTQzLS4wMjcuODExLS4wNWMtLjg1Ny0yLjU3OC4xNTctNC45NzIgMS45MzItNi40NDZjMS43MDMtMS40MTUgMy44ODItMS45OCA1Ljg1My0xLjgzOGMtLjU3Ni0zLjU4My00LjE5Ni02LjM0OC04LjU5Ni02LjM0OE01Ljc4NSA1Ljk5MWMuNjQyIDAgMS4xNjIuNTI5IDEuMTYyIDEuMThhMS4xNyAxLjE3IDAgMCAxLTEuMTYyIDEuMTc4QTEuMTcgMS4xNyAwIDAgMSA0LjYyMyA3LjE3YzAtLjY1MS41Mi0xLjE4IDEuMTYyLTEuMTh6bTUuODEzIDBjLjY0MiAwIDEuMTYyLjUyOSAxLjE2MiAxLjE4YTEuMTcgMS4xNyAwIDAgMS0xLjE2MiAxLjE3OGExLjE3IDEuMTcgMCAwIDEtMS4xNjItMS4xNzhjMC0uNjUxLjUyLTEuMTggMS4xNjItMS4xOG01LjM0IDIuODY3Yy0xLjc5Ny0uMDUyLTMuNzQ2LjUxMi01LjI4IDEuNzg2Yy0xLjcyIDEuNDI4LTIuNjg3IDMuNzItMS43OCA2LjIyYy45NDIgMi40NTMgMy42NjYgNC4yMjkgNi44ODQgNC4yMjljLjgyNiAwIDEuNjIyLS4xMiAyLjM2MS0uMzM2YS43Mi43MiAwIDAgMSAuNTk4LjA4MmwxLjU4NC45MjZhLjMuMyAwIDAgMCAuMTQuMDQ3Yy4xMzQgMCAuMjQtLjExMS4yNC0uMjQ3YzAtLjA2LS4wMjMtLjEyLS4wMzgtLjE3N2wtLjMyNy0xLjIzM2EuNi42IDAgMCAxLS4wMjMtLjE1NmEuNDkuNDkgMCAwIDEgLjIwMS0uMzk4QzIzLjAyNCAxOC40OCAyNCAxNi44MiAyNCAxNC45OGMwLTMuMjEtMi45MzEtNS44MzctNi42NTYtNi4wODhWOC44OWMtLjEzNS0uMDEtLjI3LS4wMjctLjQwNy0uMDN6bS0yLjUzIDMuMjc0Yy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45Ny0uOTgyem00Ljg0NCAwYy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45NjktLjk4MiIvPjwvc3ZnPgo=" alt=""></span>
+            <span class="member-main"><span class="member-name">微信 · 小艾</span><span class="member-role">最近：10-17 16:02</span></span>
+            <span class="employee-go">›</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 工作台（卡片主页） -->
+    <section class="panel" id="panel-workbench">
+      <div class="workbench">
+        <h1>工作台</h1>
+        <p class="sub">老板自己的工具箱 — 编队在消息里，工具在这里。</p>
+        <div class="workbench-grid">
+          <button class="workbench-card" onclick="openTool('todos')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 12h6M9 16h6"/></svg></span>
+            <span class="wb-title">待办</span><span class="wb-desc">今天要做的事和进度</span></button>
+          <button class="workbench-card" onclick="openTool('auto')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
+            <span class="wb-title">自动化</span><span class="wb-desc">定时与触发的编队任务</span></button>
+          <button class="workbench-card" onclick="openTool('skills')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg></span>
+            <span class="wb-title">技能库</span><span class="wb-desc">给机器人装上新本领</span></button>
+          <button class="workbench-card" onclick="openTool('connectors')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22v-5M9 8V2M15 8V2M7 8h10v4a5 5 0 0 1-10 0z"/></svg></span>
+            <span class="wb-title">连接器</span><span class="wb-desc">接入外部应用与数据</span></button>
+          <button class="workbench-card" onclick="openTool('contexts')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></span>
+            <span class="wb-title">资料库</span><span class="wb-desc">编队共享的知识底座</span></button>
+          <button class="workbench-card" onclick="openTool('apps')">
+            <span class="wb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
+            <span class="wb-title">应用</span><span class="wb-desc">编队产出的小工具</span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 工具子页：待办 -->
+    <section class="panel" id="panel-todos">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">待办</span>
+          <div class="tool-head-actions">
+            <div class="seg" id="todo-seg">
+              <button class="active" data-g="project" onclick="todoGroup('project',this)">按项目</button>
+              <button data-g="status" onclick="todoGroup('status',this)">按状态</button>
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="document.getElementById('todo-add').focus()">＋ 新建</button>
+          </div>
+        </div>
+        <div class="tool-body" id="todos-content"></div>
+      </div>
+    </section>
+
+    <!-- 工具子页：自动化 -->
+    <section class="panel" id="panel-auto">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">自动化</span>
+          <span class="tool-count" id="auto-count"></span>
+          <div class="tool-head-actions">
+            <button class="btn btn-primary btn-sm" onclick="openAutoAdd()">＋ 新建</button>
+          </div>
+        </div>
+        <div class="tool-body" id="auto-list"></div>
+      </div>
+    </section>
+
+    <!-- 工具子页：技能库 -->
+    <section class="panel" id="panel-skills">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">技能库</span>
+          <div class="tool-head-actions">
+            <button class="btn btn-ghost btn-sm" onclick="openMarket()">🛒 技能市场</button>
+            <button class="btn btn-primary btn-sm" onclick="openSkillAdd()">＋ 新建技能</button>
+          </div>
+        </div>
+        <div class="tool-body">
+          <div class="tool-cat-strip" id="skill-cats"></div>
+          <div class="card-grid" id="skills-grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 工具子页：连接器 -->
+    <section class="panel" id="panel-connectors">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">连接器</span>
+          <div class="tool-head-actions">
+            <label class="conn-search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              <input id="conn-search-input" placeholder="搜索连接器" oninput="renderConnectors(this.value)">
+            </label>
+            <button class="btn btn-ghost btn-sm" onclick="openMcpAdd()">添加 MCP 服务器</button>
+          </div>
+        </div>
+        <div class="tool-body" id="connectors-body"></div>
+      </div>
+    </section>
+
+    <!-- 工具子页：资料库 -->
+    <section class="panel" id="panel-contexts">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">资料库</span>
+          <span class="tool-count">编队共享 + 我的上传 · 只存本机</span>
+        </div>
+        <div class="ctx-layout">
+          <div class="ctx-tree-col" id="ctx-tree"></div>
+          <div class="ctx-view-col" id="ctx-view"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 工具子页：应用 -->
+    <section class="panel" id="panel-apps">
+      <div class="tool-page">
+        <div class="tool-head">
+          <button class="tool-back" onclick="openTool('workbench')">‹</button>
+          <span class="tool-title">应用</span>
+          <span class="tool-count" id="apps-count"></span>
+          <div class="tool-head-actions">
+            <button class="btn btn-primary btn-sm" onclick="toast('新建应用：真机由编队产出 artifact 后「保存为应用」生成')">＋ 新建</button>
+          </div>
+        </div>
+        <div class="tool-body"><div class="card-grid" id="apps-grid"></div></div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="panel" id="panel-settings">
+      <div class="settings">
+        <h1>设置</h1>
+        <div class="settings-tabs">
+          <button data-tab="data" onclick="settingsTab('data')">☰ 数据</button>
+          <button data-tab="models" class="active" onclick="settingsTab('models')">✦ 模型</button>
+          <button data-tab="general" onclick="settingsTab('general')">⚙ 通用</button>
+        </div>
+
+        <div class="settings-body hidden" id="tab-data">
+          <div style="margin-top:20px"></div>
+          <div class="data-card"><div class="t">记忆</div><div class="d">偏好 + 事实 · 0 条</div></div>
+          <div class="settings-section-h">本地 <span class="hint">仅此设备</span></div>
+          <div class="data-card"><div class="t">数据目录</div><div class="d">所有数据保存在此目录。点击可在文件管理器中打开。</div><div class="path">/Users/you/.onefleet/data</div></div>
+          <div class="settings-section-h">回收站</div>
+          <div class="data-card"><div class="d">暂无可恢复数据</div></div>
+        </div>
+
+        <div id="tab-models">
+          <div style="height:20px"></div>
+          <div class="settings-note">🔒 所有 API Key 与授权信息只保存在本机，不上云、不外发。</div>
+          <div class="settings-section-h">对话模型 <span class="hint">第一项为默认模型；不可用时会依次使用后面的模型。 <button class="btn btn-soft" onclick="openAddModel()">＋ 添加模型</button></span></div>
+          <div id="model-list">
+            <div class="model-row" data-key="9d2a...5QV" data-name="Zhipu GLM" data-model="GLM-5.3">
+              <span class="badge">默认</span>
+              <span style="flex:1">
+                <span class="model-name">Zhipu GLM</span>
+                <span class="model-sub">API Key <code>9d2a...5QV</code> · <span style="color:var(--success-text)">连接正常 828ms</span></span>
+              </span>
+              <select class="form-select" style="width:auto;padding:5px 8px;font-size:12px"><option>GLM-5.3</option><option>GLM-5.3 Flash</option><option>GLM-5.2</option></select>
+              <button class="link-btn" onclick="testModel(this)">测试</button>
+              <button class="link-btn danger" onclick="deleteModel(this)">删除</button>
+            </div>
+          </div>
+          <div class="models-empty hidden" id="models-empty">还没有可用模型 — 点右上角「＋ 添加模型」，填一个 API Key 即可开工。</div>
+          <p style="font-size:11.5px;color:var(--muted);margin-top:14px">拖动列表调整优先级，也可使用上下箭头。已停用的官方模型不参与轮转。</p>
+        </div>
+
+        <div id="tab-general" class="hidden">
+          <div style="margin-top:20px"></div>
+          <div class="data-card"><div class="t">语言</div><div class="d">简体中文</div></div>
+          <div class="data-card"><div class="t">开机自启</div><div class="d">关闭</div></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ═══ 弹窗们 ═══ -->
+
+<!-- 添加模型 -->
+<div class="modal-mask" id="modal-add">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('modal-add')">✕</button>
+    <h3>添加模型</h3>
+    <p class="desc">选择列表中的模型或填写自定义接口，然后添加授权。</p>
+    <label class="form-label">提供商</label>
+    <select class="form-select" id="am-provider" onchange="amProviderChanged()">
+      <option>— 选择提供商 —</option>
+      <option>DeepSeek</option><option>Zhipu GLM</option><option>Moonshot</option>
+      <option>Moonshot Coding Plan</option><option>MiniMax (Global)</option><option>MiniMax</option>
+      <option>Doubao</option><option>OpenAI Codex</option><option>OpenAI</option>
+      <option>Google Gemini</option><option>Anthropic</option><option>OpenRouter</option>
+    </select>
+    <label class="form-label">模型</label>
+    <select class="form-select" id="am-model"><option>— 请先选择提供商 —</option></select>
+    <div id="am-key-form" class="hidden">
+      <label class="form-label">标签</label>
+      <input class="form-input" id="am-label" placeholder="可选，例如：默认、工作、个人">
+      <label class="form-label">API Key</label>
+      <input class="form-input" id="am-key" type="password" placeholder="sk-...">
+      <p class="form-hint">从 <a href="#" onclick="return false">https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys</a> 创建</p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-add')">取消</button>
+      <button class="btn btn-primary" onclick="amSubmit()">＋ 添加账号</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入编队模板 -->
+<div class="modal-mask" id="modal-import">
+  <div class="modal wide">
+    <button class="modal-x" onclick="closeModal('modal-import')">✕</button>
+    <h3>导入编队模板</h3>
+    <p class="desc">真实应用里这里是文件选择器（读取 .yaml）；原型内置两份模板供预览，点选后导入。</p>
+    <div id="tpl-list"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-import')">取消</button>
+      <button class="btn btn-primary" onclick="importTpl()">导入并建队</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导出模板 YAML -->
+<div class="modal-mask" id="modal-export">
+  <div class="modal wide">
+    <button class="modal-x" onclick="closeModal('modal-export')">✕</button>
+    <h3>content-ops.yaml</h3>
+    <p class="desc">「导出模板」生成的编队 YAML（schema v1，与真机解析器同格式）。</p>
+    <pre class="yaml" id="export-yaml"></pre>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-export')">关闭</button>
+      <button class="btn btn-primary" onclick="copyYaml()">复制到剪贴板</button>
+    </div>
+  </div>
+</div>
+
+<!-- 技能市场 -->
+<div class="modal-mask" id="modal-market">
+  <div class="modal wide">
+    <button class="modal-x" onclick="closeModal('modal-market')">✕</button>
+    <h3>技能市场</h3>
+    <p class="desc">开源技能一键安装到技能库（真机为社区能力市场，支持搜索/分类）。</p>
+    <div id="market-list"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-market')">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建技能 -->
+<div class="modal-mask" id="modal-skill-add">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('modal-skill-add')">✕</button>
+    <h3>新建技能</h3>
+    <label class="form-label">技能名</label>
+    <input class="form-input" id="skill-name" placeholder="例如：周报生成器">
+    <label class="form-label">描述</label>
+    <input class="form-input" id="skill-desc" placeholder="一句话说清这个技能做什么">
+    <label class="form-label">指令（SKILL.md 正文）</label>
+    <textarea class="form-textarea" id="skill-body" style="min-height:90px" placeholder="你希望机器人按什么步骤/规范执行…"></textarea>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-skill-add')">取消</button>
+      <button class="btn btn-primary" onclick="addSkill()">保存技能</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建自动化任务 -->
+<div class="modal-mask" id="modal-auto-add">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('modal-auto-add')">✕</button>
+    <h3>新建自动化任务</h3>
+    <label class="form-label">任务标题</label>
+    <input class="form-input" id="aa-title" placeholder="例如：每日竞品晨报">
+    <label class="form-label">要执行的指令</label>
+    <textarea class="form-textarea" id="aa-msg" style="min-height:70px" placeholder="机器人每次被唤起时收到的消息…"></textarea>
+    <label class="form-label">执行对象</label>
+    <select class="form-select" id="aa-rcpt"><option>指挥官</option><option>小艾</option><option>小笔</option><option>小审</option></select>
+    <label class="form-label">计划</label>
+    <select class="form-select" id="aa-schedule">
+      <option>每天 08:30</option><option>每天 20:00</option><option>每周一 09:00</option><option>每月 1 日 10:00</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-auto-add')">取消</button>
+      <button class="btn btn-primary" onclick="addAutoTask()">创建任务</button>
+    </div>
+  </div>
+</div>
+
+<!-- 添加 MCP 服务器 -->
+<div class="modal-mask" id="modal-mcp-add">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('modal-mcp-add')">✕</button>
+    <h3>添加 MCP 服务器</h3>
+    <p class="desc">粘贴 JSON 配置，保存后出现在「连接器」。</p>
+    <textarea class="form-textarea" id="mcp-json">{
+  "mcpServers": {
+    "amap-maps": {
+      "command": "npx",
+      "args": ["-y", "@amap/amap-maps-mcp-server"],
+      "env": { "AMAP_MAPS_API_KEY": "..." }
+    }
+  }
+}</textarea>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-mcp-add')">取消</button>
+      <button class="btn btn-primary" onclick="addMcp()">保存并连接</button>
+    </div>
+  </div>
+</div>
+
+<!-- 全局搜索 -->
+<div class="ovl" id="ovl-search">
+  <div class="search-box">
+    <input class="search-input" id="search-input" placeholder="搜索对话、机器人、编队、技能…" oninput="runSearch(this.value)">
+    <div class="search-results" id="search-results"></div>
+    <div class="search-foot"><span>↑↓ 选择</span><span>↵ 打开</span><span>esc 关闭</span><span style="margin-left:auto">真实应用：Cmd/Ctrl + K</span></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ════════ 数据（模拟，结构对齐真机字段） ════════ */
+const TPL_CONTENT = `team:
+  id: content-ops
+  name: 内容运营小队
+  category: creation
+  description: 调研 → 写作 → 审查的一条龙内容编队
+model:
+  provider: zai
+  model: glm-5.3-flash
+  api_key_env: GLM_API_KEY
+members:
+  - id: researcher
+    name: 小艾
+    icon: search
+    color: sky
+    role: 内容调研员 · 检索并核验资料，产出带来源的调研简报
+    dispatch: 需要外部信息、竞品动态、事实核验时派给小艾
+    skills: [web-search]
+  - id: writer
+    name: 小笔
+    icon: pen-line
+    color: amber
+    role: 内容写手 · 把调研写成可发布的成稿
+    dispatch: 有调研简报、要产出公众号/知乎成稿时派给小笔
+  - id: reviewer
+    name: 小审
+    icon: shield-check
+    color: green
+    role: 内容审查员 · 事实核查与合规把关
+    dispatch: 成稿完成后必须过一遍小审再交付
+welcome_task:
+  text: |
+    启动本周内容计划：调研近一周 AI 编队产品动态，产出公众号文章初稿
+acceptance:
+  - 每条结论附来源链接
+  - 成稿含标题 3 选 1 与配图建议
+`;
+const TPL_GROWTH = `team:
+  id: solo-growth
+  name: 一人公司增长组
+  category: growth
+  description: 投放 · 文案 · 数据 · 客服 四人编队，一个人也能跑增长
+model:
+  provider: zai
+  model: glm-5.3-flash
+  api_key_env: GLM_API_KEY
+members:
+  - id: ads
+    name: 投放手
+    role: 渠道预算分配与 ROI 盯盘
+    dispatch: 涉及投放计划、出价、渠道对比时派给投放手
+  - id: copywriter
+    name: 文案
+    role: 卖点提炼与多平台文案改写
+    dispatch: 有产品信息要变成落地页/朋友圈/推文时派给文案
+  - id: analyst
+    name: 数据员
+    role: 漏斗分析 · 周报数据看板
+    dispatch: 要看转化、留存、A/B 结果时派给数据员
+  - id: support
+    name: 客服
+    role: 咨询应答与工单整理
+    dispatch: 用户问题、售后话术时派给客服
+welcome_task:
+  text: |
+    盘点这周各渠道投放 ROI，给下周预算分配建议
+acceptance:
+  - 结论附数据出处
+`;
+const TEMPLATES = [
+  {file:'content-ops.yaml', name:'内容运营小队', desc:'3 个机器人 · 调研/写作/审查一条龙', icon:'✍️', yaml:TPL_CONTENT},
+  {file:'solo-growth.yaml', name:'一人公司增长组', desc:'4 个机器人 · 投放/文案/数据/客服', icon:'📈', yaml:TPL_GROWTH},
+];
+
+let FLEETS = [
+  {name:'内容运营小队', members:3, date:'2026-10-17'},
+  {name:'市场调研小组', members:4, date:'2026-10-16'},
+];
+let EMPLOYEES = [
+  {name:'小艾', fleet:'内容运营小队', role:'内容调研员', status:'st-idle'},
+  {name:'小笔', fleet:'内容运营小队', role:'内容写手', status:'st-working'},
+  {name:'小审', fleet:'内容运营小队', role:'内容审查员', status:'st-done'},
+];
+let CONVS = [
+  {kind:'group', title:'本周内容计划作战室', preview:'指挥官：小笔正在写初稿…', time:'17:20', conv:'group'},
+  {kind:'dm', title:'你好，请用一句话自我介绍', preview:'你好！我是这个群聊的指挥官…', time:'17:19', conv:'dm-commander'},
+  {kind:'dm', title:'微信 · 小艾', preview:'在微信里直接跟小艾说话', time:'16:02', conv:'dm-wechat'},
+];
+
+let TODOS = [
+  {text:'复核小笔的公众号初稿（合规）', src:'内容运营小队', done:false},
+  {text:'定下周选题：Agent 团队协作赛道', src:'内容运营小队', done:true},
+  {text:'把 Q3 数据导入资料库', src:'内容运营小队', done:false},
+  {text:'盯竞品周报：Grok Bot / Manus Cue / Meta Muse', src:'市场调研小组', done:false},
+  {text:'给 OneFleet 录发布视频', src:'个人事项', done:false},
+];
+let todoMode = 'project';
+
+let AUTOS = [
+  {title:'AI 编队赛道晨报', msg:'汇总近 24h 编队/多智能体产品动态，输出 5 条要点', rcpt:'指挥官', sched:'每天 08:30', device:'本机', enabled:true, next:'明天 08:30'},
+  {title:'竞品动态扫描', msg:'扫描 Grok/Manus/Meta 官方发布渠道，更新竞品笔记', rcpt:'小艾', sched:'每周一 09:00', device:'本机', enabled:true, next:'10-20（周一）09:00'},
+  {title:'费用周报', msg:'统计本周各机器人 token 消耗，按编队汇总', rcpt:'指挥官', sched:'每周五 18:00', device:'本机', enabled:false, next:'已停用'},
+];
+
+let SKILLS = [
+  {name:'web-search', ver:'v1.2', cat:'研究', desc:'联网检索并交叉核验来源，输出带链接的事实清单', enabled:true},
+  {name:'deep-research', ver:'v1.0', cat:'研究', desc:'多轮检索 + 结构化综述，适合赛道调研', enabled:true},
+  {name:'xlsx-report', ver:'v1.0', cat:'办公', desc:'读取表格数据，产出图表 + 结论的月度报告', enabled:true},
+  {name:'pptx-deck', ver:'v0.9', cat:'办公', desc:'按大纲生成分页演示文稿，可导出文件', enabled:false},
+  {name:'fact-check', ver:'v1.1', cat:'内容', desc:'逐条核校成稿中的事实断言，标记风险', enabled:true},
+  {name:'wechat-format', ver:'v1.0', cat:'内容', desc:'公众号排版：标题、小图标、引导语一键套用', enabled:true},
+];
+let skillCat = '全部';
+const SKILL_CATS = ['全部','研究','办公','内容','设计'];
+
+let CONNECTORS = [
+  {name:'微信', desc:'iLink 机器人通道 · 扫码绑定后可收发消息', connected:true, brand:'wechat'},
+  {name:'Tavily 搜索', desc:'网页检索 / 抓取 / 站点图谱 · 额度充足', connected:true},
+  {name:'本地文件系统', desc:'工作区目录内读写与归档', connected:true},
+  {name:'GitHub', desc:'仓库、Issue、PR 读写（走 gh / API）', connected:false},
+  {name:'Gmail', desc:'收发邮件、整理附件', connected:false},
+  {name:'Google Calendar', desc:'会议安排与提醒', connected:false},
+  {name:'Notion', desc:'页面与数据库读写', connected:false},
+  {name:'飞书', desc:'多维表格 / 消息卡片', connected:false, wip:true},
+  {name:'Telegram', desc:'Bot API 通道', connected:false, wip:true},
+];
+
+const CTX_FILES = {
+  '品牌语气指南.md': {folder:'编队共享', size:'4 KB', md:`<h2>品牌语气指南</h2>
+<p>OneFleet 对外文案的统一语气：<b>可靠的搭档</b>，不吹牛、不卖萌、不堆术语。</p>
+<h3>原则</h3><ul>
+<li>先给结论，再给依据；每条断言附来源。</li>
+<li>技术名词保留英文（agent、MCP、token），其余全中文。</li>
+<li>禁用词：「颠覆」「革命性」「遥遥领先」。</li></ul>
+<h3>示例</h3><p>✅「这周三个竞品都上了群聊功能，我们的差异位是本地数据。」</p>
+<p>❌「OneFleet 将颠覆整个 AI 行业！」</p>`},
+  '内容选题库.md': {folder:'编队共享', size:'2 KB', md:`<h2>内容选题库</h2><ul>
+<li>编队工作台 vs 单 Agent：什么时候需要「团队」？</li>
+<li>BYOK 的意义：模型自由与成本透明</li>
+<li>本地优先：你的数据为什么不该上云</li>
+<li>实测：微信扫码遥控家里的机器人</li></ul>
+<p>状态标记：● 写作中 ○ 待定</p>`},
+  '平台合规清单.md': {folder:'编队共享', size:'3 KB', md:`<h2>平台合规清单（公众号）</h2><ul>
+<li>不得出现未标注来源的数据断言</li>
+<li>AI 生成内容需文末声明</li>
+<li>引用竞品素材 ≤ 合理引用范围</li></ul>
+<p>小审在终审时逐项打勾。</p>`},
+  'Q3销售数据.csv': {folder:'数据', size:'18 KB', md:`<h2>Q3销售数据.csv</h2><p class="ctx-view-path">原型内 CSV 以摘要呈现；真机资料库支持表格预览与全文检索。</p>
+<div class="md-viewer"><pre class="yaml" style="margin:0">month,channel,orders,revenue
+2026-07,官网,412,88300
+2026-07,淘宝,763,142900
+2026-08,官网,455,97100
+2026-08,淘宝,801,151300
+2026-09,官网,503,109800
+2026-09,淘宝,842,160700</pre></div>`},
+  '竞品价格表.md': {folder:'数据', size:'2 KB', md:`<h2>竞品价格表</h2>
+<ul><li>Grok Bot：随 X Premium（$30/月）提供</li><li>Manus：订阅制 + 按量积分</li><li>Meta Muse：SMB 套餐内含连接器席位</li></ul>
+<p>OneFleet 定位：本地 + BYOK，成本=模型账单本身。</p>`},
+  '需求文档.docx': {folder:'我的上传', size:'640 KB', md:`<h2>需求文档.docx</h2><p>二进制文件 — 真机会调用本地解析管线转 Markdown 后入库；原型里这里显示转换进度。</p><p class="inline-status busy">⏳ 已在真机转为 需求文档.md（演示）</p>`},
+};
+let ctxCur = '品牌语气指南.md';
+
+let APPS = [
+  {name:'竞品监测台', desc:'Grok/Manus/Meta 官方动态聚合看板', icon:'🛰️', tone:'purple'},
+  {name:'月报生成器', desc:'喂 CSV，出图表 + 结论的月度经营报告', icon:'📊', tone:'green'},
+  {name:'选题打分器', desc:'按流量假设给选题库排序', icon:'🎯', tone:'amber'},
+];
+
+const MARKET_SKILLS = [
+  {name:'pdf-process', cat:'办公', desc:'PDF 抽取/合并/拆分'},
+  {name:'data-viz', cat:'设计', desc:'交互式图表（基于 visualize 思路）'},
+  {name:'md-slides', cat:'办公', desc:'Markdown 一键转演示稿'},
+  {name:'cn-stock', cat:'研究', desc:'A 股行情与公告检索'},
+];
+
+/* ════════ 路由 ════════ */
+const NAV_MB = {home:'mb-messages', messages:'mb-messages', fleets:'mb-fleets', remote:'mb-remote', employees:'mb-employees'};
+const NAV_PANEL = {home:'panel-home', messages:'panel-conversation', fleets:'panel-fleet-detail',
+  remote:'panel-remote-view', employees:'panel-dm', workbench:'panel-workbench', settings:'panel-settings'};
+function nav(name){
+  document.querySelectorAll('.rail-btn[data-nav]').forEach(b=>b.classList.toggle('active', b.dataset.nav===name));
+  Object.values(NAV_MB).forEach(id=>document.getElementById(id).classList.add('hidden'));
+  document.getElementById('mb-messages').classList.toggle('hidden', !['home','messages'].includes(name));
+  if (NAV_MB[name]) {
+    document.getElementById(NAV_MB[name]).classList.remove('hidden');
+    if (name==='remote') showPanel('panel-remote-view');
+    else showPanel(NAV_PANEL[name]);
+  } else showPanel(NAV_PANEL[name]);
+  if (name==='settings') settingsTab('models');
+  closeDrawers();
+}
+function showPanel(id){document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id===id));}
+document.querySelectorAll('.rail-btn[data-nav]').forEach(b=>b.addEventListener('click',()=>nav(b.dataset.nav)));
+
+function openTool(t){
+  document.querySelectorAll('.rail-btn[data-nav]').forEach(b=>b.classList.toggle('active', b.dataset.nav==='workbench'));
+  Object.values(NAV_MB).forEach(id=>document.getElementById(id).classList.add('hidden'));
+  if (t==='workbench') showPanel('panel-workbench');
+  else showPanel('panel-'+t);
+  closeDrawers();
+}
+
+/* ════════ 中栏渲染 ════════ */
+let convFilter = 'all';
+function renderMsgs(){
+  const box = document.getElementById('msg-rows');
+  const rows = CONVS.filter(c=>convFilter==='all'||c.kind===convFilter);
+  box.innerHTML = rows.map((c,i)=>`
+    <button class="conv-row ${c.conv==='group'?'active':''}" data-click="${c.conv}">
+      <span class="conv-avatar">${c.kind==='group'?'👑':(c.conv==='dm-wechat'?'🟢':'🤖')}</span>
+      <span class="conv-main"><span class="conv-name">${c.title}${c.kind==='group'?' <span class="chip">3 个机器人</span>':''}</span>
+      <span class="conv-preview">${c.preview}</span></span>
+      <span class="conv-time">${c.time}</span>
+    </button>`).join('') || '<div class="conv-empty">这个分类下还没有会话</div>';
+  box.querySelectorAll('[data-click]').forEach(el=>el.addEventListener('click',()=>{
+    const k = el.dataset.click;
+    if (k==='group'){ nav('messages'); }
+    else if (k==='dm-commander'){ nav('messages'); showPanel('panel-conversation'); }
+    else openDm('小艾');
+  }));
+}
+document.querySelectorAll('#conv-filter button').forEach(b=>b.addEventListener('click',()=>{
+  convFilter = b.dataset.filter;
+  document.querySelectorAll('#conv-filter button').forEach(x=>x.classList.toggle('active',x===b));
+  renderMsgs();
+}));
+
+function renderFleets(){
+  const box = document.getElementById('fleet-rows');
+  box.innerHTML = FLEETS.map(f=>`
+    <button class="fleet-card" onclick="nav('fleets')">
+      <span class="fleet-card-name">${f.name}</span>
+      <span class="fleet-card-meta">${f.members} 个机器人 · ${f.date}</span>
+    </button>`).join('') +
+    '<div class="conv-empty">还没有编队 — 导入一份模板，一键建队。</div>';
+  // 前两张卡是真实编队，空文案只在 0 编队时显示
+  if (FLEETS.length) box.lastElementChild.remove();
+  // 市场调研小组卡片：详情结构同内容运营小队，这里复用同一详情面板（标题不同演示略）
+}
+
+function renderEmployees(){
+  const box = document.getElementById('employee-rows');
+  box.innerHTML = '<div class="employees-hint">全部机器人都在这里 — 点一个，直接跟他说话。</div>' +
+  EMPLOYEES.map(e=>`
+    <button class="employee-row" onclick="openDm('${e.name}')">
+      <span class="employee-avatar">🤖<span class="status-dot ${e.status}"></span></span>
+      <span class="employee-main">
+        <span class="employee-name">${e.name} <span class="employee-fleet">${e.fleet}</span></span>
+        <span class="employee-role">${e.role}</span>
+      </span><span class="employee-go">›</span>
+    </button>`).join('') +
+  '<div class="employees-hint" style="margin-top:10px">机器人由编队模板生成，也可「基于对话创建」。</div>';
+}
+
+/* ════════ 首页 / 会话 模拟发送 ════════ */
+function fillDemo(t){ nav('home'); const i=document.getElementById('home-input'); i.value=t; i.focus(); }
+function guideGoGroup(){ nav('messages'); document.getElementById('conv-input').focus(); }
+function sendHome(){
+  const t = document.getElementById('home-input').value.trim();
+  if (!t) return toast('先输入一个目标');
+  document.getElementById('home-input').value=''; clearAttach('home');
+  nav('messages');
+  CONVS.unshift({kind:'group', title:t.slice(0,18)+'…', preview:'指挥官正在拆解任务', time:'刚刚', conv:'group'});
+  renderMsgs();
+  addMsg('user', t); simulateReply();
+}
+function sendConv(){
+  const t = document.getElementById('conv-input').value.trim();
+  if (!t) return;
+  document.getElementById('conv-input').value=''; clearAttach('conv');
+  addMsg('user', t); simulateReply();
+}
+function addMsg(role, text, who){
+  const body = document.getElementById('conv-body');
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
+  const div = document.createElement('div');
+  div.className = 'msg '+role;
+  if (role==='user'){
+    div.innerHTML = `<div class="msg-bubble"></div><div class="msg-meta"><span class="msg-time">今天 ${hh}</span></div>`;
+    div.querySelector('.msg-bubble').textContent = text;
+  } else {
+    div.innerHTML = `<span class="msg-avatar">👑</span><div class="msg-meta"><b>${who||'指挥官'}</b> <span class="chip bot" style="margin-left:4px">管理员</span><span class="msg-time">今天 ${hh}</span></div><div class="msg-bubble"></div>`;
+    div.querySelector('.msg-bubble').textContent = text;
+  }
+  // 保持底部「创建机器人」分隔线在最后
+  const sep = body.querySelector('.dash-sep:last-of-type');
+  if (sep && sep.querySelector('button')) body.insertBefore(div, sep); else body.appendChild(div);
+  body.scrollTop = body.scrollHeight;
+  const c = document.getElementById('info-msg-count'); if(c) c.textContent = body.querySelectorAll('.msg').length;
+  return div;
+}
+let simulating = false;
+function simulateReply(){
+  if (simulating) return;
+  simulating = true;
+  const body = document.getElementById('conv-body');
+  const run = document.createElement('div');
+  run.className='running-card';
+  run.innerHTML = '指挥官 <span class="t">耗时 <span id="sim-sec">0</span>s</span> 执行中 <span class="dots"></span>';
+  const sep = body.querySelector('.dash-sep:last-of-type');
+  body.insertBefore(run, sep||null); body.scrollTop = body.scrollHeight;
+  let s = 0;
+  const timer = setInterval(()=>{ s++; const el=document.getElementById('sim-sec'); if(el) el.textContent=s; }, 1000);
+  setTimeout(()=>{
+    clearInterval(timer); run.remove();
+    addMsg('agent','收到！这是一个原型演示回复 — 真实应用会由 GLM-5.3 通过指挥官生成，并按需要调度编队里的机器人协作。你在这里点到的每个交互，都对应真机的一条已有功能。');
+    simulating = false;
+  }, 3200);
+}
+function createBotFromChat(){
+  if (EMPLOYEES.some(e=>e.name==='小记')) return toast('「小记」已在机器人列表里了');
+  EMPLOYEES.push({name:'小记', fleet:'内容运营小队', role:'会议速记员（基于对话创建）', status:'st-idle'});
+  renderEmployees();
+  toast('已创建机器人「小记」— 在「机器人」列表可以找到它');
+}
+
+/* ════════ 附件 ════════ */
+function togglePop(btn, where){
+  const pop = document.getElementById('pop-'+where);
+  const willOpen = !pop.classList.contains('open');
+  document.querySelectorAll('.pop').forEach(p=>p.classList.remove('open'));
+  if (willOpen) pop.classList.add('open');
+}
+document.addEventListener('click', e=>{
+  if (!e.target.closest('.pop') && !e.target.closest('.composer-plus'))
+    document.querySelectorAll('.pop').forEach(p=>p.classList.remove('open'));
+});
+function addAttach(where, name){
+  document.querySelectorAll('.pop').forEach(p=>p.classList.remove('open'));
+  const bar = document.getElementById(where+'-attach-bar');
+  const chip = document.createElement('span');
+  chip.className='attach-chip';
+  chip.innerHTML = `<span></span><button title="移除">✕</button>`;
+  chip.firstChild.textContent = name;
+  chip.querySelector('button').onclick = ()=>chip.remove();
+  bar.appendChild(chip);
+}
+function clearAttach(where){ document.getElementById(where+'-attach-bar').innerHTML=''; }
+
+/* ════════ DM ════════ */
+let dmWho = '小艾';
+function openDm(name){
+  dmWho = name;
+  document.getElementById('dm-title').textContent = name;
+  document.getElementById('dm-name2').textContent = name;
+  document.getElementById('dm-rcpt').textContent = name;
+  nav('employees'); showPanel('panel-dm');
+  const body = document.getElementById('dm-body');
+  body.innerHTML = `<div class="msg agent"><span class="msg-avatar bot-av">🤖</span><div class="msg-meta"><b>${name}</b> <span class="msg-time">刚刚</span></div><div class="msg-bubble">你好，我是${name}。把你的要求发给我 — 真实应用里我会按自己的职责处理（原型中回复为演示文案）。</div></div>`;
+}
+function sendDm(){
+  const t = document.getElementById('dm-input').value.trim();
+  if (!t) return;
+  document.getElementById('dm-input').value=''; clearAttach('dm');
+  const body = document.getElementById('dm-body');
+  const div = document.createElement('div');
+  div.className='msg user';
+  div.innerHTML = `<div class="msg-bubble"></div><div class="msg-meta"><span class="msg-time">刚刚</span></div>`;
+  div.querySelector('.msg-bubble').textContent = t;
+  body.appendChild(div); body.scrollTop = body.scrollHeight;
+  setTimeout(()=>{
+    const rep = document.createElement('div');
+    rep.className='msg agent';
+    rep.innerHTML = `<span class="msg-avatar bot-av">🤖</span><div class="msg-meta"><b>${dmWho}</b> <span class="msg-time">刚刚</span></div><div class="msg-bubble"></div>`;
+    rep.querySelector('.msg-bubble').textContent = `（演示）${dmWho} 收到了你的消息。真实应用里这里由绑定的模型生成回复。`;
+    body.appendChild(rep); body.scrollTop = body.scrollHeight;
+  }, 1200);
+}
+
+/* ════════ 编队开工 ════════ */
+function fleetGo(){
+  nav('messages');
+  addMsg('user','启动本周内容计划：调研近一周 AI 编队产品动态，产出公众号文章初稿');
+  simulateReply();
+}
+
+/* ════════ 导入 / 导出模板 ════════ */
+let tplSel = 0;
+function openImport(){
+  document.getElementById('tpl-list').innerHTML = TEMPLATES.map((t,i)=>`
+    <div class="tpl-item ${i===tplSel?'sel':''}" onclick="selTpl(${i},this)">
+      <span class="ic">${t.icon}</span>
+      <span style="flex:1"><span class="nm">${t.name}</span><span class="ds">${t.file} · ${t.desc}</span></span>
+    </div>`).join('');
+  document.getElementById('modal-import').classList.add('open');
+}
+function selTpl(i, el){ tplSel=i; document.querySelectorAll('.tpl-item').forEach(x=>x.classList.remove('sel')); el.classList.add('sel'); }
+function importTpl(){
+  const t = TEMPLATES[tplSel];
+  closeModal('modal-import');
+  if (FLEETS.some(f=>f.name===t.name)) return toast('「'+t.name+'」已经导入过了（真机允许重复建队）');
+  FLEETS.push({name:t.name, members:(t.yaml.match(/^  - id:/gm)||[]).length, date:'今天'});
+  const newBots = t.name==='一人公司增长组'
+    ? [{name:'投放手',role:'渠道预算分配与 ROI 盯盘'},{name:'文案',role:'卖点提炼与多平台文案改写'},{name:'数据员',role:'漏斗分析 · 周报数据看板'},{name:'客服',role:'咨询应答与工单整理'}]
+    : [];
+  newBots.forEach(b=>EMPLOYEES.push({name:b.name, fleet:t.name, role:b.role, status:'st-idle'}));
+  renderFleets(); renderEmployees(); renderMsgs();
+  nav('fleets');
+  toast('已建队：'+t.name+'（机器人 + 群聊已生成）');
+}
+function openExport(){
+  document.getElementById('export-yaml').textContent = TPL_CONTENT;
+  document.getElementById('modal-export').classList.add('open');
+}
+function copyYaml(){
+  const txt = document.getElementById('export-yaml').textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(
+    ()=>toast('YAML 已复制到剪贴板'),
+    ()=>toast('复制失败 — 请手动选择文本（原型环境剪贴板受限）'));
+}
+
+/* ════════ 待办 ════════ */
+function todoGroup(mode, btn){
+  todoMode = mode;
+  document.querySelectorAll('#todo-seg button').forEach(b=>b.classList.toggle('active', b===btn));
+  renderTodos();
+}
+function renderTodos(){
+  const box = document.getElementById('todos-content');
+  let html = '';
+  const item = (t,i)=>`<div class="todo-item ${t.done?'done':''}" onclick="toggleTodo(${i})">
+      <span class="todo-check">${t.done?'✓':''}</span>
+      <span class="todo-text">${t.text}</span><span class="todo-src">${t.src}</span></div>`;
+  if (todoMode==='project'){
+    const groups = [...new Set(TODOS.map(t=>t.src))];
+    groups.forEach(g=>{
+      const idxs = TODOS.map((t,i)=>({t,i})).filter(o=>o.t.src===g);
+      html += `<div class="todo-group-label">${g} · ${idxs.filter(o=>!o.t.done).length} 未完成</div>`;
+      html += idxs.map(o=>item(o.t,o.i)).join('');
+    });
+  } else {
+    const done = TODOS.map((t,i)=>({t,i})).filter(o=>!o.t.done), nd = TODOS.map((t,i)=>({t,i})).filter(o=>o.t.done);
+    html = `<div class="todo-group-label">进行中 · ${done.length}</div>`+done.map(o=>item(o.t,o.i)).join('')
+         + `<div class="todo-group-label">已完成 · ${nd.length}</div>`+nd.map(o=>item(o.t,o.i)).join('');
+  }
+  html += `<div class="add-row"><input id="todo-add" placeholder="＋ 新建待办，回车添加" onkeydown="if(event.key==='Enter'&&this.value.trim()){TODOS.push({text:this.value.trim(),src:'个人事项',done:false});this.value='';renderTodos();}"></div>`;
+  box.innerHTML = html;
+}
+function toggleTodo(i){ TODOS[i].done=!TODOS[i].done; renderTodos(); }
+
+/* ════════ 自动化 ════════ */
+function renderAutos(){
+  document.getElementById('auto-count').textContent = AUTOS.filter(a=>a.enabled).length + ' 个启用中 · 共 ' + AUTOS.length;
+  document.getElementById('auto-list').innerHTML = AUTOS.map((a,i)=>`
+    <div class="auto-row ${a.enabled?'':'is-off'}">
+      <div class="auto-main">
+        <div class="auto-row-title">${a.title}</div>
+        <div class="auto-row-content">${a.msg}</div>
+        <div class="auto-row-chips">
+          <span class="auto-row-chip is-schedule">🗓 ${a.sched}</span>
+          <span class="auto-row-chip is-agent">👤 ${a.rcpt}</span>
+          <span class="auto-row-chip">💻 ${a.device}</span>
+        </div>
+      </div>
+      <div class="auto-row-side">
+        <div class="switch ${a.enabled?'on':''}" onclick="toggleAuto(${i})"></div>
+        <span class="auto-row-status ${a.enabled?'on':''}">${a.enabled?'已启用':'已停用'}</span>
+        <span class="auto-next">下次：${a.enabled?a.next:'已停用'}</span>
+        <button class="link-btn" onclick="runAutoNow(${i},this)">▶ 立即运行</button>
+      </div>
+    </div>`).join('');
+}
+function toggleAuto(i){ AUTOS[i].enabled=!AUTOS[i].enabled; renderAutos(); toast(AUTOS[i].enabled?'已启用「'+AUTOS[i].title+'」':'已停用「'+AUTOS[i].title+'」'); }
+function runAutoNow(i, btn){
+  btn.textContent='⏳ 执行中…'; btn.disabled=true;
+  setTimeout(()=>{ btn.textContent='▶ 立即运行'; btn.disabled=false;
+    toast('「'+AUTOS[i].title+'」已执行并在会话里生成了结果（演示）'); }, 1600);
+}
+function openAutoAdd(){ document.getElementById('modal-auto-add').classList.add('open'); }
+function addAutoTask(){
+  const title = document.getElementById('aa-title').value.trim();
+  if (!title) return toast('填个标题');
+  AUTOS.unshift({title, msg:document.getElementById('aa-msg').value.trim()||'（无附加指令）',
+    rcpt:document.getElementById('aa-rcpt').value, sched:document.getElementById('aa-schedule').value,
+    device:'本机', enabled:true, next:'按计划'});
+  closeModal('modal-auto-add'); renderAutos(); toast('自动化任务「'+title+'」已创建');
+  document.getElementById('aa-title').value=''; document.getElementById('aa-msg').value='';
+}
+
+/* ════════ 技能库 ════════ */
+function renderSkillCats(){
+  document.getElementById('skill-cats').innerHTML = SKILL_CATS.map(c=>
+    `<button class="${c===skillCat?'active':''}" onclick="skillCat='${c}';renderSkillCats();renderSkills()">${c}</button>`).join('');
+}
+function renderSkills(){
+  const grid = document.getElementById('skills-grid');
+  const list = SKILLS.filter(s=>skillCat==='全部'||s.cat===skillCat);
+  grid.innerHTML = list.length ? list.map(s=>{
+    const gi = SKILLS.indexOf(s);
+    return `<div class="skill-card ${s.enabled?'':'is-disabled'}">
+      <div class="skill-card-top"><span class="skill-card-name">${s.name}</span>
+        <span class="chip">${s.ver}</span><span class="chip">${s.cat}</span></div>
+      <div class="skill-card-desc">${s.desc}</div>
+      <div class="skill-card-foot">
+        <span class="chip ${s.enabled?'ok':''}">${s.enabled?'已启用':'已停用'}</span>
+        <button class="link-btn" onclick="SKILLS[${gi}].enabled=!SKILLS[${gi}].enabled;renderSkills()">${s.enabled?'停用':'启用'}</button>
+        <button class="btn btn-soft btn-sm" onclick="useSkill('${s.name}')">使用</button>
+      </div>
+    </div>`;}).join('') : '<div class="conv-empty">这个分类下还没有技能 — 去技能市场装一个。</div>';
+}
+function useSkill(name){ nav('home'); const i=document.getElementById('home-input'); i.value='（用技能：'+name+'）'; i.focus(); toast('技能「'+name+'」已随下一条消息带上'); }
+function openSkillAdd(){ document.getElementById('modal-skill-add').classList.add('open'); }
+function addSkill(){
+  const n = document.getElementById('skill-name').value.trim();
+  if (!n) return toast('技能名必填');
+  SKILLS.unshift({name:n, ver:'v0.1', cat:'自定义', desc:document.getElementById('skill-desc').value.trim()||'（无描述）', enabled:true});
+  closeModal('modal-skill-add'); renderSkills(); renderSkillCats(); toast('技能「'+n+'」已保存到技能库');
+}
+
+/* ════════ 技能市场 ════════ */
+function openMarket(){
+  document.getElementById('market-list').innerHTML = MARKET_SKILLS.map(s=>`
+    <div class="conn-card" style="margin-top:10px">
+      <span class="conn-ic">✨</span>
+      <span class="conn-main"><span class="conn-name">${s.name} <span class="chip">${s.cat}</span></span>
+      <span class="conn-desc">${s.desc}</span></span>
+      <button class="btn btn-primary btn-sm" onclick="installSkill('${s.name}','${s.cat}','${s.desc}',this)">安装</button>
+    </div>`).join('');
+  document.getElementById('modal-market').classList.add('open');
+}
+function installSkill(name, cat, desc, btn){
+  if (SKILLS.some(s=>s.name===name)) return toast('已装过');
+  btn.textContent='⏳ 安装中'; btn.disabled=true;
+  setTimeout(()=>{ SKILLS.unshift({name, ver:'v0.1', cat, desc, enabled:true}); renderSkills();
+    btn.textContent='已安装'; toast('技能「'+name+'」已安装到技能库'); }, 900);
+}
+
+/* ════════ 连接器 ════════ */
+function renderConnectors(q=''){
+  const box = document.getElementById('connectors-body');
+  const match = c => c.name.toLowerCase().includes(q.toLowerCase()) || c.desc.includes(q);
+  const card = (c,i)=>`<div class="conn-card">
+      <span class="conn-ic ${c.brand==='wechat'?'brand':''}">${c.brand==='wechat'?'<img src="data:image/svg+xml;base64,PCEtLSBTb3VyY2U6IGh0dHBzOi8vYXBpLmljb25pZnkuZGVzaWduL3NpbXBsZS1pY29uczp3ZWNoYXQuc3ZnIChTaW1wbGUgSWNvbnMsIENDMCkuIEJyYW5kIGNvbG9yICMwN0MxNjAgYXBwbGllZDsgdmVuZG9yZWQgMjAyNi0xMC0xNi4gLS0+Cjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciICB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGZpbGw9IiMwN0MxNjAiIGQ9Ik04LjY5MSAyLjE4OEMzLjg5MSAyLjE4OCAwIDUuNDc2IDAgOS41M2MwIDIuMjEyIDEuMTcgNC4yMDMgMy4wMDIgNS41NWEuNTkuNTkgMCAwIDEgLjIxMy42NjVsLS4zOSAxLjQ4Yy0uMDE5LjA3LS4wNDguMTQxLS4wNDguMjEzYzAgLjE2My4xMy4yOTUuMjkuMjk1YS4zMy4zMyAwIDAgMCAuMTY3LS4wNTRsMS45MDMtMS4xMTRhLjg2Ljg2IDAgMCAxIC43MTctLjA5OGExMC4yIDEwLjIgMCAwIDAgMi44MzcuNDAzYy4yNzYgMCAuNTQzLS4wMjcuODExLS4wNWMtLjg1Ny0yLjU3OC4xNTctNC45NzIgMS45MzItNi40NDZjMS43MDMtMS40MTUgMy44ODItMS45OCA1Ljg1My0xLjgzOGMtLjU3Ni0zLjU4My00LjE5Ni02LjM0OC04LjU5Ni02LjM0OE01Ljc4NSA1Ljk5MWMuNjQyIDAgMS4xNjIuNTI5IDEuMTYyIDEuMThhMS4xNyAxLjE3IDAgMCAxLTEuMTYyIDEuMTc4QTEuMTcgMS4xNyAwIDAgMSA0LjYyMyA3LjE3YzAtLjY1MS41Mi0xLjE4IDEuMTYyLTEuMTh6bTUuODEzIDBjLjY0MiAwIDEuMTYyLjUyOSAxLjE2MiAxLjE4YTEuMTcgMS4xNyAwIDAgMS0xLjE2MiAxLjE3OGExLjE3IDEuMTcgMCAwIDEtMS4xNjItMS4xNzhjMC0uNjUxLjUyLTEuMTggMS4xNjItMS4xOG01LjM0IDIuODY3Yy0xLjc5Ny0uMDUyLTMuNzQ2LjUxMi01LjI4IDEuNzg2Yy0xLjcyIDEuNDI4LTIuNjg3IDMuNzItMS43OCA2LjIyYy45NDIgMi40NTMgMy42NjYgNC4yMjkgNi44ODQgNC4yMjljLjgyNiAwIDEuNjIyLS4xMiAyLjM2MS0uMzM2YS43Mi43MiAwIDAgMSAuNTk4LjA4MmwxLjU4NC45MjZhLjMuMyAwIDAgMCAuMTQuMDQ3Yy4xMzQgMCAuMjQtLjExMS4yNC0uMjQ3YzAtLjA2LS4wMjMtLjEyLS4wMzgtLjE3N2wtLjMyNy0xLjIzM2EuNi42IDAgMCAxLS4wMjMtLjE1NmEuNDkuNDkgMCAwIDEgLjIwMS0uMzk4QzIzLjAyNCAxOC40OCAyNCAxNi44MiAyNCAxNC45OGMwLTMuMjEtMi45MzEtNS44MzctNi42NTYtNi4wODhWOC44OWMtLjEzNS0uMDEtLjI3LS4wMjctLjQwNy0uMDN6bS0yLjUzIDMuMjc0Yy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45Ny0uOTgyem00Ljg0NCAwYy41MzUgMCAuOTY5LjQ0Ljk2OS45ODJhLjk3Ni45NzYgMCAwIDEtLjk2OS45ODNhLjk3Ni45NzYgMCAwIDEtLjk2OS0uOTgzYzAtLjU0Mi40MzQtLjk4Mi45NjktLjk4MiIvPjwvc3ZnPgo=" alt="">':(c.name[0])}</span>
+      <span class="conn-main"><span class="conn-name">${c.name}${c.wip?' <span class="chip warn">开发中</span>':''}${c.connected?' <span class="chip ok">已连接</span>':''}</span>
+      <span class="conn-desc">${c.desc}</span></span>
+      ${c.wip?'<span class="chip">即将上线</span>':(c.connected
+        ? '<button class="link-btn danger" onclick="CONN('+i+').connected=false;renderConnectors();toast(\'已断开 '+c.name+'\')">断开</button>'
+        : '<button class="btn btn-primary btn-sm" onclick="CONN('+i+').connected=true;renderConnectors();toast(\'已连接 '+c.name+'（演示：真机走授权流程）\')">连接</button>')}
+    </div>`;
+  const conn = CONNECTORS.filter(c=>c.connected&&match(c)).map(c=>card(c,CONNECTORS.indexOf(c)));
+  const avail = CONNECTORS.filter(c=>!c.connected&&match(c)).map(c=>card(c,CONNECTORS.indexOf(c)));
+  box.innerHTML =
+    (conn.length?`<div class="tool-group-label">已连接 <span class="chip">${conn.length}</span></div><div class="card-grid">${conn.join('')}</div>`:'')
+   +(avail.length?`<div class="tool-group-label" style="margin-top:18px">可用 <span class="chip">${avail.length}</span></div><div class="card-grid">${avail.join('')}</div>`:'')
+   + (!conn.length&&!avail.length?'<div class="conv-empty">没有匹配的连接器</div>':'');
+}
+window.CONN = i => CONNECTORS[i];
+function openMcpAdd(){ document.getElementById('modal-mcp-add').classList.add('open'); }
+function addMcp(){
+  try{
+    const j = JSON.parse(document.getElementById('mcp-json').value);
+    const name = Object.keys(j.mcpServers||{})[0]||'自定义 MCP';
+    CONNECTORS.unshift({name, desc:'自定义 MCP 服务器 · stdio', connected:true});
+    closeModal('modal-mcp-add'); renderConnectors(); toast('已添加并连接「'+name+'」');
+  }catch(e){ toast('JSON 解析失败 — 检查格式'); }
+}
+
+/* ════════ 资料库 ════════ */
+function renderCtx(){
+  const folders = ['编队共享','数据','我的上传'];
+  document.getElementById('ctx-tree').innerHTML = folders.map(f=>{
+    const files = Object.entries(CTX_FILES).filter(([,m])=>m.folder===f);
+    return `<div class="ctx-folder">📂 ${f} <span class="size" style="margin-left:auto;font-size:10px;color:var(--muted)">${files.length}</span></div>`
+      + files.map(([name,m])=>`<div class="ctx-file ${name===ctxCur?'active':''}" onclick="openCtxFile('${name}')">📄 ${name}<span class="size">${m.size}</span></div>`).join('');
+  }).join('');
+}
+function openCtxFile(name){
+  ctxCur = name; renderCtx();
+  document.getElementById('ctx-view').innerHTML =
+    `<div class="ctx-view-path">~/.onefleet/data/library/${CTX_FILES[name].folder}/${name}</div>
+     <div class="md-viewer md-body">${CTX_FILES[name].md}</div>
+     <div style="margin-top:12px;display:flex;gap:8px">
+       <button class="btn btn-ghost btn-sm" onclick="toast('下载原件（演示）')">下载</button>
+       <button class="btn btn-ghost btn-sm" onclick="toast('已按文件名+内容建立索引（演示）')">供机器人检索</button>
+     </div>`;
+}
+
+/* ════════ 应用 ════════ */
+function renderApps(){
+  document.getElementById('apps-count').textContent = APPS.length + ' 个应用';
+  document.getElementById('apps-grid').innerHTML = APPS.map(a=>`
+    <div class="app-card">
+      <span class="app-card-icon tone-${a.tone}">${a.icon}</span>
+      <span class="conn-main"><span class="conn-name">${a.name}</span><span class="conn-desc">${a.desc}</span></span>
+      <button class="btn btn-soft btn-sm" onclick="toast('打开「${a.name}」（真机为编队产出的可交互小应用）')">打开</button>
+    </div>`).join('') || '<div class="conv-empty">还没有应用 — 编队的产出页里点「保存为应用」。</div>';
+}
+
+/* ════════ 远程状态机 ════════ */
+function remoteScan(){
+  document.getElementById('mb-remote').querySelector('.remote-connect-btn').textContent = '等待扫码…';
+  nav('remote');
+  document.getElementById('rv-state-body').classList.add('hidden');
+  document.getElementById('rv-state-qr').classList.remove('hidden');
+  setRemoteState('等待扫码…', false);
+}
+function remoteBound(){
+  document.getElementById('rv-state-qr').classList.add('hidden');
+  document.getElementById('rv-state-bound').classList.remove('hidden');
+  document.getElementById('rv-convos').classList.remove('hidden');
+  document.getElementById('mb-remote').querySelector('.remote-connect-btn').textContent = '重新扫码';
+  setRemoteState('已连接', true);
+  toast('已绑定值班机器人（演示：断开保留绑定，重扫接回原会话）');
+}
+function remoteDisconnect(){
+  document.getElementById('rv-state-bound').classList.add('hidden');
+  document.getElementById('rv-state-body').classList.remove('hidden');
+  document.getElementById('rv-convos').classList.add('hidden');
+  document.getElementById('mb-remote').querySelector('.remote-connect-btn').textContent = '扫码接入微信';
+  setRemoteState('未连接', false);
+  toast('已断开 — 绑定与 DM 会话已保留，重扫后自动接回');
+}
+function setRemoteState(text, on){
+  const pill = document.getElementById('mb-remote-state');
+  pill.textContent = text; pill.classList.toggle('is-on', on);
+}
+
+/* ════════ 抽屉 ════════ */
+function openDrawer(id){ closeDrawers(); document.getElementById(id).classList.add('open');
+  if (id==='drawer-side') document.getElementById('side-toggle-btn').classList.add('active'); }
+function closeDrawer(id){ document.getElementById(id).classList.remove('open');
+  if (id==='drawer-side') document.getElementById('side-toggle-btn').classList.remove('active'); }
+function toggleDrawer(id, btn){ const open = document.getElementById(id).classList.contains('open');
+  closeDrawers(); if(!open){ document.getElementById(id).classList.add('open'); btn.classList.add('active'); } }
+function closeDrawers(){ document.querySelectorAll('.drawer').forEach(d=>d.classList.remove('open'));
+  document.querySelectorAll('.icon-btn.active').forEach(b=>b.classList.remove('active')); }
+
+/* ════════ 全局搜索 ════════ */
+function openSearch(){
+  document.getElementById('ovl-search').classList.add('open');
+  const i = document.getElementById('search-input'); i.value=''; runSearch(''); i.focus();
+}
+function closeSearch(){ document.getElementById('ovl-search').classList.remove('open'); }
+document.addEventListener('keydown', e=>{
+  if ((e.metaKey||e.ctrlKey) && e.key.toLowerCase()==='k'){ e.preventDefault(); openSearch(); }
+  if (e.key==='Escape'){ closeSearch(); closeAllModals(); }
+});
+document.getElementById('ovl-search').addEventListener('click', e=>{ if(e.target.id==='ovl-search') closeSearch(); });
+function runSearch(q){
+  const box = document.getElementById('search-results');
+  const hit = s => !q || s.toLowerCase().includes(q.toLowerCase());
+  const groups = [];
+  const cs = CONVS.filter(c=>hit(c.title)); if(cs.length) groups.push(['对话', cs.map(c=>({t:c.title, s:'会话 · '+c.time, go:()=>{ if(c.kind==='dm'&&c.conv==='dm-wechat') openDm('小艾'); else nav('messages'); }}))]);
+  const es = EMPLOYEES.filter(e=>hit(e.name)||hit(e.role)); if(es.length) groups.push(['机器人', es.map(e=>({t:e.name, s:e.role, go:()=>openDm(e.name)}))]);
+  const fs = FLEETS.filter(f=>hit(f.name)); if(fs.length) groups.push(['编队', fs.map(f=>({t:f.name, s:f.members+' 个机器人', go:()=>nav('fleets')}))]);
+  const ss = SKILLS.filter(s=>hit(s.name)||hit(s.desc)); if(ss.length) groups.push(['技能', ss.map(s=>({t:s.name, s:s.cat+' · '+s.ver, go:()=>{openTool('skills'); toast('高亮：'+s.name);}}))]);
+  const pages = [{t:'工作台',go:()=>openTool('workbench')},{t:'设置 · 模型',go:()=>nav('settings')},{t:'微信远程',go:()=>nav('remote')},{t:'待办',go:()=>openTool('todos')},{t:'自动化',go:()=>openTool('auto')},{t:'资料库',go:()=>openTool('contexts')}].filter(p=>hit(p.t));
+  if(pages.length) groups.push(['页面', pages.map(p=>({t:p.t, s:'', go:p.go}))]);
+  window._searchHits = groups.map(g=>g[1]).flat();
+  box.innerHTML = groups.length ? groups.map(([label,rows])=>
+    `<div class="search-group">${label}</div>`+rows.map(r=>
+      `<button class="res-row" data-idx="${window._searchHits.indexOf(r)}">${r.t}<span class="sub">${r.s}</span></button>`).join('')
+  ).join('') : '<div class="conv-empty">没有匹配结果</div>';
+  box.querySelectorAll('[data-idx]').forEach(el=>el.addEventListener('click',()=>{ closeSearch(); window._searchHits[+el.dataset.idx].go(); }));
+}
+
+/* ════════ 设置 ════════ */
+function settingsTab(name){
+  document.querySelectorAll('.settings-tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  ['data','models','general'].forEach(t=>document.getElementById('tab-'+t).classList.toggle('hidden', t!==name));
+}
+function testModel(btn){
+  const row = btn.closest('.model-row');
+  const span = row.querySelector('.model-sub');
+  const key = row.dataset.key || 'sk-****';
+  span.innerHTML = `API Key <code>${key}</code> · <span style="color:var(--muted)">测试中…</span>`;
+  setTimeout(()=>{ span.innerHTML = `API Key <code>${key}</code> · <span style="color:var(--success-text)">连接正常 ${(600+Math.floor(Math.random()*500))}ms</span>`; }, 900);
+}
+function deleteModel(btn){
+  const row = btn.closest('.model-row'); const nm = row.dataset.name;
+  row.remove();
+  const list = document.getElementById('model-list');
+  list.querySelectorAll('.model-row').forEach((r,i)=>{
+    const b = r.querySelector('.badge'); if(b) b.textContent = i===0?'默认':'备选';
+  });
+  if (!list.querySelectorAll('.model-row').length) document.getElementById('models-empty').classList.remove('hidden');
+  toast('已删除 '+nm+' 的授权（仅本机，回收站可恢复为演示占位）');
+}
+function closeAllModals(){ document.querySelectorAll('.modal-mask.open').forEach(m=>m.classList.remove('open')); }
+
+/* ════════ 添加模型弹窗 ════════ */
+const MODELS = {
+  'DeepSeek':['deepseek-chat','deepseek-reasoner'],
+  'Zhipu GLM':['GLM-5.3','GLM-5.3 Flash','GLM-5.2'],
+  'Moonshot':['kimi-k2.5','kimi-latest'],
+  'Moonshot Coding Plan':['kimi-for-coding'],
+  'MiniMax (Global)':['MiniMax-Text-01'],
+  'MiniMax':['MiniMax-Text-01'],
+  'Doubao':['doubao-seed-1.6','doubao-pro'],
+  'OpenAI Codex':['（OAuth 登录，无需 API Key）'],
+  'OpenAI':['gpt-5.6','gpt-5.5','o4'],
+  'Google Gemini':['gemini-3.6-pro','gemini-3.6-flash'],
+  'Anthropic':['claude-opus-5','claude-sonnet-5'],
+  'OpenRouter':['openrouter/auto','自定义模型 ID'],
+};
+// 提供商下拉按 CN 区置顶（对齐真机 provider_catalog sortProviderIds）
+(function sortProviders(){
+  const sel = document.getElementById('am-provider');
+  const opts = [...sel.options].slice(1);
+  const cn = ['DeepSeek','Zhipu GLM','Moonshot','Moonshot Coding Plan','MiniMax (Global)','MiniMax','Doubao'];
+  opts.sort((a,b)=>(cn.indexOf(a.value||a.text)>=0?0:1)-(cn.indexOf(b.value||b.text)>=0?0:1));
+  opts.forEach(o=>sel.appendChild(o));
+})();
+function openAddModel(){
+  document.getElementById('modal-add').classList.add('open');
+  document.getElementById('am-provider').selectedIndex=0;
+  document.getElementById('am-model').innerHTML='<option>— 请先选择提供商 —</option>';
+  document.getElementById('am-key-form').classList.add('hidden');
+}
+function amProviderChanged(){
+  const p = document.getElementById('am-provider').value;
+  const sel = document.getElementById('am-model');
+  if (!MODELS[p]){ sel.innerHTML='<option>— 请先选择提供商 —</option>'; return; }
+  sel.innerHTML = MODELS[p].map(m=>`<option>${m}</option>`).join('');
+  document.getElementById('am-key-form').classList.toggle('hidden', p==='OpenAI Codex');
+}
+function amSubmit(){
+  const p = document.getElementById('am-provider').value;
+  if (!MODELS[p]) return toast('先选择提供商');
+  closeModal('modal-add');
+  document.getElementById('models-empty').classList.add('hidden');
+  const row = document.createElement('div');
+  row.className='model-row';
+  row.dataset.key='sk-****'; row.dataset.name=p;
+  row.innerHTML = `<span class="badge soft">备选</span>
+    <span style="flex:1"><span class="model-name">${p}</span>
+    <span class="model-sub">API Key <code>sk-****</code> · <span style="color:var(--muted)">未测试</span></span></span>
+    <select class="form-select" style="width:auto;padding:5px 8px;font-size:12px">${MODELS[p].map(m=>`<option>${m}</option>`).join('')}</select>
+    <button class="link-btn" onclick="testModel(this)">测试</button>
+    <button class="link-btn danger" onclick="deleteModel(this)">删除</button>`;
+  document.getElementById('model-list').appendChild(row);
+  toast(`已添加 ${p} · ${document.getElementById('am-model').value}（真机会在这里保存 key 并做连通性测试）`);
+}
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+document.querySelectorAll('.modal-mask').forEach(m=>m.addEventListener('click', e=>{ if(e.target===m) m.classList.remove('open'); }));
+
+/* ════════ Toast ════════ */
+let toastTimer;
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
+}
+
+/* ════════ 初始化 ════════ */
+renderMsgs(); renderFleets(); renderEmployees();
+renderTodos(); renderAutos(); renderSkillCats(); renderSkills();
+renderConnectors(); renderCtx(); openCtxFile(ctxCur); renderApps();
+nav('messages');
+</script>
+</body>
+</html>
