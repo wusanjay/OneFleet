@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# 参考源码仓库（9 个 clone，共 ~2.3GB，各含独立 .git，见 源码参考/README.md 索引）
+源码参考/
